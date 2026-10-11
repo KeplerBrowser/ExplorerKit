@@ -3265,6 +3265,7 @@ mod tests {
     fn popup_request_event_drains_through_bridge_json() {
         let mut handle = HostHandle::new();
         let event = HostEvent::PopupRequested {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "parent-1".to_owned(),
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
@@ -3284,6 +3285,7 @@ mod tests {
     fn popup_created_event_drains_through_bridge_json() {
         let mut handle = HostHandle::new();
         let event = HostEvent::PopupCreated {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "parent-1".to_owned(),
             child_webview_id: "child-1".to_owned(),
             parent_url: Some("https://parent.test/".to_owned()),

@@ -272,6 +272,7 @@ private fun ExplorerHostEvent.hostEventName(): String =
     is ExplorerHostEvent.NavigationRequested -> "navigationRequested"
     is ExplorerHostEvent.PopupRequested -> "popupRequested"
     is ExplorerHostEvent.PopupCreated -> "popupCreated"
+    is ExplorerHostEvent.PopupCreationFailed -> "popupCreationFailed"
     is ExplorerHostEvent.UrlChanged -> "urlChanged"
     is ExplorerHostEvent.PageTitleChanged -> "pageTitleChanged"
     is ExplorerHostEvent.StatusTextChanged -> "statusTextChanged"

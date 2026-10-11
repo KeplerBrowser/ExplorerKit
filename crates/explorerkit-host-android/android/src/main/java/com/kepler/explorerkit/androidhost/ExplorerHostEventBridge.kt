@@ -13,6 +13,7 @@ object ExplorerHostEventBridge {
         )
       "popupRequested" ->
         ExplorerHostEvent.PopupRequested(
+          requestId = payload.string("requestId"),
           parentWebViewId = payload.string("parentWebViewId"),
           parentUrl = payload.nullableString("parentUrl"),
           targetUrl = payload.nullableString("targetUrl"),
@@ -21,12 +22,18 @@ object ExplorerHostEventBridge {
         )
       "popupCreated" ->
         ExplorerHostEvent.PopupCreated(
+          requestId = payload.string("requestId"),
           parentWebViewId = payload.string("parentWebViewId"),
           childWebViewId = payload.string("childWebViewId"),
           parentUrl = payload.nullableString("parentUrl"),
           targetUrl = payload.nullableString("targetUrl"),
           windowFeatures = payload.nullableString("windowFeatures"),
           policy = payload.string("policy")
+        )
+      "popupCreationFailed" ->
+        ExplorerHostEvent.PopupCreationFailed(
+          requestId = payload.string("requestId"),
+          errorMessage = payload.string("errorMessage")
         )
       "urlChanged" -> ExplorerHostEvent.UrlChanged(payload.string("url"))
       "pageTitleChanged" -> ExplorerHostEvent.PageTitleChanged(payload.nullableString("title"))

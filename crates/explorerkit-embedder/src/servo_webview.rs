@@ -14,9 +14,11 @@ use url::Url;
 use crate::{
     ContextMenuAction, HostEvent, HostInputEvent, HostSurface, ImeCompositionState,
     KeyboardInputEvent, KeyboardInputKey, KeyboardInputState, KeyboardKey, KeyboardNamedKey,
-    ManagedChildRenderingContextFactory, NavigationRequest, PointerButton, PointerButtonAction,
-    PointerInputEvent, PointerScrollMode, PopupRequestPolicy, ServoWebViewAdapter,
-    ServoWebViewEvent, SurfaceSize, SurfaceViewport, TouchEventKind, WebViewCommand,
+    ManagedChildRenderingContextFactory, ManagedChildWebViewFactory, NavigationRequest,
+    NewWebViewDecision, NewWebViewRequest, PointerButton, PointerButtonAction, PointerInputEvent,
+    PointerScrollMode, PopupRequestPolicy, PreparedManagedChild, ServoWebViewAdapter,
+    ServoWebViewEvent, SurfaceSize, SurfaceViewport, TouchEventKind, WebViewCommand, WebViewHandle,
+    WebViewRegistrar,
 };
 
 pub struct ServoWebViewInit {
@@ -30,8 +32,6 @@ pub struct ServoWebViewInit {
 
 pub struct ServoWebView {
     adapter: ServoWebViewAdapter,
-    webview: WebView,
-    runtime: ServoRuntime,
 }
 
 impl ServoWebView {
@@ -73,6 +73,7 @@ impl ServoWebView {
         } else {
             ServoWebViewAdapter::new(popup_policy, rendering_context.clone())
         };
+        adapter.set_runtime(runtime.clone());
         let delegate = adapter.webview_delegate();
 
         let builder = WebViewBuilder::new(runtime.lease.servo(), rendering_context)
@@ -88,20 +89,19 @@ impl ServoWebView {
         let webview = builder.build();
         adapter.register_root_webview(&webview);
 
-        Ok(Self {
-            adapter,
-            webview,
-            runtime,
-        })
+        Ok(Self { adapter })
     }
 
     pub fn set_hidpi_scale_factor(&mut self, density: f32) {
-        self.webview
-            .set_hidpi_scale_factor(hidpi_scale_factor(density));
+        if let Ok(webview) = self.adapter.native_webview() {
+            webview.set_hidpi_scale_factor(hidpi_scale_factor(density));
+        }
     }
 
     pub fn resize(&mut self, size: SurfaceSize) {
-        self.webview.resize(physical_size(size));
+        if let Ok(webview) = self.adapter.native_webview() {
+            webview.resize(physical_size(size));
+        }
     }
 
     pub fn request_paint(&self) {
@@ -121,6 +121,78 @@ impl ServoWebView {
 
     pub fn drain_webview_events(&self) -> Vec<ServoWebViewEvent> {
         self.adapter.drain_webview_events()
+    }
+
+    pub(crate) fn from_adapter(adapter: ServoWebViewAdapter) -> Self {
+        Self { adapter }
+    }
+
+    /// Installs prepared native child creation before this view's first native activity.
+    ///
+    /// Rejects an enabled legacy policy, an explicit legacy renderer factory, or
+    /// existing children. The facade uses this seam for Runtime registration.
+    pub fn set_managed_child_webview_factory(
+        &mut self,
+        factory: ManagedChildWebViewFactory,
+    ) -> Result<(), String> {
+        self.adapter.set_managed_child_webview_factory(factory)
+    }
+
+    #[doc(hidden)]
+    pub fn __bind_runtime(
+        &self,
+        webview: WebViewHandle,
+        registrar: WebViewRegistrar,
+        navigation_state_events: bool,
+    ) {
+        self.adapter
+            .bind_runtime(webview, registrar, navigation_state_events);
+    }
+
+    #[doc(hidden)]
+    pub fn __set_new_webview_handler(
+        &self,
+        handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+    ) -> Result<(), String> {
+        self.adapter.set_new_webview_handler(handler)
+    }
+
+    #[doc(hidden)]
+    pub fn __child_factory(
+        &self,
+        prepare: Rc<
+            dyn Fn(
+                ServoWebView,
+                WebViewHandle,
+                &WebView,
+                &str,
+            ) -> Result<PreparedManagedChild, String>,
+        >,
+    ) -> ManagedChildWebViewFactory {
+        self.adapter.child_factory(prepare)
+    }
+
+    #[doc(hidden)]
+    pub fn __prepare_child(
+        self,
+        rendering_context: Rc<dyn RenderingContext>,
+        commit: Box<dyn FnOnce(ServoWebView, String)>,
+    ) -> PreparedManagedChild {
+        self.adapter
+            .set_rendering_context(rendering_context.clone());
+        PreparedManagedChild {
+            rendering_context,
+            delegate: self.adapter.webview_delegate(),
+            commit: Box::new(move |native| {
+                self.adapter.register_root_webview(&native);
+                commit(self, native.id().to_string());
+            }),
+        }
+    }
+
+    #[doc(hidden)]
+    pub fn __is_live(&self) -> bool {
+        self.adapter.is_live()
     }
 
     pub fn set_popup_policy(&mut self, popup_policy: PopupRequestPolicy) {
@@ -193,7 +265,10 @@ impl ServoWebView {
     }
 
     pub fn size(&self) -> SurfaceSize {
-        let size = self.webview.size();
+        let Ok(webview) = self.adapter.native_webview() else {
+            return SurfaceSize::new(0, 0);
+        };
+        let size = webview.size();
         SurfaceSize::new(size.width as u32, size.height as u32)
     }
 
@@ -214,42 +289,37 @@ impl ServoWebView {
 
     pub fn load_url_request(&mut self, request: NavigationRequest) -> Result<(), String> {
         let parsed_url = Url::parse(&request.url).map_err(|error| error.to_string())?;
-        self.webview.load(parsed_url);
+        self.adapter.native_webview()?.load(parsed_url);
         Ok(())
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
-        self.webview.reload();
+        self.adapter.native_webview()?.reload();
         Ok(())
     }
 
     pub fn go_back(&mut self) -> Result<(), String> {
-        self.webview.go_back(1);
+        self.adapter.native_webview()?.go_back(1);
         Ok(())
     }
 
     pub fn go_forward(&mut self) -> Result<(), String> {
-        self.webview.go_forward(1);
+        self.adapter.native_webview()?.go_forward(1);
         Ok(())
     }
 
     pub fn focus(&mut self) -> Result<(), String> {
-        self.webview.focus();
+        self.adapter.native_webview()?.focus();
         Ok(())
     }
 
     pub fn blur(&mut self) -> Result<(), String> {
-        self.webview.blur();
+        self.adapter.native_webview()?.blur();
         Ok(())
     }
 
     pub fn evaluate_javascript(&mut self, evaluation_id: &str, script: &str) -> Result<(), String> {
-        let evaluation_id = evaluation_id.to_owned();
-        let adapter = self.adapter.clone();
-        self.webview.evaluate_javascript(script, move |result| {
-            adapter.notify_javascript_evaluation_result(evaluation_id, result);
-        });
-        Ok(())
+        self.adapter.evaluate_javascript(evaluation_id, script)
     }
 
     pub fn dispatch_touch_event(
@@ -266,7 +336,8 @@ impl ServoWebView {
             TouchEventKind::Up => TouchEventType::Up,
             TouchEventKind::Cancel => TouchEventType::Cancel,
         };
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::Touch(TouchEvent::new(
                 event_type,
                 TouchId(touch_id),
@@ -295,7 +366,8 @@ impl ServoWebView {
         match event {
             PointerInputEvent::Moved { x, y } => {
                 let point = WebViewPoint::Device(DevicePoint::new(x, y));
-                self.webview
+                self.adapter
+                    .native_webview()?
                     .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
             }
             PointerInputEvent::Button {
@@ -309,7 +381,8 @@ impl ServoWebView {
                     PointerButtonAction::Released => MouseButtonAction::Up,
                 };
                 let point = WebViewPoint::Device(DevicePoint::new(x, y));
-                self.webview
+                self.adapter
+                    .native_webview()?
                     .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                         action,
                         mouse_button(button),
@@ -324,7 +397,8 @@ impl ServoWebView {
                 y,
             } => {
                 let point = WebViewPoint::Device(DevicePoint::new(x, y));
-                self.webview
+                self.adapter
+                    .native_webview()?
                     .notify_input_event(InputEvent::Wheel(WheelEvent::new(
                         WheelDelta {
                             x: delta_x,
@@ -336,7 +410,8 @@ impl ServoWebView {
                     )));
             }
             PointerInputEvent::LeftViewport => {
-                self.webview
+                self.adapter
+                    .native_webview()?
                     .notify_input_event(InputEvent::MouseLeftViewport(MouseLeftViewportEvent {
                         focus_moving_to_another_iframe: false,
                     }));
@@ -346,7 +421,8 @@ impl ServoWebView {
     }
 
     pub fn dispatch_keyboard_input(&mut self, event: KeyboardInputEvent) -> Result<(), String> {
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::Keyboard(KeyboardEvent::new_without_event(
                 key_state(event.state),
                 keyboard_key(event.key),
@@ -366,15 +442,18 @@ impl ServoWebView {
 
     pub fn trigger_context_menu(&mut self, x: f32, y: f32) -> Result<(), String> {
         let point = WebViewPoint::Device(DevicePoint::new(x, y));
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::MouseMove(MouseMoveEvent::new(point)));
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                 MouseButtonAction::Down,
                 MouseButton::Secondary,
                 point,
             )));
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::MouseButton(MouseButtonEvent::new(
                 MouseButtonAction::Up,
                 MouseButton::Secondary,
@@ -392,7 +471,8 @@ impl ServoWebView {
             ImeCompositionState::Update => CompositionState::Update,
             ImeCompositionState::End => CompositionState::End,
         };
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::Ime(ImeEvent::Composition(CompositionEvent {
                 state,
                 data: text.to_owned(),
@@ -401,7 +481,8 @@ impl ServoWebView {
     }
 
     pub fn dismiss_input_method(&mut self) -> Result<(), String> {
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::Ime(ImeEvent::Dismissed));
         Ok(())
     }
@@ -412,7 +493,8 @@ impl ServoWebView {
             KeyboardKey::Delete => Key::Named(NamedKey::Delete),
             KeyboardKey::Enter => Key::Named(NamedKey::Enter),
         };
-        self.webview
+        self.adapter
+            .native_webview()?
             .notify_input_event(InputEvent::Keyboard(KeyboardEvent::from_state_and_key(
                 KeyState::Down,
                 key,
@@ -508,7 +590,7 @@ impl ServoWebView {
         present: impl FnOnce(),
     ) -> Result<Vec<ServoWebViewEvent>, String> {
         before_spin();
-        self.runtime.perform_updates()?;
+        self.adapter.runtime().perform_updates()?;
 
         Ok(self.paint_pending(surface_attached, present))
     }
@@ -534,8 +616,10 @@ impl ServoWebView {
         present: impl FnOnce(),
     ) -> Vec<ServoWebViewEvent> {
         if surface_attached && self.adapter.take_needs_paint() {
-            self.webview.paint();
-            present();
+            if let Ok(webview) = self.adapter.native_webview() {
+                webview.paint();
+                present();
+            }
         }
 
         self.adapter.drain_webview_events()
@@ -554,7 +638,7 @@ impl ServoWebView {
             .managed_child_surface_attached(child_webview_id)?;
 
         before_spin();
-        self.runtime.perform_updates()?;
+        self.adapter.runtime().perform_updates()?;
 
         if surface_attached
             && self
@@ -1081,12 +1165,14 @@ mod tests {
     fn assert_default_denied_popup_event(event: &HostEvent) {
         match event {
             HostEvent::PopupRequested {
+                request_id,
                 parent_webview_id,
                 parent_url,
                 target_url,
                 window_features,
                 policy,
             } => {
+                assert!(!request_id.is_empty());
                 assert!(!parent_webview_id.is_empty());
                 assert!(parent_url
                     .as_deref()
@@ -1607,7 +1693,11 @@ mod tests {
             ))
         );
 
-        let retained_child_url = "data:text/html,%3Ctitle%3ERetained%3C/title%3Eretained";
+        let retained_child_url = concat!(
+            "data:text/html,%253Ctitle%253ERetained%253C%252Ftitle%253E",
+            "%253Cscript%253Eonmessage%253D()%253D%253Ewindow.open(%2527about%253Ablank%2527)",
+            "%253C%252Fscript%253E"
+        );
         let closing_child_url =
             "data:text/html,%253Cscript%253Ewindow.close()%253C%252Fscript%253E";
         let managed_parent_url = format!(
@@ -2060,6 +2150,33 @@ mod tests {
             .expect("parent should still render after child surface cleanup");
         assert_eq!(root_present_count.get(), 1);
         assert_eq!(webview.size(), parent_size);
+
+        webview.set_popup_policy(PopupRequestPolicy::DefaultDeny);
+        webview
+            .evaluate_javascript(
+                "legacy-policy-change",
+                "firstPopup.postMessage('open', '*')",
+            )
+            .unwrap();
+        let denied = collect_webview_events_until(webview, |events| {
+            events
+                .iter()
+                .any(|event| matches!(event.event, HostEvent::PopupRequested { .. }))
+        });
+        assert!(denied.iter().any(|event| {
+            event.webview_id == retained_child_webview_id
+                && matches!(
+                    event.event,
+                    HostEvent::PopupRequested {
+                        policy: PopupRequestPolicy::DefaultDeny,
+                        ..
+                    }
+                )
+        }));
+        assert_eq!(
+            webview.managed_child_webview_ids(),
+            vec![retained_child_webview_id.clone()]
+        );
 
         webview
             .destroy_managed_child_webview(&retained_child_webview_id)
