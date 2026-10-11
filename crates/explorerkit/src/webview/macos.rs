@@ -9,8 +9,8 @@ use std::rc::Rc;
 use dpi::{PhysicalPosition, PhysicalSize};
 use explorerkit_embedder::{
     ConfigurableHost, ContextMenuAction, Host, HostError, HostEvent, HostInputEvent,
-    JavaScriptEvaluationErrorKind, LoadStatusKind, PopupRequestPolicy, SessionHandle,
-    WebViewCommand, WebViewHandle,
+    JavaScriptEvaluationErrorKind, LoadStatusKind, NewWebViewDecision, NewWebViewRequest,
+    PopupRequestPolicy, SessionHandle, WebViewCommand, WebViewHandle, WebViewRegistrar,
 };
 use explorerkit_host::{
     HostSurface, NativeSurface, SurfaceDelegate, SurfaceError, SurfaceSize, SurfaceViewport,
@@ -302,17 +302,21 @@ pub struct MacOsViewHost<S> {
     webkit_data_store_identifier: WebKitDataStoreIdentifier,
     views: HashMap<WebViewHandle, MacOsView>,
     callbacks: Rc<RefCell<SystemCallbacks>>,
+    registrar: Option<WebViewRegistrar>,
     next_generation: u64,
 }
 
 impl<S> MacOsViewHost<S> {
     /// Creates the macOS host with existing Servo surface services and one WebKit store.
     pub fn new(services: S, options: MacOsViewHostOptions) -> Self {
+        let mut servo = SurfaceHost::new(services, options.surface_host);
+        servo.set_navigation_state_events();
         Self {
-            servo: SurfaceHost::new(services, options.surface_host),
+            servo,
             webkit_data_store_identifier: options.webkit_data_store_identifier,
             views: HashMap::new(),
             callbacks: Rc::new(RefCell::new(SystemCallbacks::default())),
+            registrar: None,
             next_generation: 0,
         }
     }
@@ -327,12 +331,41 @@ impl<S> MacOsViewHost<S> {
         self.servo.services_mut()
     }
 
+    fn finish_servo_pump(
+        &self,
+        webviews: &[WebViewHandle],
+        result: Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError>,
+    ) -> Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError> {
+        if result.is_err() {
+            if let Some(registrar) = &self.registrar {
+                for &webview in webviews {
+                    if let Some(MacOsView::System(state)) = self.views.get(&webview) {
+                        for event in self.system_sink(webview, state.generation).drain() {
+                            registrar.record_event(webview, event);
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
     fn next_generation(&mut self) -> u64 {
         self.next_generation = self.next_generation.wrapping_add(1);
         self.next_generation
     }
 
-    fn view_is_servo(&self, webview: WebViewHandle) -> Result<bool, HostError> {
+    fn sync_servo_views(&mut self) {
+        let live = self.servo.native_view_handles();
+        self.views
+            .retain(|handle, view| !matches!(view, MacOsView::Servo) || live.contains(handle));
+        for handle in live {
+            self.views.entry(handle).or_insert(MacOsView::Servo);
+        }
+    }
+
+    fn view_is_servo(&mut self, webview: WebViewHandle) -> Result<bool, HostError> {
+        self.sync_servo_views();
         match self.views.get(&webview) {
             Some(MacOsView::Servo) => Ok(true),
             Some(MacOsView::System(_)) => Ok(false),
@@ -410,6 +443,24 @@ impl<S> Host for MacOsViewHost<S>
 where
     S: AppKitViewDelegate + for<'a> SurfaceDelegate<Frame<'a> = SurfaceFrame<'a>>,
 {
+    fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+        self.registrar = Some(registrar.clone());
+        self.servo.set_webview_registrar(registrar);
+    }
+
+    fn set_new_webview_handler(
+        &mut self,
+        webview: WebViewHandle,
+        handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+    ) -> Result<(), HostError> {
+        if self.view_is_servo(webview)? {
+            return self.servo.set_new_webview_handler(webview, handler);
+        }
+        Err(HostError::new(
+            "native child creation is unavailable with the published system-WebView backend",
+        ))
+    }
+
     fn shutdown(&mut self) -> Result<(), HostError> {
         for (&webview, view) in &self.views {
             if let MacOsView::System(state) = view {
@@ -456,14 +507,16 @@ where
         &mut self,
         webviews: &[WebViewHandle],
     ) -> Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError> {
+        self.sync_servo_views();
         let servo_views: Vec<_> = webviews
             .iter()
             .copied()
             .filter(|webview| matches!(self.views.get(webview), Some(MacOsView::Servo)))
             .collect();
+        let servo_result = self.servo.perform_all_updates(&servo_views);
+        self.sync_servo_views();
         let mut servo_results: HashMap<_, _> = self
-            .servo
-            .perform_all_updates(&servo_views)?
+            .finish_servo_pump(webviews, servo_result)?
             .into_iter()
             .collect();
 
@@ -471,16 +524,19 @@ where
             .iter()
             .copied()
             .map(|webview| {
-                let result = match self.views.get(&webview) {
-                    Some(MacOsView::Servo) => with_navigation_state(
+                let result = if servo_views.contains(&webview) {
+                    with_navigation_state(
                         servo_results
                             .remove(&webview)
-                            .unwrap_or_else(|| Err(unknown_webview(webview))),
-                    ),
-                    Some(MacOsView::System(_)) => {
-                        collect_system_updates(&mut self.views, &self.callbacks, webview)
+                            .unwrap_or_else(|| Ok(Vec::new())),
+                    )
+                } else {
+                    match self.views.get(&webview) {
+                        Some(MacOsView::System(_)) => {
+                            collect_system_updates(&mut self.views, &self.callbacks, webview)
+                        }
+                        _ => Err(unknown_webview(webview)),
                     }
-                    None => Err(unknown_webview(webview)),
                 };
                 (webview, result)
             })
@@ -1449,6 +1505,77 @@ mod tests {
     struct EvaluationRuntime {
         runtime: Runtime<MacOsViewHost<NoopDelegate>>,
         callbacks: Rc<RefCell<SystemCallbacks>>,
+    }
+
+    #[test]
+    fn shared_pump_errors_remain_host_errors_with_or_without_servo_views() {
+        struct FailedPumpHost(MacOsViewHost<NoopDelegate>);
+        impl Host for FailedPumpHost {
+            fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+                self.0.set_webview_registrar(registrar);
+            }
+            fn create_webview(
+                &mut self,
+                session: SessionHandle,
+                webview: WebViewHandle,
+            ) -> Result<(), HostError> {
+                if self.0.views.is_empty() {
+                    self.0.create_webview_with_options(
+                        session,
+                        webview,
+                        MacOsWebViewOptions::new(MacOsWebViewKind::SystemWebView),
+                    )
+                } else {
+                    self.0.create_webview(session, webview)
+                }
+            }
+            fn observe_webview_events(
+                &mut self,
+                _: WebViewHandle,
+                _: &[HostEvent],
+            ) -> Result<(), HostError> {
+                Ok(())
+            }
+            fn perform_all_updates(
+                &mut self,
+                webviews: &[WebViewHandle],
+            ) -> Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError>
+            {
+                self.0
+                    .finish_servo_pump(webviews, Err(HostError::new("shared pump failed")))
+            }
+        }
+        for include_servo in [false, true] {
+            let host = MacOsViewHost::new(
+                NoopDelegate,
+                MacOsViewHostOptions::new(
+                    SurfaceHostOptions::default(),
+                    WebKitDataStoreIdentifier([0x39; 16]),
+                ),
+            );
+            let callbacks = host.callbacks.clone();
+            let mut runtime = Runtime::new(FailedPumpHost(host));
+            let session = runtime.create_session();
+            let system = runtime.create_webview(session).unwrap();
+            if include_servo {
+                runtime.create_webview(session).unwrap();
+            }
+            let target = *callbacks.borrow().views.keys().next().unwrap();
+            let sink = SystemCallbackSink { target, callbacks };
+            let title = HostEvent::PageTitleChanged {
+                title: Some("system callback survives".into()),
+            };
+            sink.push(title.clone());
+            assert!(
+                matches!(runtime.perform_all_updates(), Err(explorerkit_embedder::RuntimeError::Host(error)) if error.message() == "shared pump failed")
+            );
+            let events = runtime.drain_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].webview, system);
+            assert_eq!(events[0].event, title);
+            assert!(runtime.perform_all_updates().is_err());
+            assert!(runtime.drain_events().is_empty());
+        }
     }
 
     impl EvaluationRuntime {

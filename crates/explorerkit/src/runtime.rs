@@ -1,7 +1,8 @@
 //! Runtime/session facade exports.
 
 pub use explorerkit_embedder::{
-    Runtime, RuntimeError, RuntimeError as ExplorerKitError, SessionHandle,
+    NewWebViewDecision, NewWebViewRequest, Runtime, RuntimeError, RuntimeError as ExplorerKitError,
+    SessionHandle,
 };
 
 #[cfg(all(

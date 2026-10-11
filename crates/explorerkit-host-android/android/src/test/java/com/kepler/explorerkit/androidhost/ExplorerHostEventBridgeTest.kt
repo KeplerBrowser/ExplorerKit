@@ -10,16 +10,18 @@ class ExplorerHostEventBridgeTest {
       listOf(
         """{"name":"navigationRequested","payload":{"navigationId":"navigation-1","url":"https://example.com/"}}""" to
           ExplorerHostEvent.NavigationRequested("navigation-1", "https://example.com/"),
-        """{"name":"popupRequested","payload":{"parentWebViewId":"parent-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"default-deny"}}""" to
+        """{"name":"popupRequested","payload":{"requestId":"request-1","parentWebViewId":"parent-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"default-deny"}}""" to
           ExplorerHostEvent.PopupRequested(
+            requestId = "request-1",
             parentWebViewId = "parent-1",
             parentUrl = "https://parent.test/",
             targetUrl = null,
             windowFeatures = null,
             policy = "default-deny"
           ),
-        """{"name":"popupCreated","payload":{"parentWebViewId":"parent-1","childWebViewId":"child-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"managed-child"}}""" to
+        """{"name":"popupCreated","payload":{"requestId":"request-1","parentWebViewId":"parent-1","childWebViewId":"child-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"managed-child"}}""" to
           ExplorerHostEvent.PopupCreated(
+            requestId = "request-1",
             parentWebViewId = "parent-1",
             childWebViewId = "child-1",
             parentUrl = "https://parent.test/",
@@ -27,6 +29,8 @@ class ExplorerHostEventBridgeTest {
             windowFeatures = null,
             policy = "managed-child"
           ),
+        """{"name":"popupCreationFailed","payload":{"requestId":"request-1","errorMessage":"renderer unavailable"}}""" to
+          ExplorerHostEvent.PopupCreationFailed("request-1", "renderer unavailable"),
         """{"name":"urlChanged","payload":{"url":"https://example.com/"}}""" to
           ExplorerHostEvent.UrlChanged("https://example.com/"),
         """{"name":"pageTitleChanged","payload":{"title":"Example Domain"}}""" to
