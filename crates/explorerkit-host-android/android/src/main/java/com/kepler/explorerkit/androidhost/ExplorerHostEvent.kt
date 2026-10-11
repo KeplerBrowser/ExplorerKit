@@ -48,6 +48,7 @@ sealed interface ExplorerHostEvent {
   ) : ExplorerHostEvent
 
   data class PopupRequested(
+    val requestId: String,
     val parentWebViewId: String,
     val parentUrl: String?,
     val targetUrl: String?,
@@ -56,12 +57,18 @@ sealed interface ExplorerHostEvent {
   ) : ExplorerHostEvent
 
   data class PopupCreated(
+    val requestId: String,
     val parentWebViewId: String,
     val childWebViewId: String,
     val parentUrl: String?,
     val targetUrl: String?,
     val windowFeatures: String?,
     val policy: String
+  ) : ExplorerHostEvent
+
+  data class PopupCreationFailed(
+    val requestId: String,
+    val errorMessage: String
   ) : ExplorerHostEvent
 
   data class UrlChanged(val url: String) : ExplorerHostEvent

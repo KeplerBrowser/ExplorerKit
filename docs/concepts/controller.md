@@ -234,6 +234,23 @@ Servo's `JavaScriptEvaluationError` into these categories:
 `InternalError`, `WebViewNotReady`, and `SerializationError`. The ID only
 matches the result to its request.
 
+For native Rust Servo views, evaluation IDs are scoped to the addressed view.
+An empty ID or one already pending on that view is rejected; the same ID can
+be pending on siblings. A registered native child uses the same rules as an
+app-created view.
+
+When Servo reports `LoadStatus::Started`, still-pending evaluations from that
+view's previous observed load finish with `DocumentNotFound`. A late native
+callback cannot complete a reused ID or affect another view. This follows
+observed load events: Servo does not report `Started` for every reload or
+overlapping navigation, so submitting a navigation command alone does not
+retire an evaluation. The SDK does not cancel native script execution or
+promise which document a script submitted during navigation will run in.
+
+Destroying a view discards its queued results; retire your own waiters when
+you destroy it. Native closure reports `Closed`. Closing a source does not
+cancel evaluations on its live children.
+
 For the React Native promise API, see
 [React Native](../platforms/react-native.md#evaluating-javascript). For macOS system
 views, see [macOS system web view](../reference/macos-system-webview.md#evaluating-javascript).

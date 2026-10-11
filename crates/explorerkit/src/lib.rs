@@ -28,7 +28,9 @@ pub mod webview;
 
 pub use events::{ExplorerKitEvent, FaviconImage, FaviconPixelFormat, HostEvent, LoadStatusKind};
 pub use input::HostInputEvent;
-pub use runtime::{ExplorerKitError, Runtime, SessionHandle};
+pub use runtime::{
+    ExplorerKitError, NewWebViewDecision, NewWebViewRequest, Runtime, SessionHandle,
+};
 pub use surface::{HostSurface, SurfacePoint, SurfaceSize, SurfaceViewport};
 pub use webview::WebViewHandle;
 
@@ -170,6 +172,7 @@ mod tests {
     fn facade_popup_child_surface_adoption_keeps_child_events_tagged() {
         let child_webview_id = "servo-child-1".to_owned();
         let popup_created = HostEvent::PopupCreated {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "servo-parent-1".to_owned(),
             child_webview_id: child_webview_id.clone(),
             parent_url: Some("https://parent.test/".to_owned()),

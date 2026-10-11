@@ -11,6 +11,7 @@ class ExplorerViewEventsTest {
     val payload =
       createNewWebViewRequestedEventPayload(
         ExplorerHostEvent.PopupRequested(
+          requestId = "request-1",
           parentWebViewId = "parent-1",
           parentUrl = null,
           targetUrl = null,
@@ -32,6 +33,7 @@ class ExplorerViewEventsTest {
     val payload =
       createNewWebViewRequestedEventPayload(
         ExplorerHostEvent.PopupRequested(
+          requestId = "request-1",
           parentWebViewId = "parent-1",
           parentUrl = "https://parent.test/",
           targetUrl = "https://target.test/",

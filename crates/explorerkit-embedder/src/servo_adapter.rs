@@ -75,6 +75,7 @@ pub struct PendingPermissionRequestInfo {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PopupRequest {
+    pub request_id: String,
     pub parent_webview_id: String,
     pub parent_url: Option<String>,
     pub target_url: Option<String>,
@@ -83,6 +84,7 @@ pub struct PopupRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PopupCreated {
+    pub request_id: String,
     pub parent_webview_id: String,
     pub child_webview_id: String,
     pub parent_url: Option<String>,
@@ -262,6 +264,7 @@ impl ServoAdapterState {
 
     pub fn request_popup(&mut self, request: PopupRequest) {
         self.events.push_back(HostEvent::PopupRequested {
+            request_id: request.request_id,
             parent_webview_id: request.parent_webview_id,
             parent_url: request.parent_url,
             target_url: request.target_url,
@@ -272,6 +275,7 @@ impl ServoAdapterState {
 
     pub fn notify_popup_created(&mut self, created: PopupCreated) {
         self.events.push_back(HostEvent::PopupCreated {
+            request_id: created.request_id,
             parent_webview_id: created.parent_webview_id,
             child_webview_id: created.child_webview_id,
             parent_url: created.parent_url,
@@ -676,6 +680,7 @@ mod tests {
         let mut state = ServoAdapterState::default();
 
         state.request_popup(PopupRequest {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "parent-1".to_owned(),
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
@@ -685,6 +690,7 @@ mod tests {
         assert_eq!(
             state.drain_events(),
             vec![HostEvent::PopupRequested {
+                request_id: "request-1".to_owned(),
                 parent_webview_id: "parent-1".to_owned(),
                 parent_url: Some("https://parent.test/".to_owned()),
                 target_url: None,
@@ -700,6 +706,7 @@ mod tests {
         let mut state = ServoAdapterState::default();
 
         state.notify_popup_created(PopupCreated {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "parent-1".to_owned(),
             child_webview_id: "child-1".to_owned(),
             parent_url: Some("https://parent.test/".to_owned()),
@@ -710,6 +717,7 @@ mod tests {
         assert_eq!(
             state.drain_events(),
             vec![HostEvent::PopupCreated {
+                request_id: "request-1".to_owned(),
                 parent_webview_id: "parent-1".to_owned(),
                 child_webview_id: "child-1".to_owned(),
                 parent_url: Some("https://parent.test/".to_owned()),
