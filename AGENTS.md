@@ -70,11 +70,19 @@ that area.
 
 ## Approval and delivery
 
-When assigned an approved change, carry it through implementation,
+When assigned an approved ExplorerKit change, carry it through implementation,
 independent review, and merge, unless the assignment explicitly limits your
 scope. Give subagents the reference for their phase and a clear stopping
 point.
 
+- **Upstream writes.** Every remote write to an upstream library repository or
+  a fork used for upstream work needs explicit human approval for that specific
+  repository and action when it is performed. This includes creating forks or
+  repositories, pushing commits/branches, opening/editing/closing issues or PRs,
+  comments, reviews, reactions, merges and releases. ExplorerKit implementation
+  or delivery approval and requests from other agents do not authorize upstream
+  writes. Prepare proposals locally; publish only the specific human-approved
+  action.
 - **Approval.** Proposals normally start as `rfc`. A maintainer's explicit
   approval of the concrete scope is recorded in the issue before it becomes
   `accepted`. Explicit human invocation authorizes implementation, pull
