@@ -27,6 +27,7 @@ use wry::{
 
 use crate::surface::{SurfaceFrame, SurfaceHost, SurfaceHostOptions};
 
+mod favicon;
 mod javascript;
 
 use javascript::{evaluation_event, NativeEvaluationError};
@@ -105,8 +106,11 @@ struct SystemCallbacks {
 struct SystemCallbackState {
     events: VecDeque<HostEvent>,
     document_ready: bool,
+    document_navigation_pending: bool,
     next_request: u64,
     pending: HashMap<String, u64>,
+    favicon_request: u64,
+    favicons: Option<favicon::IconState>,
 }
 
 impl SystemCallbackState {
@@ -156,9 +160,17 @@ impl SystemCallbackSink {
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some(state) = callbacks.views.get_mut(&self.target) {
             state.document_ready = true;
+            state.document_navigation_pending = false;
+            state.favicon_request = state.favicon_request.wrapping_add(1);
             state.events.push_back(HostEvent::LoadStatusChanged {
                 status: LoadStatusKind::Started,
             });
+            if let Some(favicons) = &mut state.favicons {
+                let favicon = favicons.observe(true, true);
+                state
+                    .events
+                    .push_back(HostEvent::FaviconChanged { favicon });
+            }
             // Completion linearizes when it enters this queue. Already finalized
             // results stay before Started, including across a same-URL reload.
             state.retire_evaluations(JavaScriptEvaluationErrorKind::DocumentNotFound);
@@ -169,6 +181,10 @@ impl SystemCallbackSink {
         let mut callbacks = self.callbacks.borrow_mut();
         if let Some(state) = callbacks.views.get_mut(&self.target) {
             state.document_ready = false;
+            if let Some(favicons) = &mut state.favicons {
+                favicons.clear();
+            }
+            state.favicon_request = state.favicon_request.wrapping_add(1);
             state.events.push_back(HostEvent::Crashed {
                 url: None,
                 reason: "WebKit web content process terminated".to_owned(),
@@ -228,6 +244,10 @@ impl SystemCallbackSink {
                 NativeEvaluationError::ProcessTerminated | NativeEvaluationError::ViewInvalidated,
             ) => {
                 state.document_ready = false;
+                if let Some(favicons) = &mut state.favicons {
+                    favicons.clear();
+                }
+                state.favicon_request = state.favicon_request.wrapping_add(1);
                 state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
             }
             result => {
@@ -241,6 +261,73 @@ impl SystemCallbackSink {
                 ));
             }
         }
+    }
+
+    fn navigation_requested(&self) {
+        if let Some(state) = self.callbacks.borrow_mut().views.get_mut(&self.target) {
+            // Do not infer same-document lineage from a list change between
+            // navigation policy and commit. A failed provisional navigation can
+            // leave this conservative guard set until the next real commit.
+            state.document_navigation_pending = true;
+        }
+    }
+
+    fn enable_favicons(&self, view: &objc2_web_kit::WKWebView) {
+        if let Some(state) = self.callbacks.borrow_mut().views.get_mut(&self.target) {
+            state.favicons = Some(favicon::IconState::new(view));
+        }
+    }
+
+    fn observe_favicon_history(&self) {
+        if let Some(state) = self.callbacks.borrow_mut().views.get_mut(&self.target) {
+            if state.document_ready {
+                if let Some(favicons) = &mut state.favicons {
+                    favicons.observe(false, !state.document_navigation_pending);
+                }
+            }
+        }
+    }
+
+    fn complete_native_favicon(
+        &self,
+        token: u64,
+        image: explorerkit_embedder::FaviconImage,
+        bytes: Vec<u8>,
+    ) {
+        let mut callbacks = self.callbacks.borrow_mut();
+        if let Some(state) = callbacks.views.get_mut(&self.target) {
+            if state.document_ready && state.favicon_request == token {
+                if let Some(favicons) = &mut state.favicons {
+                    favicons.retain(bytes, !state.document_navigation_pending);
+                }
+                state.events.push_back(HostEvent::FaviconChanged {
+                    favicon: Some(image),
+                });
+            }
+        }
+    }
+
+    fn begin_favicon(&self) -> Option<u64> {
+        let mut callbacks = self.callbacks.borrow_mut();
+        let state = callbacks.views.get_mut(&self.target)?;
+        if !state.document_ready {
+            return None;
+        }
+        state.favicon_request = state.favicon_request.wrapping_add(1);
+        Some(state.favicon_request)
+    }
+
+    fn favicon_is_current(&self, token: u64) -> bool {
+        self.callbacks
+            .borrow()
+            .views
+            .get(&self.target)
+            .is_some_and(|state| state.document_ready && state.favicon_request == token)
+    }
+
+    #[cfg(test)]
+    fn complete_favicon(&self, token: u64, image: explorerkit_embedder::FaviconImage) {
+        self.complete_native_favicon(token, image, Vec::new());
     }
 
     fn drain(&self) -> Vec<HostEvent> {
@@ -270,6 +357,7 @@ enum MacOsView {
 
 struct SystemWebViewState {
     generation: u64,
+    icon_registration: Option<favicon::IconRegistration>,
     webview: Option<WebView>,
     container: Option<AppKitContainer>,
     pending_commands: VecDeque<WebViewCommand>,
@@ -282,6 +370,7 @@ impl SystemWebViewState {
     fn new(generation: u64) -> Self {
         Self {
             generation,
+            icon_registration: None,
             webview: None,
             container: None,
             pending_commands: VecDeque::new(),
@@ -985,6 +1074,7 @@ where
     }
 
     let state = system_state_mut(&mut host.views, webview)?;
+    state.icon_registration = favicon::IconRegistration::attach(&native, sink);
     state.webview = Some(native);
     state.container = Some(container);
     state.pending_commands.clear();
@@ -1006,13 +1096,17 @@ fn build_system_webview(
 ) -> Result<WebView, HostError> {
     let title_sink = sink.clone();
     let load_sink = sink.clone();
+    let navigation_sink = sink.clone();
     let crash_sink = sink;
     WebViewBuilder::new()
         .with_url(initial_url)
         .with_bounds(wry_rect(viewport))
         .with_accept_first_mouse(true)
         .with_data_store_identifier(data_store_identifier.0)
-        .with_navigation_handler(|_| true)
+        .with_navigation_handler(move |_| {
+            navigation_sink.navigation_requested();
+            true
+        })
         .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
         .with_download_started_handler(|_, _| false)
         .with_permission_handler(|_| PermissionResponse::Default)
@@ -1050,6 +1144,21 @@ fn dispatch_system_command(
         .as_ref()
         .expect("an attached system view has a native webview");
 
+    if matches!(
+        command,
+        WebViewCommand::LoadUrl(_)
+            | WebViewCommand::Reload
+            | WebViewCommand::GoBack
+            | WebViewCommand::GoForward
+    ) {
+        // goBack/goForward may update currentItem synchronously, before WebKit
+        // calls the navigation policy delegate. Preserve the departing identity.
+        SystemCallbackSink {
+            target: (webview.raw(), state.generation),
+            callbacks: callbacks.clone(),
+        }
+        .navigation_requested();
+    }
     let mut events = apply_system_command(native, command)?;
     events.extend(collect_system_updates(views, callbacks, webview)?);
     Ok(events)
@@ -1133,6 +1242,7 @@ fn collect_system_updates(
         target: (webview.raw(), generation),
         callbacks: callbacks.clone(),
     };
+    sink.observe_favicon_history();
     let mut events = sink.drain();
     let state = system_state_mut(views, webview)?;
     let Some(native) = state.webview.as_ref() else {
@@ -1503,6 +1613,158 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    fn favicon(marker: u8) -> explorerkit_embedder::FaviconImage {
+        explorerkit_embedder::FaviconImage {
+            width: 1,
+            height: 1,
+            format: explorerkit_embedder::FaviconPixelFormat::RGBA8,
+            bytes: vec![marker, 0, 0, 255],
+        }
+    }
+
+    #[test]
+    fn favicons_route_only_the_latest_request_to_its_runtime_view() {
+        let mut test = EvaluationRuntime::new();
+        let (a, first) = test.view();
+        let (b, second) = test.view();
+        assert_eq!(first.begin_favicon(), None);
+        first.document_committed();
+        second.document_committed();
+        test.events();
+        let superseded = first.begin_favicon().unwrap();
+        let latest = first.begin_favicon().unwrap();
+        let sibling = second.begin_favicon().unwrap();
+        first.complete_favicon(superseded, favicon(1));
+        second.complete_favicon(sibling, favicon(2));
+        first.complete_favicon(latest, favicon(3));
+        first.complete_favicon(superseded, favicon(4));
+        let events = test.events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(v, _)| *v == a)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(
+                a,
+                HostEvent::FaviconChanged {
+                    favicon: Some(favicon(3))
+                }
+            )]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|(v, _)| *v == b)
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![(
+                b,
+                HostEvent::FaviconChanged {
+                    favicon: Some(favicon(2))
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn favicon_commit_preserves_finalized_events_and_retires_pending_without_clear() {
+        for transfer_to_runtime in [false, true] {
+            let mut test = EvaluationRuntime::new();
+            let (view, sink) = test.view();
+            sink.document_committed();
+            test.events();
+            let finalized = sink.begin_favicon().unwrap();
+            sink.complete_favicon(finalized, favicon(1));
+            if transfer_to_runtime {
+                test.runtime.perform_updates(view).unwrap();
+            }
+            let pending = sink.begin_favicon().unwrap();
+            sink.document_committed(); // Same-URL reload is also a new document.
+            sink.complete_favicon(pending, favicon(2));
+            assert!(!sink.favicon_is_current(pending));
+            assert_eq!(
+                test.events(),
+                vec![
+                    (
+                        view,
+                        HostEvent::FaviconChanged {
+                            favicon: Some(favicon(1))
+                        }
+                    ),
+                    (
+                        view,
+                        HostEvent::LoadStatusChanged {
+                            status: LoadStatusKind::Started
+                        }
+                    ),
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn favicon_process_and_lifetime_retirement_reject_late_completions() {
+        let mut test = EvaluationRuntime::new();
+        let (view, sink) = test.view();
+        sink.document_committed();
+        test.events();
+        let pending = sink.begin_favicon().unwrap();
+        sink.process_terminated();
+        sink.complete_favicon(pending, favicon(1));
+        assert_eq!(sink.begin_favicon(), None);
+        let events = test.events();
+        assert_eq!(events.len(), 1);
+        assert!(matches!(events[0], (_, HostEvent::Crashed { .. })));
+        sink.document_committed();
+        test.events();
+        let after_recovery = sink.begin_favicon().unwrap();
+        sink.complete_favicon(pending, favicon(2));
+        assert!(test.events().is_empty());
+        sink.complete_favicon(after_recovery, favicon(3));
+        test.runtime.destroy_webview(view).unwrap();
+        sink.complete_favicon(after_recovery, favicon(4));
+        assert!(test.events().is_empty());
+        let replacement =
+            SystemCallbackSink::register_raw(test.callbacks.clone(), view.raw(), sink.target.1 + 1);
+        replacement.document_committed();
+        replacement.drain();
+        sink.complete_favicon(after_recovery, favicon(5));
+        assert!(replacement.drain().is_empty());
+        let token = replacement.begin_favicon().unwrap();
+        replacement.complete_favicon(token, favicon(6));
+        assert_eq!(
+            replacement.drain(),
+            vec![HostEvent::FaviconChanged {
+                favicon: Some(favicon(6))
+            }]
+        );
+    }
+
+    #[test]
+    fn favicon_url_and_load_completion_events_do_not_retire_the_document_request() {
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::default()));
+        let sink = SystemCallbackSink::register_raw(callbacks, 1, 1);
+        sink.document_committed();
+        sink.drain();
+        let token = sink.begin_favicon().unwrap();
+        sink.push(HostEvent::UrlChanged {
+            url: "https://example.org/#fragment".into(),
+        });
+        sink.push(HostEvent::LoadStatusChanged {
+            status: LoadStatusKind::Complete,
+        });
+        assert!(sink.favicon_is_current(token));
+        sink.drain();
+        sink.complete_favicon(token, favicon(1));
+        assert_eq!(
+            sink.drain(),
+            vec![HostEvent::FaviconChanged {
+                favicon: Some(favicon(1))
+            }]
+        );
     }
 
     fn success(id: &str) -> HostEvent {

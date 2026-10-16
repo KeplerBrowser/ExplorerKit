@@ -50,6 +50,22 @@ native Rust, but its React Native wiring is incomplete and not supported.
 
 ## Details by capability
 
+### Favicons
+
+- **Native Rust with Servo:** forwards Servo's decoded first frame and pixel
+  format through `FaviconChanged`. Discovery and selection stay in Servo.
+- **Native Rust with macOS system WebKit:** document-load icons use a private
+  WebKit API and work only when that API is available. Post-load changes to an
+  icon link are not reported; changing its `href` or inserting another icon
+  link does not trigger native discovery on the tested WebKit version.
+  PNG and ICO pixels are validated; SVG decoding is not supported by this
+  adapter. Malformed, oversized or undecodable images supply no replacement
+  image. Committed documents restore retained native history icons or report
+  `None` so the app can show its fallback; see the retention limits below.
+- **Android and iOS adapters:** no supported public favicon callback.
+
+See [the macOS event and lifetime rules](macos-system-webview.md#favicons).
+
 ### Navigation policy
 
 The page asks before following a link or loading a frame (Servo's

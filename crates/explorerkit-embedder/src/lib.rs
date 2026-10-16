@@ -168,7 +168,9 @@ impl JavaScriptEvaluationErrorKind {
     }
 }
 
-/// Servo favicon pixel formats preserved without conversion.
+/// Pixel layouts used by owned favicon images.
+///
+/// Servo favicon pixel formats are preserved without conversion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FaviconPixelFormat {
     /// Luminance channel only.
@@ -183,7 +185,10 @@ pub enum FaviconPixelFormat {
     BGRA8,
 }
 
-/// An owned copy of Servo's first favicon image frame.
+/// An owned decoded first-frame favicon image.
+///
+/// Servo views copy their first frame without conversion. macOS system views
+/// decode WebKit-provided image data into straight RGBA8 pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FaviconImage {
     /// Image width in pixels.
@@ -192,7 +197,8 @@ pub struct FaviconImage {
     pub height: u32,
     /// Pixel layout used by [`Self::bytes`].
     pub format: FaviconPixelFormat,
-    /// Unmodified bytes from Servo's first image frame.
+    /// Unmodified bytes from Servo's first image frame, or decoded straight
+    /// RGBA8 bytes for a macOS system view.
     pub bytes: Vec<u8>,
 }
 
@@ -223,9 +229,13 @@ pub enum HostEvent {
     PageTitleChanged {
         title: Option<String>,
     },
-    /// Servo reported a new favicon value for this event's webview.
+    /// A new favicon value for this event's webview.
     FaviconChanged {
-        /// The current first-frame image, or `None` when Servo reports no favicon.
+        /// The current first-frame image, or `None` when no image is available.
+        ///
+        /// Servo forwards its engine value. A macOS system view with native icon
+        /// support also emits `None` at document commit when no retained image is
+        /// available; a later native load may supply an image.
         favicon: Option<FaviconImage>,
     },
     StatusTextChanged {
