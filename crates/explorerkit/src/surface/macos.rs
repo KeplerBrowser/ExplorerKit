@@ -191,6 +191,10 @@ fn ensure_child_view(
     }
 }
 
+/// Converts top-left child bounds into the AppKit parent's coordinate space.
+///
+/// # Safety
+/// `parent` must be a live NSView accessed on its owning AppKit thread.
 unsafe fn appkit_frame(parent: id, bounds: AppKitChildViewBounds) -> NSRect {
     let parent_bounds = parent.bounds();
     let width = bounds.width.max(1.0);
