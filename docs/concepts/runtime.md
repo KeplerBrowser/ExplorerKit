@@ -75,8 +75,9 @@ A web view's identity (its controller) and its surface have separate
 lifetimes:
 
 1. A controller can exist before its surface is ready.
-2. Navigation and commands sent before a surface exists wait in Rust until a
-   surface is attached.
+2. For app-created views, navigation and commands sent before the first
+   surface exists wait in Rust until it is attached. An adopted native child
+   already has a running document and accepts commands before attachment.
 3. Detaching a surface removes the render target, but does not invalidate the
    controller.
 4. Disposing the host invalidates the controller. Later commands fail with an
@@ -87,29 +88,63 @@ losing the page.
 
 ## Popups and new windows
 
-When a page calls `window.open` or follows a `target="_blank"` link, Servo
-asks the embedder through `WebViewDelegate::request_create_new`. A
-`PopupRequestPolicy` decides what happens:
+When a page needs a new browsing context, Servo asks the embedder through
+`WebViewDelegate::request_create_new`. Creation is denied unless the source
+view has a handler installed with `Runtime::set_new_webview_handler`:
 
-- `DefaultDeny` (the default): nothing opens. The request is still reported as
-  an event with the URL of the page that asked. Servo 0.6 doesn't expose the
-  popup's target URL, so the event's `targetUrl` and `windowFeatures` are
-  always null for now.
-- `ManagedChild`: ExplorerKit creates a child web view under the view that asked
-  (the root). Your app attaches a surface to the child with
-  `attach_managed_child_surface`, and the child's events carry its ID. The
-  child must keep a live handle while it exists.
+```rust
+runtime.set_new_webview_handler(view, Some(std::rc::Rc::new(|_request| {
+    // This example accepts every request from this view.
+    NewWebViewDecision::Create
+})))?;
+```
 
-Set the policy per view with `Runtime::set_popup_policy`. Managed children
-belong to one root. They are not a way to create more top-level views (use
-`create_webview` for that), and they do not add a multi-view React Native
-API.
+The handler returns `NewWebViewDecision::Deny` or `Create` synchronously on
+the owning thread. It receives a `NewWebViewRequest` with the actual source
+handle, a unique opaque request ID, and the source URL when known. Servo does
+not supply the destination URL or window features; those fields remain
+`None`. The handler cannot infer a user click or destination from this
+metadata. Do not call back into the Runtime or wait for UI inside it.
 
-The React Native Android adapter always denies popups and sends
-`onCreateNewWebViewRequested` as information only. iOS does not send that
-event. Navigation allow/deny for normal links is a different request
+On `Create`, ExplorerKit retains the original native child and registers an
+ordinary `WebViewHandle` in the source's session. It preserves Servo's native
+POST, `about:blank`, opener, named-window, and `noopener` behavior. It does not
+recreate the page by loading its URL.
+
+| Receipt | Meaning |
+| --- | --- |
+| `PopupRequested` | Creation was denied; this is information, not a pending question. |
+| `PopupCreated` | The child is registered. `ExplorerKitEvent::created_webview` contains its handle; `webview` identifies the immediate source. |
+| `PopupCreationFailed` | The handler accepted, but preparation failed before native creation. |
+
+Each receipt carries the attempt's `request_id`. The creation receipt remains
+available even if its source closes before you drain events. Subsequent
+events use the child's own handle, with no managed-child ID in the envelope.
+Use that handle for the existing navigation, evaluation, input, prompt, and
+surface methods. Answers to prompts must target the view that asked. See
+[evaluation lifetime](controller.md#javascript-evaluation-results) for result
+identity and navigation behavior.
+
+The child can execute before your app attaches a surface. Your app chooses
+its layout slot later; see [attaching and detaching](surfaces.md#attaching-and-detaching).
+Source and child have independent lifetimes. Closing either leaves the
+other's document, history, and pending work intact. Source lineage records
+IDs only and does not keep its document alive.
+
+A child initially copies its source's handler. Changing or removing a
+handler affects only the addressed view, including for nested requests.
+`None` denies future requests. `set_popup_policy(DefaultDeny)` also clears the
+handler; `ManagedChild` is rejected on this registered route. Standalone
+lower-level embedders retain their legacy managed-child policy. Existing
+managed-child surface methods remain aliases for registered children and
+resolve even after the originating source closes; new callers use the child
+handle directly.
+
+See [platform support](../reference/capabilities.md#popups-and-new-windows)
+before enabling this handler. Unsupported hosts return an error.
+Navigation allow/deny for normal links is a separate request
 (`request_navigation`), and `load_web_resource` is HTTP(S) resource
-interception, not popup routing.
+interception.
 
 ## Native macOS: Servo or system WebKit per view
 

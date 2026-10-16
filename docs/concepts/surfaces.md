@@ -105,14 +105,21 @@ that reuse the same offscreen target and completion rules.
 
 - Create a web view before you attach a surface to it.
 - A web view has at most one surface at a time.
-- The first attach creates the Servo view. Later attaches reuse it, so the
-  page, history, and controller state survive.
+- For an app-created view, the first attach creates the Servo view. An
+  [adopted native child](runtime.md#popups-and-new-windows) already exists;
+  attachment uses that same document and rendering context. Later attaches
+  reuse the view, so the page, history, and controller state survive.
 - Send the viewport's position, size, and scale together, before the next
   update.
 - Detaching removes the render target but keeps the web view alive, so you can
   attach it again later.
 - If your layout collapses to zero size, don't attach yet, or detach until the
   slot has a real size.
+
+Adopted Servo children have their own exportable GPU context. Attach them to
+`OffscreenSurface::exportable()`; other target kinds return an error. Each
+frame names the child's handle. Moving the child to another slot means
+detaching and reattaching the same view, without loading the page again.
 
 On macOS, a [system web view](../reference/macos-system-webview.md) keeps a
 ExplorerKit-owned container view while detached. Reattaching moves that
@@ -167,6 +174,10 @@ later.
   its handle, and drops its queued events. Other views keep working. If detach
   fails, the view stays registered so you can retry. An exportable view
   returns this retryable error while you still hold its GPU frames.
+- A successful native `window.close()` retires that view immediately and
+  reports `Closed`, even with an exported frame outstanding. The frame keeps
+  its IOSurface alive independently; complete it after the last GPU read as
+  usual. The closed document no longer receives commands or produces frames.
 - Dropping the host normally releases its engine connection after it closes
   all views. A later host in the same process can reuse the engine.
 - `Runtime::shutdown()` consumes the runtime, closes its views, and shuts the

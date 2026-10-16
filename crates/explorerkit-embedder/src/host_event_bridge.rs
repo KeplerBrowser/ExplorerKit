@@ -23,6 +23,7 @@ fn event_name(event: &HostEvent) -> &'static str {
         HostEvent::NavigationRequested { .. } => "navigationRequested",
         HostEvent::PopupRequested { .. } => "popupRequested",
         HostEvent::PopupCreated { .. } => "popupCreated",
+        HostEvent::PopupCreationFailed { .. } => "popupCreationFailed",
         HostEvent::UrlChanged { .. } => "urlChanged",
         HostEvent::PageTitleChanged { .. } => "pageTitleChanged",
         HostEvent::FaviconChanged { .. } => "faviconChanged",
@@ -64,12 +65,14 @@ fn write_payload(output: &mut String, event: &HostEvent) {
             write_string_field(output, &mut first, "url", url);
         }
         HostEvent::PopupRequested {
+            request_id,
             parent_webview_id,
             parent_url,
             target_url,
             window_features,
             policy,
         } => {
+            write_string_field(output, &mut first, "requestId", request_id);
             write_string_field(output, &mut first, "parentWebViewId", parent_webview_id);
             write_optional_string_field(output, &mut first, "parentUrl", parent_url.as_deref());
             write_optional_string_field(output, &mut first, "targetUrl", target_url.as_deref());
@@ -82,6 +85,7 @@ fn write_payload(output: &mut String, event: &HostEvent) {
             write_string_field(output, &mut first, "policy", policy.as_str());
         }
         HostEvent::PopupCreated {
+            request_id,
             parent_webview_id,
             child_webview_id,
             parent_url,
@@ -89,6 +93,7 @@ fn write_payload(output: &mut String, event: &HostEvent) {
             window_features,
             policy,
         } => {
+            write_string_field(output, &mut first, "requestId", request_id);
             write_string_field(output, &mut first, "parentWebViewId", parent_webview_id);
             write_string_field(output, &mut first, "childWebViewId", child_webview_id);
             write_optional_string_field(output, &mut first, "parentUrl", parent_url.as_deref());
@@ -100,6 +105,13 @@ fn write_payload(output: &mut String, event: &HostEvent) {
                 window_features.as_deref(),
             );
             write_string_field(output, &mut first, "policy", policy.as_str());
+        }
+        HostEvent::PopupCreationFailed {
+            request_id,
+            error_message,
+        } => {
+            write_string_field(output, &mut first, "requestId", request_id);
+            write_string_field(output, &mut first, "errorMessage", error_message);
         }
         HostEvent::UrlChanged { url } => {
             write_string_field(output, &mut first, "url", url);
@@ -717,16 +729,18 @@ mod tests {
         );
         assert_eq!(
             encode_host_event_bridge(&HostEvent::PopupRequested {
+                request_id: "request-1".to_owned(),
                 parent_webview_id: "parent-1".to_owned(),
                 parent_url: Some("https://parent.test/".to_owned()),
                 target_url: None,
                 window_features: None,
                 policy: PopupRequestPolicy::DefaultDeny,
             }),
-            r#"{"name":"popupRequested","payload":{"parentWebViewId":"parent-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"default-deny"}}"#
+            r#"{"name":"popupRequested","payload":{"requestId":"request-1","parentWebViewId":"parent-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"default-deny"}}"#
         );
         assert_eq!(
             encode_host_event_bridge(&HostEvent::PopupCreated {
+                request_id: "request-1".to_owned(),
                 parent_webview_id: "parent-1".to_owned(),
                 child_webview_id: "child-1".to_owned(),
                 parent_url: Some("https://parent.test/".to_owned()),
@@ -734,7 +748,14 @@ mod tests {
                 window_features: None,
                 policy: PopupRequestPolicy::ManagedChild,
             }),
-            r#"{"name":"popupCreated","payload":{"parentWebViewId":"parent-1","childWebViewId":"child-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"managed-child"}}"#
+            r#"{"name":"popupCreated","payload":{"requestId":"request-1","parentWebViewId":"parent-1","childWebViewId":"child-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"managed-child"}}"#
+        );
+        assert_eq!(
+            encode_host_event_bridge(&HostEvent::PopupCreationFailed {
+                request_id: "request-1".to_owned(),
+                error_message: "renderer unavailable".to_owned(),
+            }),
+            r#"{"name":"popupCreationFailed","payload":{"requestId":"request-1","errorMessage":"renderer unavailable"}}"#
         );
         assert_eq!(
             encode_host_event_bridge(&HostEvent::UrlChanged {

@@ -9,8 +9,9 @@ use std::sync::Arc;
 
 use dpi::PhysicalSize;
 use explorerkit_embedder::{
-    ContextMenuAction, Host, HostCall, HostError, HostEvent, HostInputEvent, PopupRequestPolicy,
-    ServoRuntime, ServoWebView, ServoWebViewInit, SessionHandle, WebViewCommand, WebViewHandle,
+    ContextMenuAction, Host, HostCall, HostError, HostEvent, HostInputEvent, NewWebViewDecision,
+    NewWebViewRequest, PopupCreated, PopupRequestPolicy, ServoRuntime, ServoWebView,
+    ServoWebViewInit, SessionHandle, WebViewCommand, WebViewHandle, WebViewRegistrar,
 };
 use explorerkit_host::{
     HostSurface, NativeSurface, OffscreenSurface, SurfaceDelegate, SurfaceError, SurfaceFrameInfo,
@@ -420,6 +421,23 @@ struct AttachedSurface {
     viewport: SurfaceViewport,
 }
 
+#[derive(Clone)]
+struct SurfaceRuntimeBinding {
+    webview: WebViewHandle,
+    session: SessionHandle,
+    registrar: WebViewRegistrar,
+    adoptions: std::rc::Weak<RefCell<Vec<AdoptedSurfaceWebView>>>,
+    navigation_state_events: bool,
+}
+
+struct AdoptedSurfaceWebView {
+    webview: WebViewHandle,
+    session: SessionHandle,
+    driver: Box<dyn ServoWebViewDriver>,
+}
+
+type NewWebViewHandler = Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>;
+
 trait ServoWebViewFactory {
     fn shutdown(&self) -> Result<(), HostError> {
         Ok(())
@@ -440,6 +458,31 @@ trait ServoWebViewFactory {
 }
 
 trait ServoWebViewDriver {
+    fn bind_runtime(
+        &mut self,
+        _binding: SurfaceRuntimeBinding,
+        _options: &SurfaceHostOptions,
+    ) -> Result<(), HostError> {
+        Ok(())
+    }
+
+    fn set_new_webview_handler(
+        &mut self,
+        _handler: Option<NewWebViewHandler>,
+    ) -> Result<(), HostError> {
+        Err(HostError::new(
+            "native child creation is unsupported by this driver",
+        ))
+    }
+
+    fn is_live(&self) -> bool {
+        true
+    }
+
+    fn can_dispatch_unattached(&self) -> bool {
+        false
+    }
+
     fn before_update(
         &mut self,
         _services: &mut dyn SurfaceHostServices,
@@ -578,6 +621,10 @@ impl AttachRollback<'_> {
         let Some(mut surface_webview) = self.surface_webview.take() else {
             return Ok(());
         };
+        if !surface_webview.is_live() {
+            self.surface_webviews.insert(self.webview, surface_webview);
+            return Ok(());
+        }
         let detach_result = if self.may_be_attached {
             catch_unwind(AssertUnwindSafe(|| surface_webview.detach()))
         } else {
@@ -646,6 +693,12 @@ fn poisoned_webview_error(webview: WebViewHandle) -> HostError {
     ))
 }
 
+fn unregistered_child_error(child_webview_id: &str) -> HostError {
+    HostError::new(format!(
+        "managed child webview {child_webview_id} is not registered"
+    ))
+}
+
 fn drop_surface_webview(surface_webview: Box<dyn ServoWebViewDriver>) {
     if let Err(payload) = catch_unwind(AssertUnwindSafe(|| drop(surface_webview))) {
         // Preserve terminal cleanup even if a custom panic payload would panic again in Drop.
@@ -660,7 +713,8 @@ struct SurfaceWebViewFactory {
 
 impl ServoWebViewFactory for SurfaceWebViewFactory {
     fn shutdown(&self) -> Result<(), HostError> {
-        if let Some(runtime) = self.runtime.borrow_mut().take() {
+        let runtime = self.runtime.borrow_mut().take();
+        if let Some(runtime) = runtime {
             runtime.shutdown().map_err(HostError::new)?;
         } else {
             ServoRuntime::shutdown_retained().map_err(HostError::new)?;
@@ -669,7 +723,8 @@ impl ServoWebViewFactory for SurfaceWebViewFactory {
     }
 
     fn perform_updates(&self) -> Result<(), HostError> {
-        if let Some(runtime) = self.runtime.borrow().as_ref() {
+        let runtime = self.runtime.borrow().clone();
+        if let Some(runtime) = runtime {
             runtime.perform_updates().map_err(HostError::new)?;
         }
         Ok(())
@@ -711,6 +766,10 @@ pub struct SurfaceHost<S> {
     pending_commands: HashMap<WebViewHandle, VecDeque<PendingSurfaceCommand>>,
     pending_events: HashMap<WebViewHandle, VecDeque<HostEvent>>,
     calls: Vec<HostCall>,
+    registrar: Option<WebViewRegistrar>,
+    adoptions: Rc<RefCell<Vec<AdoptedSurfaceWebView>>>,
+    new_webview_handlers: HashMap<WebViewHandle, NewWebViewHandler>,
+    navigation_state_events: bool,
 }
 
 impl<S> SurfaceHost<S> {
@@ -735,6 +794,10 @@ impl<S> SurfaceHost<S> {
             pending_commands: HashMap::new(),
             pending_events: HashMap::new(),
             calls: Vec::new(),
+            registrar: None,
+            adoptions: Rc::default(),
+            new_webview_handlers: HashMap::new(),
+            navigation_state_events: false,
         }
     }
 
@@ -758,7 +821,41 @@ impl<S> SurfaceHost<S> {
         &self.calls
     }
 
-    fn ensure_created_webview(&self, webview: WebViewHandle) -> Result<(), HostError> {
+    pub(crate) fn set_navigation_state_events(&mut self) {
+        self.navigation_state_events = true;
+    }
+
+    pub(crate) fn native_view_handles(&mut self) -> Vec<WebViewHandle> {
+        self.sync_native_views();
+        self.created_webviews.keys().copied().collect()
+    }
+
+    fn sync_native_views(&mut self) {
+        let adoptions = self.adoptions.borrow_mut().drain(..).collect::<Vec<_>>();
+        for adopted in adoptions {
+            self.created_webviews
+                .insert(adopted.webview, adopted.session);
+            self.surface_webviews
+                .insert(adopted.webview, adopted.driver);
+        }
+        let retired = self
+            .surface_webviews
+            .iter()
+            .filter(|(_, view)| !view.is_live())
+            .map(|(handle, _)| *handle)
+            .collect::<Vec<_>>();
+        for handle in retired {
+            self.surface_webviews.remove(&handle);
+            self.created_webviews.remove(&handle);
+            self.attached_surfaces.remove(&handle);
+            self.pending_commands.remove(&handle);
+            self.pending_events.remove(&handle);
+            self.new_webview_handlers.remove(&handle);
+        }
+    }
+
+    fn ensure_created_webview(&mut self, webview: WebViewHandle) -> Result<(), HostError> {
+        self.sync_native_views();
         if !self.created_webviews.contains_key(&webview) {
             return Err(HostError::new(format!(
                 "webview {} is not registered",
@@ -776,6 +873,7 @@ impl<S> Drop for SurfaceHost<S> {
     fn drop(&mut self) {
         // Renderer targets must be detached before host-owned native surface services drop.
         self.surface_webviews.clear();
+        self.adoptions.borrow_mut().clear();
     }
 }
 
@@ -826,7 +924,7 @@ impl<S: SurfaceHostServices> SurfaceHost<S> {
                 .and_then(|()| surface_webview.perform_updates(&mut self.services, webview))
         }));
 
-        match update_result {
+        let result = match update_result {
             Ok(Ok(events)) => {
                 self.attached_surfaces.insert(
                     webview,
@@ -838,6 +936,10 @@ impl<S: SurfaceHostServices> SurfaceHost<S> {
                 self.calls.push(call);
                 self.surface_webviews.insert(webview, surface_webview);
                 Ok(events)
+            }
+            Ok(Err(error)) if !surface_webview.is_live() => {
+                self.surface_webviews.insert(webview, surface_webview);
+                Err(error)
             }
             Ok(Err(error)) => {
                 let rollback = catch_unwind(AssertUnwindSafe(|| {
@@ -863,7 +965,9 @@ impl<S: SurfaceHostServices> SurfaceHost<S> {
                 self.poison_surface_webview(webview, Some(surface_webview));
                 resume_unwind(payload);
             }
-        }
+        };
+        self.sync_native_views();
+        result
     }
 
     fn dispatch_controller_response(
@@ -877,11 +981,105 @@ impl<S: SurfaceHostServices> SurfaceHost<S> {
         };
 
         respond(surface_webview.as_mut())?;
-        surface_webview.perform_updates(&mut self.services, webview)
+        self.perform_updates(webview)
     }
 }
 
 impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
+    fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+        self.registrar = Some(registrar);
+    }
+
+    fn set_new_webview_handler(
+        &mut self,
+        webview: WebViewHandle,
+        handler: Option<NewWebViewHandler>,
+    ) -> Result<(), HostError> {
+        self.ensure_created_webview(webview)?;
+        if !cfg!(target_os = "macos") || self.registrar.is_none() {
+            return Err(HostError::new(
+                "registered native child creation requires the macOS exportable renderer",
+            ));
+        }
+        if let Some(view) = self.surface_webviews.get_mut(&webview) {
+            return view.set_new_webview_handler(handler);
+        }
+        match handler {
+            Some(handler) => {
+                self.new_webview_handlers.insert(webview, handler);
+            }
+            None => {
+                self.new_webview_handlers.remove(&webview);
+            }
+        }
+        Ok(())
+    }
+
+    fn set_popup_policy(
+        &mut self,
+        webview: WebViewHandle,
+        policy: PopupRequestPolicy,
+    ) -> Result<Vec<HostEvent>, HostError> {
+        self.ensure_created_webview(webview)?;
+        if policy == PopupRequestPolicy::ManagedChild {
+            return Err(HostError::new(
+                "registered child creation requires a per-request decision handler",
+            ));
+        }
+        self.new_webview_handlers.remove(&webview);
+        if cfg!(target_os = "macos") && self.registrar.is_some() {
+            if let Some(view) = self.surface_webviews.get_mut(&webview) {
+                view.set_new_webview_handler(None)?;
+            }
+        }
+        Ok(Vec::new())
+    }
+
+    fn attach_managed_child_surface(
+        &mut self,
+        _: WebViewHandle,
+        child_webview_id: &str,
+        _: &HostSurface,
+        _: SurfaceViewport,
+    ) -> Result<Vec<HostEvent>, HostError> {
+        Err(unregistered_child_error(child_webview_id))
+    }
+
+    fn resize_managed_child_surface(
+        &mut self,
+        _: WebViewHandle,
+        child_webview_id: &str,
+        _: SurfaceSize,
+    ) -> Result<Vec<HostEvent>, HostError> {
+        Err(unregistered_child_error(child_webview_id))
+    }
+
+    fn update_managed_child_surface_viewport(
+        &mut self,
+        _: WebViewHandle,
+        child_webview_id: &str,
+        _: SurfaceViewport,
+        _: SurfaceViewport,
+    ) -> Result<Vec<HostEvent>, HostError> {
+        Err(unregistered_child_error(child_webview_id))
+    }
+
+    fn detach_managed_child_surface(
+        &mut self,
+        _: WebViewHandle,
+        child_webview_id: &str,
+    ) -> Result<Vec<HostEvent>, HostError> {
+        Err(unregistered_child_error(child_webview_id))
+    }
+
+    fn perform_managed_child_updates(
+        &mut self,
+        _: WebViewHandle,
+        child_webview_id: &str,
+    ) -> Result<Vec<HostEvent>, HostError> {
+        Err(unregistered_child_error(child_webview_id))
+    }
+
     fn shutdown(&mut self) -> Result<(), HostError> {
         // Finalization must also retire views left by a failed individual detach.
         // Drop their renderers while native services still live, then retire the engine.
@@ -893,10 +1091,13 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         self.pending_events.clear();
         self.poisoned_webviews.clear();
         self.created_webviews.clear();
+        self.adoptions.borrow_mut().clear();
+        self.new_webview_handlers.clear();
         self.webview_factory.shutdown()
     }
 
     fn destroy_webview(&mut self, webview: WebViewHandle) -> Result<(), HostError> {
+        self.sync_native_views();
         if !self.created_webviews.contains_key(&webview) {
             return Err(HostError::new(format!(
                 "webview {} is not registered",
@@ -913,6 +1114,7 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         self.pending_events.remove(&webview);
         self.poisoned_webviews.remove(&webview);
         self.created_webviews.remove(&webview);
+        self.new_webview_handlers.remove(&webview);
         self.calls.push(HostCall::DestroyWebView { webview });
         Ok(())
     }
@@ -931,7 +1133,8 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
             });
             results.push((webview, prepared.map(|()| Vec::new())));
         }
-        self.webview_factory.perform_updates()?;
+        let pump_result = self.webview_factory.perform_updates();
+        self.sync_native_views();
         for (webview, result) in &mut results {
             if result.is_ok() {
                 if let Some(view) = self.surface_webviews.get_mut(webview) {
@@ -941,6 +1144,8 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
                     .push(HostCall::PerformUpdates { webview: *webview });
             }
         }
+        self.sync_native_views();
+        pump_result?;
         Ok(results)
     }
 
@@ -1021,16 +1226,39 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
                 Ok(surface_webview) => {
                     rollback.surface_webview = Some(surface_webview);
                     rollback.may_be_attached = true;
-                    Ok(())
+                    let configure = if let Some(registrar) = self.registrar.clone() {
+                        rollback.surface_webview().bind_runtime(
+                            SurfaceRuntimeBinding {
+                                webview,
+                                session: self.created_webviews[&webview],
+                                registrar,
+                                adoptions: Rc::downgrade(&self.adoptions),
+                                navigation_state_events: self.navigation_state_events,
+                            },
+                            &self.options,
+                        )
+                    } else {
+                        Ok(())
+                    };
+                    configure.and_then(|()| {
+                        if let Some(handler) = self.new_webview_handlers.remove(&webview) {
+                            rollback
+                                .surface_webview()
+                                .set_new_webview_handler(Some(handler))?;
+                        }
+                        Ok(())
+                    })
                 }
                 Err(error) => Err(error),
             }
         };
         if let Err(error) = attach_result {
-            return match rollback.rollback() {
+            let result = match rollback.rollback() {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(rollback_error),
             };
+            self.sync_native_views();
+            return result;
         }
 
         let did_promote_initial_load = promoted_initial_url.is_some();
@@ -1046,7 +1274,7 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
             did_promote_initial_load,
         );
 
-        match flush_result {
+        let result = match flush_result {
             Ok(()) => {
                 let surface_webview = rollback.commit();
                 self.attached_surfaces.insert(
@@ -1073,7 +1301,9 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
                 Ok(()) => Err(error),
                 Err(rollback_error) => Err(rollback_error),
             },
-        }
+        };
+        self.sync_native_views();
+        result
     }
 
     fn resize_surface(
@@ -1169,7 +1399,12 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
     ) -> Result<Vec<HostEvent>, HostError> {
         self.ensure_created_webview(webview)?;
 
-        if !self.attached_surfaces.contains_key(&webview) {
+        if !self.attached_surfaces.contains_key(&webview)
+            && !self
+                .surface_webviews
+                .get(&webview)
+                .is_some_and(|view| view.can_dispatch_unattached())
+        {
             self.pending_commands
                 .entry(webview)
                 .or_default()
@@ -1188,7 +1423,7 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         };
 
         surface_webview.dispatch_command(command.clone())?;
-        let events = surface_webview.perform_updates(&mut self.services, webview)?;
+        let events = self.perform_updates(webview)?;
         self.calls.push(HostCall::DispatchWebViewCommand {
             webview,
             command: command.clone(),
@@ -1247,7 +1482,12 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         script: &str,
     ) -> Result<Vec<HostEvent>, HostError> {
         self.ensure_created_webview(webview)?;
-        if !self.attached_surfaces.contains_key(&webview) {
+        if !self.attached_surfaces.contains_key(&webview)
+            && !self
+                .surface_webviews
+                .get(&webview)
+                .is_some_and(|view| view.can_dispatch_unattached())
+        {
             self.pending_commands.entry(webview).or_default().push_back(
                 PendingSurfaceCommand::EvaluateJavaScript {
                     evaluation_id: evaluation_id.to_owned(),
@@ -1264,7 +1504,7 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         };
 
         surface_webview.evaluate_javascript(evaluation_id, script)?;
-        surface_webview.perform_updates(&mut self.services, webview)
+        self.perform_updates(webview)
     }
 
     fn dispatch_input_event(
@@ -1278,7 +1518,7 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         };
 
         surface_webview.dispatch_input_event(event.clone())?;
-        surface_webview.perform_updates(&mut self.services, webview)
+        self.perform_updates(webview)
     }
 
     fn perform_updates(&mut self, webview: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
@@ -1287,9 +1527,10 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
             self.calls.push(HostCall::PerformUpdates { webview });
             return Ok(Vec::new());
         };
-        let events = surface_webview.perform_updates(&mut self.services, webview)?;
+        let result = surface_webview.perform_updates(&mut self.services, webview);
+        self.sync_native_views();
         self.calls.push(HostCall::PerformUpdates { webview });
-        Ok(events)
+        result
     }
 
     fn observe_webview_events(
@@ -1590,6 +1831,7 @@ struct SurfaceWebView {
     surface: Option<HostSurface>,
     viewport: Option<SurfaceViewport>,
     surface_attached: bool,
+    adopted_child: bool,
 }
 
 impl SurfaceWebView {
@@ -1606,24 +1848,24 @@ impl SurfaceWebView {
             ActiveRenderTarget::new(target, viewport, refresh_driver.clone(), options)?;
         let rendering_context = render_target.rendering_context();
         let webview_size = render_target.webview_size(viewport)?;
-        let mut runtime = runtime.borrow_mut();
-        if runtime.is_none() {
+        let existing_runtime = runtime.borrow().clone();
+        let runtime_owner = if let Some(runtime) = existing_runtime {
+            runtime
+        } else {
             let event_loop_waker =
                 Box::new(ServoEventLoopWaker::new(options.event_loop_waker.clone()));
-            *runtime = Some(
-                match options.config_directory() {
-                    Some(config_directory) => ServoRuntime::with_config_directory(
-                        event_loop_waker,
-                        config_directory.to_owned(),
-                    ),
-                    None => ServoRuntime::new(event_loop_waker),
-                }
-                .map_err(HostError::new)?,
-            );
-        }
-        let mut webview = runtime
-            .as_ref()
-            .expect("runtime was initialized")
+            let created = match options.config_directory() {
+                Some(config_directory) => ServoRuntime::with_config_directory(
+                    event_loop_waker,
+                    config_directory.to_owned(),
+                ),
+                None => ServoRuntime::new(event_loop_waker),
+            }
+            .map_err(HostError::new)?;
+            *runtime.borrow_mut() = Some(created.clone());
+            created
+        };
+        let mut webview = runtime_owner
             .create_webview(ServoWebViewInit {
                 rendering_context,
                 clipboard_delegate: Rc::new(ServoClipboardAdapter::new(options.clipboard())),
@@ -1645,6 +1887,7 @@ impl SurfaceWebView {
             surface: Some(surface),
             viewport: Some(viewport),
             surface_attached: true,
+            adopted_child: false,
         })
     }
 
@@ -1667,6 +1910,107 @@ impl SurfaceWebView {
 }
 
 impl ServoWebViewDriver for SurfaceWebView {
+    fn bind_runtime(
+        &mut self,
+        binding: SurfaceRuntimeBinding,
+        options: &SurfaceHostOptions,
+    ) -> Result<(), HostError> {
+        self.webview.__bind_runtime(
+            binding.webview,
+            binding.registrar.clone(),
+            binding.navigation_state_events,
+        );
+        #[cfg(target_os = "macos")]
+        {
+            let options = options.clone();
+            let factory =
+                self.webview
+                    .__child_factory(Rc::new(move |child, source, parent, request_id| {
+                        let adoptions = binding.adoptions.upgrade().ok_or_else(|| {
+                            "native child surface host has been dropped".to_owned()
+                        })?;
+                        let reservation = binding
+                            .registrar
+                            .reserve_child(source, request_id.to_owned())
+                            .map_err(|error| error.to_string())?;
+                        let webview = reservation.webview();
+                        let refresh_driver = Rc::new(SurfaceRefreshDriver::default());
+                        let initial_size = parent.rendering_context().size();
+                        let context = Rc::new(
+                            ExportableRenderingContext::new(
+                                SurfaceSize::new(initial_size.width, initial_size.height),
+                                options.event_loop_waker.clone(),
+                                refresh_driver.clone(),
+                            )
+                            .map_err(|error| error.to_string())?,
+                        );
+                        let render_target = ActiveRenderTarget::ExportableOffscreen {
+                            rendering_context: context.clone(),
+                        };
+                        child.__bind_runtime(
+                            webview,
+                            binding.registrar.clone(),
+                            binding.navigation_state_events,
+                        );
+                        let parent_webview_id = parent.id().to_string();
+                        let parent_url = parent.url().map(|url| url.to_string());
+                        let request_id = request_id.to_owned();
+                        let session = binding.session;
+                        Ok(child.__prepare_child(
+                            context,
+                            Box::new(move |child, child_webview_id| {
+                                let driver = Box::new(SurfaceWebView {
+                                    refresh_driver,
+                                    render_target,
+                                    webview: child,
+                                    pending_events: VecDeque::new(),
+                                    surface: None,
+                                    viewport: None,
+                                    surface_attached: false,
+                                    adopted_child: true,
+                                });
+                                adoptions.borrow_mut().push(AdoptedSurfaceWebView {
+                                    webview,
+                                    session,
+                                    driver,
+                                });
+                                reservation.commit(PopupCreated {
+                                    request_id,
+                                    parent_webview_id,
+                                    child_webview_id,
+                                    parent_url,
+                                    target_url: None,
+                                    window_features: None,
+                                });
+                            }),
+                        ))
+                    }));
+            self.webview
+                .set_managed_child_webview_factory(factory)
+                .map_err(HostError::new)?;
+        }
+        #[cfg(not(target_os = "macos"))]
+        let _ = options;
+        Ok(())
+    }
+
+    fn set_new_webview_handler(
+        &mut self,
+        handler: Option<NewWebViewHandler>,
+    ) -> Result<(), HostError> {
+        self.webview
+            .__set_new_webview_handler(handler)
+            .map_err(HostError::new)
+    }
+
+    fn is_live(&self) -> bool {
+        self.webview.__is_live()
+    }
+
+    fn can_dispatch_unattached(&self) -> bool {
+        self.adopted_child
+    }
+
     fn attach(
         &mut self,
         target: RenderTarget<'_>,
@@ -1791,6 +2135,9 @@ impl ServoWebViewDriver for SurfaceWebView {
         services: &mut dyn SurfaceHostServices,
         webview: WebViewHandle,
     ) -> Result<Vec<HostEvent>, HostError> {
+        if !self.webview.__is_live() {
+            return Ok(Vec::new());
+        }
         let rendering_context = self.render_target.rendering_context();
         let target_kind = self.render_target.kind();
         let surface_attached = self.surface_attached && self.render_target.can_paint()?;
@@ -2202,8 +2549,13 @@ mod tests {
         }
     }
 
+    type FakeEngineUpdate = Box<dyn FnOnce() -> Result<(), HostError>>;
+
     #[derive(Clone, Default)]
     struct FakeFaults {
+        bindings: Rc<RefCell<HashMap<WebViewHandle, SurfaceRuntimeBinding>>>,
+        retired: Rc<RefCell<HashSet<WebViewHandle>>>,
+        engine_update: Rc<RefCell<Option<FakeEngineUpdate>>>,
         fail_attach: Rc<Cell<bool>>,
         panic_attach: Rc<Cell<bool>>,
         fail_detach: Rc<Cell<bool>>,
@@ -2228,7 +2580,8 @@ mod tests {
 
         fn perform_updates(&self) -> Result<(), HostError> {
             self.log.push("engine-update");
-            Ok(())
+            let update = self.faults.engine_update.borrow_mut().take();
+            update.map_or(Ok(()), |update| update())
         }
 
         fn create(
@@ -2248,6 +2601,7 @@ mod tests {
                 viewport.scale_factor
             ));
             Ok(Box::new(FakeWebView {
+                handle: None,
                 log: self.log.clone(),
                 target_kind: target.kind(),
                 surface: Some(surface),
@@ -2255,11 +2609,14 @@ mod tests {
                 attached: true,
                 faults: self.faults.clone(),
                 pending_events: VecDeque::new(),
+                adopted_child: false,
             }))
         }
     }
 
     struct FakeWebView {
+        handle: Option<WebViewHandle>,
+        adopted_child: bool,
         log: SharedLog,
         target_kind: SurfaceMode,
         surface: Option<HostSurface>,
@@ -2284,6 +2641,28 @@ mod tests {
     }
 
     impl ServoWebViewDriver for FakeWebView {
+        fn bind_runtime(
+            &mut self,
+            binding: SurfaceRuntimeBinding,
+            _: &SurfaceHostOptions,
+        ) -> Result<(), HostError> {
+            self.handle = Some(binding.webview);
+            self.faults
+                .bindings
+                .borrow_mut()
+                .insert(binding.webview, binding);
+            Ok(())
+        }
+
+        fn can_dispatch_unattached(&self) -> bool {
+            self.adopted_child
+        }
+
+        fn is_live(&self) -> bool {
+            self.handle
+                .is_none_or(|handle| !self.faults.retired.borrow().contains(&handle))
+        }
+
         fn attach(
             &mut self,
             target: RenderTarget<'_>,
@@ -2411,6 +2790,10 @@ mod tests {
             webview: WebViewHandle,
         ) -> Result<Vec<HostEvent>, HostError> {
             self.record_viewport("driver-update");
+            let update = self.faults.engine_update.borrow_mut().take();
+            if let Some(update) = update {
+                update()?;
+            }
             services
                 .before_update(webview, self.surface.as_ref(), Some(self.viewport))
                 .map_err(|error| HostError::new(error.to_string()))?;
@@ -2464,6 +2847,229 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn children_committed_during_a_failed_update_are_live_without_attachment_or_url_replay() {
+        for pump_fails in [false, true] {
+            let log = SharedLog::default();
+            let faults = FakeFaults::default();
+            let fail_present = Rc::new(Cell::new(false));
+            let mut runtime =
+                fake_runtime_with_faults(log.clone(), fail_present.clone(), faults.clone());
+            let session = runtime.create_session();
+            let source = runtime.create_webview(session).unwrap();
+            runtime
+                .attach_surface(source, HostSurface::new("source"), SurfaceSize::new(80, 60))
+                .unwrap();
+            runtime.drain_events();
+            log.take();
+            let binding = faults.bindings.borrow()[&source].clone();
+            let child_log = log.clone();
+            let child_faults = faults.clone();
+            *faults.engine_update.borrow_mut() = Some(Box::new(move || {
+                let reservation = binding
+                    .registrar
+                    .reserve_child(source, "request-1".into())
+                    .unwrap();
+                let child = reservation.webview();
+                let driver = Box::new(FakeWebView {
+                    handle: Some(child),
+                    adopted_child: true,
+                    log: child_log,
+                    faults: child_faults,
+                    target_kind: SurfaceMode::Offscreen,
+                    surface: None,
+                    viewport: SurfaceViewport::new(SurfaceSize::new(80, 60), 1.0),
+                    attached: false,
+                    pending_events: VecDeque::new(),
+                });
+                binding
+                    .adoptions
+                    .upgrade()
+                    .unwrap()
+                    .borrow_mut()
+                    .push(AdoptedSurfaceWebView {
+                        webview: child,
+                        session,
+                        driver,
+                    });
+                binding.registrar.record_event(
+                    child,
+                    HostEvent::PageTitleChanged {
+                        title: Some("original native child".into()),
+                    },
+                );
+                reservation.commit(PopupCreated {
+                    request_id: "request-1".into(),
+                    parent_webview_id: "native-source".into(),
+                    child_webview_id: "native-child".into(),
+                    parent_url: None,
+                    target_url: None,
+                    window_features: None,
+                });
+                if pump_fails {
+                    Err(HostError::new("engine failed after creation"))
+                } else {
+                    Ok(())
+                }
+            }));
+            fail_present.set(!pump_fails);
+            assert!(runtime.perform_all_updates().is_err());
+            let updates = log.take();
+            assert_eq!(
+                updates
+                    .iter()
+                    .filter(|entry| *entry == "engine-update")
+                    .count(),
+                1
+            );
+            let events = runtime.drain_events();
+            assert_eq!(events.len(), 2);
+            let child = events[0].created_webview.unwrap();
+            assert_eq!(events[0].webview, source);
+            assert_eq!(events[1].webview, child);
+            fail_present.set(false);
+            runtime.destroy_webview(source).unwrap();
+            runtime
+                .evaluate_javascript(child, "read", "location.href")
+                .unwrap();
+            assert_eq!(evaluation_ids(&mut runtime), vec!["read"]);
+            runtime
+                .attach_surface_with_viewport(
+                    child,
+                    HostSurface::new("child"),
+                    SurfaceViewport::new(SurfaceSize::new(120, 90), 2.0),
+                )
+                .unwrap();
+            let log = log.take();
+            assert!(log.iter().any(|entry| entry == "attach:120x90@2+0,0"));
+            assert!(!log
+                .iter()
+                .any(|entry| entry.starts_with("create:") || entry.starts_with("command:load:")));
+            faults.fail_detach.set(true);
+            assert!(runtime.destroy_webview(child).is_err());
+            faults.fail_detach.set(false);
+            runtime.destroy_webview(child).unwrap();
+        }
+    }
+
+    #[test]
+    fn attachment_pumps_import_children_and_release_closed_drivers_even_on_error() {
+        for resize in [false, true] {
+            for fail_pump in [false, true] {
+                let log = SharedLog::default();
+                let faults = FakeFaults::default();
+                let mut runtime = fake_runtime_with_faults(
+                    log.clone(),
+                    Rc::new(Cell::new(false)),
+                    faults.clone(),
+                );
+                let session = runtime.create_session();
+                let source = runtime.create_webview(session).unwrap();
+                let size = SurfaceSize::new(80, 60);
+                runtime
+                    .attach_surface(source, HostSurface::new("source"), size)
+                    .unwrap();
+                if !resize {
+                    runtime.detach_surface(source).unwrap();
+                }
+                runtime.drain_events();
+                let binding = faults.bindings.borrow()[&source].clone();
+                let adoptions = binding.adoptions.upgrade().unwrap();
+                let child_faults = faults.clone();
+                *faults.engine_update.borrow_mut() =
+                    Some(Box::new(move || {
+                        let reservation = binding
+                            .registrar
+                            .reserve_child(source, "attachment-pump".into())
+                            .unwrap();
+                        let child = reservation.webview();
+                        binding.adoptions.upgrade().unwrap().borrow_mut().push(
+                            AdoptedSurfaceWebView {
+                                webview: child,
+                                session,
+                                driver: Box::new(FakeWebView {
+                                    handle: Some(child),
+                                    adopted_child: true,
+                                    log,
+                                    faults: child_faults.clone(),
+                                    target_kind: SurfaceMode::Offscreen,
+                                    surface: None,
+                                    viewport: SurfaceViewport::new(size, 1.0),
+                                    attached: false,
+                                    pending_events: VecDeque::new(),
+                                }),
+                            },
+                        );
+                        reservation.commit(PopupCreated {
+                            request_id: "attachment-pump".into(),
+                            parent_webview_id: "source-native".into(),
+                            child_webview_id: "child-native".into(),
+                            parent_url: None,
+                            target_url: None,
+                            window_features: None,
+                        });
+                        child_faults.retired.borrow_mut().insert(source);
+                        binding.registrar.retire_webview(source);
+                        if fail_pump {
+                            Err(HostError::new("pump failed after close"))
+                        } else {
+                            Ok(())
+                        }
+                    }));
+                let result = if resize {
+                    runtime.resize_surface(source, SurfaceSize::new(120, 90))
+                } else {
+                    runtime.attach_surface(source, HostSurface::new("reattached"), size)
+                };
+                assert_eq!(result.is_err(), fail_pump);
+                assert!(
+                    adoptions.borrow().is_empty(),
+                    "children must be imported before returning"
+                );
+                assert_eq!(
+                    faults.drops.get(),
+                    1,
+                    "native closure must release the driver before returning"
+                );
+                let events = runtime.drain_events();
+                let child = events
+                    .iter()
+                    .find_map(|event| event.created_webview)
+                    .unwrap();
+                assert!(events
+                    .iter()
+                    .any(|event| event.webview == source && event.event == HostEvent::Closed));
+                runtime.evaluate_javascript(child, "survivor", "1").unwrap();
+                assert_eq!(evaluation_ids(&mut runtime), vec!["survivor"]);
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_legacy_aliases_fail_and_default_denial_needs_no_creation_support() {
+        let mut runtime = fake_runtime(SharedLog::default(), Rc::new(Cell::new(false)));
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        runtime
+            .set_popup_policy(source, PopupRequestPolicy::DefaultDeny)
+            .unwrap();
+        assert!(runtime
+            .set_popup_policy(source, PopupRequestPolicy::ManagedChild)
+            .is_err());
+        assert!(runtime
+            .attach_managed_child_surface(
+                source,
+                "absent",
+                HostSurface::new("absent"),
+                SurfaceViewport::new(SurfaceSize::new(80, 60), 1.0)
+            )
+            .is_err());
+        assert!(runtime
+            .perform_managed_child_updates(source, "absent")
+            .is_err());
+        assert!(runtime.drain_events().is_empty());
     }
 
     #[test]

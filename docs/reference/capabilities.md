@@ -39,7 +39,7 @@ native Rust, but its React Native wiring is incomplete and not supported.
 | Permission prompts | ✅ | ➖ | 🟡 events only |
 | Keyboard input and IME | ✅ | ✅ (WebKit) | ✅ |
 | Clipboard: cut, copy, paste, select all | ✅ | ✅ (WebKit) | 🟡 app-provided clipboard |
-| Popups and new windows | 🟡 reported, never opened | ➖ | ✅ opt-in child views |
+| Popups and new windows | 🟡 reported, never opened | ➖ | ✅ per-request native children on macOS Servo |
 | Several views under one runtime | ➖ | ➖ | ✅ |
 | Offscreen rendering with GPU frame export | ➖ | ➖ | ✅ macOS |
 | System WebKit per view | ➖ | n/a | ✅ macOS |
@@ -155,9 +155,17 @@ opens a `target="_blank"` link.
   `windowFeatures` are always null for now, because Servo 0.6 doesn't expose
   them.
 - **iOS:** not reported.
-- **Native Rust:** denied by default. With `PopupRequestPolicy::ManagedChild`,
-  ExplorerKit creates a child view that you attach a surface to. See
+- **Native Rust on macOS Servo:** denied by default. A per-view
+  `set_new_webview_handler` can accept each request. The original native child
+  becomes an ordinary Runtime handle with independent controls, events,
+  lifetime, and exportable GPU frames. It can execute before attachment. See
   [Runtime and views](../concepts/runtime.md#popups-and-new-windows).
+- **macOS system web view:** child creation remains unsupported and enabling
+  its handler returns an error. Published Wry can build an original child in
+  an attached app view, but lacks native-close forwarding and a creation
+  callback safe for sources without a window or target URL. Clearing the
+  handler keeps creation denied. Windows, Linux, Android, iOS, and React
+  Native child presentation are not validated by the macOS Servo support.
 
 ### JavaScript evaluation
 

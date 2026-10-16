@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use dpi::PhysicalSize;
 use euclid::Scale;
@@ -10,8 +10,9 @@ use crate::{
     host_event_from_javascript_evaluation_result, ContextMenuAction, ContextMenuBounds,
     ContextMenuElementInformation, ContextMenuItem, ContextMenuRequest, FaviconImage,
     FaviconPixelFormat, FilePickerRequest, HiddenEmbedderControl, HostEvent, InputMethodKind,
-    InputMethodRequest, LoadStatusKind, PopupCreated, PopupRequest, PopupRequestPolicy,
-    SelectElementRequest, ServoAdapterState, SimpleDialogKind, SimpleDialogRequest,
+    InputMethodRequest, LoadStatusKind, NewWebViewDecision, NewWebViewRequest, PopupCreated,
+    PopupRequest, PopupRequestPolicy, SelectElementRequest, ServoAdapterState, ServoRuntime,
+    ServoWebView, SimpleDialogKind, SimpleDialogRequest, WebViewHandle, WebViewRegistrar,
 };
 use explorerkit_host::{HostSurface, SurfaceSize, SurfaceViewport};
 use servo::{
@@ -29,75 +30,238 @@ pub struct ServoWebViewEvent {
 pub type ManagedChildRenderingContextFactory =
     Rc<dyn Fn(Rc<dyn RenderingContext>) -> Rc<dyn RenderingContext>>;
 
-fn default_managed_child_rendering_context_factory() -> ManagedChildRenderingContextFactory {
-    Rc::new(|parent_rendering_context| parent_rendering_context)
+/// Resources prepared before accepting Servo's original auxiliary-view request.
+pub struct PreparedManagedChild {
+    pub rendering_context: Rc<dyn RenderingContext>,
+    pub delegate: Rc<dyn WebViewDelegate>,
+    pub commit: Box<dyn FnOnce(WebView)>,
 }
+
+/// Fallible preparation; the returned commit has no recoverable adoption step.
+pub type ManagedChildWebViewFactory =
+    Rc<dyn Fn(&WebView, &str) -> Result<PreparedManagedChild, String>>;
 
 #[derive(Clone)]
 pub struct ServoWebViewAdapter {
     shared: Rc<SharedState>,
+    key: String,
 }
 
 impl ServoWebViewAdapter {
     pub(crate) fn close(&self) {
-        let mut ids = self.managed_child_webview_ids();
-        if let Some(root) = self.shared.manager.borrow().root_webview_id() {
-            ids.push(root);
-        }
-        for id in ids {
-            self.shared.cleanup_pending_for_webview(&id);
-        }
-        self.shared.manager.borrow_mut().managed_children.clear();
+        self.shared.cleanup_pending_for_webview(&self.key);
+        let removed = self.shared.manager.borrow_mut().views.remove(&self.key);
+        drop(removed);
     }
 
     pub fn new(
         popup_policy: PopupRequestPolicy,
         rendering_context: Rc<dyn RenderingContext>,
     ) -> Self {
-        Self {
-            shared: Rc::new(SharedState::new(
-                popup_policy,
-                rendering_context,
-                default_managed_child_rendering_context_factory(),
-                false,
-            )),
-        }
+        Self::with_factory(
+            popup_policy,
+            rendering_context,
+            Rc::new(|context| context),
+            false,
+        )
     }
 
     pub fn with_managed_child_rendering_context_factory(
         popup_policy: PopupRequestPolicy,
         rendering_context: Rc<dyn RenderingContext>,
-        managed_child_rendering_context_factory: ManagedChildRenderingContextFactory,
+        factory: ManagedChildRenderingContextFactory,
     ) -> Self {
+        Self::with_factory(popup_policy, rendering_context, factory, true)
+    }
+
+    fn with_factory(
+        popup_policy: PopupRequestPolicy,
+        rendering_context: Rc<dyn RenderingContext>,
+        factory: ManagedChildRenderingContextFactory,
+        explicit: bool,
+    ) -> Self {
+        let key = "view-0".to_owned();
         Self {
             shared: Rc::new(SharedState::new(
+                key.clone(),
                 popup_policy,
                 rendering_context,
-                managed_child_rendering_context_factory,
-                true,
+                factory,
+                explicit,
             )),
+            key,
         }
+    }
+
+    pub(crate) fn set_runtime(&self, runtime: ServoRuntime) {
+        *self.shared.runtime.borrow_mut() = Some(runtime);
+    }
+
+    pub(crate) fn runtime(&self) -> ServoRuntime {
+        self.shared
+            .runtime
+            .borrow()
+            .as_ref()
+            .expect("native owner has a runtime lease")
+            .clone()
+    }
+
+    pub(crate) fn native_webview(&self) -> Result<WebView, String> {
+        self.shared
+            .manager
+            .borrow()
+            .view(&self.key)?
+            .webview
+            .clone()
+            .ok_or_else(|| "native webview has not been committed".to_owned())
+    }
+
+    pub(crate) fn is_live(&self) -> bool {
+        self.shared.manager.borrow().views.contains_key(&self.key)
     }
 
     pub fn webview_delegate(&self) -> Rc<dyn WebViewDelegate> {
         Rc::new(ServoWebViewDelegate {
-            shared: self.shared.clone(),
+            shared: Rc::downgrade(&self.shared),
+            key: self.key.clone(),
         })
     }
 
     pub fn register_root_webview(&self, webview: &WebView) {
+        if let Some(view) = self.shared.manager.borrow_mut().views.get_mut(&self.key) {
+            view.native_id = webview_key(webview);
+            view.webview = Some(webview.clone());
+        }
+    }
+
+    pub(crate) fn bind_runtime(
+        &self,
+        webview: WebViewHandle,
+        registrar: WebViewRegistrar,
+        navigation_state_events: bool,
+    ) {
+        let mut manager = self.shared.manager.borrow_mut();
+        let view = manager
+            .views
+            .get_mut(&self.key)
+            .expect("prepared view is live");
+        view.registration = Some(RuntimeBinding {
+            webview,
+            registrar,
+            navigation_state_events,
+        });
+        // Construction can already have emitted events before the facade binds the root.
+        let queued = manager.events.drain(..).collect::<Vec<_>>();
+        for (key, event) in queued {
+            if key == self.key {
+                manager.emit(&key, event.event);
+            } else {
+                manager.events.push_back((key, event));
+            }
+        }
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the native child callback signature explicit."
+    )]
+    pub(crate) fn set_new_webview_handler(
+        &self,
+        handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+    ) -> Result<(), String> {
+        let old = {
+            let mut manager = self.shared.manager.borrow_mut();
+            let view = manager.view_mut(&self.key)?;
+            if view.factory.is_none() || view.registration.is_none() {
+                return Err("registered native child creation is unavailable".to_owned());
+            }
+            std::mem::replace(&mut view.handler, handler)
+        };
+        drop(old);
+        Ok(())
+    }
+
+    pub(crate) fn set_managed_child_webview_factory(
+        &self,
+        factory: ManagedChildWebViewFactory,
+    ) -> Result<(), String> {
+        let mut manager = self.shared.manager.borrow_mut();
+        if self.shared.managed_child_rendering_context_is_child_scoped || manager.views.len() != 1 {
+            return Err("prepared child creation requires a fresh view without a legacy factory or children".to_owned());
+        }
+        if manager.legacy_popup_policy != PopupRequestPolicy::DefaultDeny
+            || manager.view(&self.key)?.factory.is_some()
+        {
+            return Err(
+                "prepared child creation must be configured once while creation is denied"
+                    .to_owned(),
+            );
+        }
+        manager.view_mut(&self.key)?.factory = Some(factory);
+        Ok(())
+    }
+
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the prepared native child callback signature explicit."
+    )]
+    pub(crate) fn child_factory(
+        &self,
+        prepare: Rc<
+            dyn Fn(
+                ServoWebView,
+                WebViewHandle,
+                &WebView,
+                &str,
+            ) -> Result<PreparedManagedChild, String>,
+        >,
+    ) -> ManagedChildWebViewFactory {
+        let owner = Rc::downgrade(&self.shared);
+        Rc::new(move |parent, request_id| {
+            let shared = owner
+                .upgrade()
+                .ok_or_else(|| "native child owner has been dropped".to_owned())?;
+            let (source, key) = {
+                let mut manager = shared.manager.borrow_mut();
+                let source = manager
+                    .views
+                    .values()
+                    .find(|view| view.native_id == webview_key(parent))
+                    .and_then(|view| view.registration.as_ref())
+                    .map(|binding| binding.webview)
+                    .ok_or_else(|| {
+                        "native child source is not registered with a Runtime".to_owned()
+                    })?;
+                (source, manager.reserve_child(&webview_key(parent))?)
+            };
+            let child = ServoWebView::from_adapter(Self { shared, key });
+            prepare(child, source, parent, request_id)
+        })
+    }
+
+    pub(crate) fn set_rendering_context(&self, context: Rc<dyn RenderingContext>) {
         self.shared
             .manager
             .borrow_mut()
-            .register_root_webview(webview_key(webview));
+            .view_mut(&self.key)
+            .expect("prepared child is live")
+            .rendering_context = context;
     }
 
     pub fn request_paint(&self) {
-        self.shared.manager.borrow_mut().request_root_paint();
+        self.shared
+            .manager
+            .borrow_mut()
+            .update_state_for_webview(&self.key, ServoAdapterState::request_paint);
     }
 
     pub fn take_needs_paint(&self) -> bool {
-        self.shared.manager.borrow_mut().take_root_needs_paint()
+        self.shared
+            .manager
+            .borrow_mut()
+            .views
+            .get_mut(&self.key)
+            .is_some_and(|view| view.state.take_needs_paint())
     }
 
     pub fn drain_events(&self) -> Vec<HostEvent> {
@@ -112,10 +276,21 @@ impl ServoWebViewAdapter {
     }
 
     pub fn set_popup_policy(&self, popup_policy: PopupRequestPolicy) {
-        self.shared
-            .manager
-            .borrow_mut()
-            .set_popup_policy(popup_policy);
+        let old = {
+            let mut manager = self.shared.manager.borrow_mut();
+            let Ok(view) = manager.view_mut(&self.key) else {
+                return;
+            };
+            if view.factory.is_none() {
+                manager.legacy_popup_policy = popup_policy;
+                None
+            } else if popup_policy == PopupRequestPolicy::DefaultDeny {
+                view.handler.take()
+            } else {
+                None
+            }
+        };
+        drop(old);
     }
 
     pub fn managed_child_webview_ids(&self) -> Vec<String> {
@@ -126,11 +301,17 @@ impl ServoWebViewAdapter {
         self.shared
             .manager
             .borrow()
-            .opener_webview_id(child_webview_id)
+            .child(child_webview_id)
+            .ok()
+            .and_then(|view| view.parent_webview_id.clone())
     }
 
     pub fn destroy_managed_child_webview(&self, child_webview_id: &str) -> Result<(), String> {
-        self.shared.destroy_managed_child_webview(child_webview_id)
+        let key = self.shared.manager.borrow().child_key(child_webview_id)?;
+        self.shared.cleanup_pending_for_webview(&key);
+        let removed = self.shared.manager.borrow_mut().views.remove(&key);
+        drop(removed);
+        Ok(())
     }
 
     pub fn attach_managed_child_surface(
@@ -139,13 +320,13 @@ impl ServoWebViewAdapter {
         surface: HostSurface,
         viewport: SurfaceViewport,
     ) -> Result<(), String> {
-        let child_webview = self
+        let child = self
             .shared
             .manager
             .borrow_mut()
             .attach_managed_child_surface(child_webview_id, surface, viewport)?;
-        child_webview.set_hidpi_scale_factor(servo_hidpi_scale_factor(viewport.scale_factor));
-        child_webview.resize(servo_physical_size(viewport.size));
+        child.set_hidpi_scale_factor(servo_hidpi_scale_factor(viewport.scale_factor));
+        child.resize(servo_physical_size(viewport.size));
         Ok(())
     }
 
@@ -154,13 +335,13 @@ impl ServoWebViewAdapter {
         child_webview_id: &str,
         viewport: SurfaceViewport,
     ) -> Result<(), String> {
-        let child_webview = self
+        let child = self
             .shared
             .manager
             .borrow_mut()
             .update_managed_child_surface_viewport(child_webview_id, viewport)?;
-        child_webview.set_hidpi_scale_factor(servo_hidpi_scale_factor(viewport.scale_factor));
-        child_webview.resize(servo_physical_size(viewport.size));
+        child.set_hidpi_scale_factor(servo_hidpi_scale_factor(viewport.scale_factor));
+        child.resize(servo_physical_size(viewport.size));
         Ok(())
     }
 
@@ -178,30 +359,38 @@ impl ServoWebViewAdapter {
         self.shared
             .manager
             .borrow()
-            .managed_child_surface_viewport(child_webview_id)
+            .child(child_webview_id)
+            .ok()
+            .and_then(|view| view.surface.as_ref())
+            .map(|surface| surface.viewport)
     }
 
     pub fn managed_child_surface_attached(&self, child_webview_id: &str) -> Result<bool, String> {
-        self.shared
-            .manager
-            .borrow()
-            .managed_child_surface_attached(child_webview_id)
-    }
-
-    pub fn take_managed_child_needs_paint(&self, child_webview_id: &str) -> Result<bool, String> {
-        self.shared
-            .manager
-            .borrow_mut()
-            .take_managed_child_needs_paint(child_webview_id)
-    }
-
-    pub fn paint_managed_child(&self, child_webview_id: &str) -> Result<(), String> {
-        let child_webview = self
+        Ok(self
             .shared
             .manager
             .borrow()
-            .managed_child_webview(child_webview_id)?;
-        child_webview.paint();
+            .child(child_webview_id)?
+            .surface
+            .is_some())
+    }
+
+    pub fn take_managed_child_needs_paint(&self, child_webview_id: &str) -> Result<bool, String> {
+        let mut manager = self.shared.manager.borrow_mut();
+        let key = manager.child_key(child_webview_id)?;
+        Ok(manager.view_mut(&key)?.state.take_needs_paint())
+    }
+
+    pub fn paint_managed_child(&self, child_webview_id: &str) -> Result<(), String> {
+        let child = self
+            .shared
+            .manager
+            .borrow()
+            .child(child_webview_id)?
+            .webview
+            .clone()
+            .expect("committed native child");
+        child.paint();
         Ok(())
     }
 
@@ -209,7 +398,41 @@ impl ServoWebViewAdapter {
         self.shared
             .manager
             .borrow()
-            .ensure_managed_child_webview(child_webview_id)
+            .child(child_webview_id)
+            .map(|_| ())
+    }
+
+    pub(crate) fn evaluate_javascript(
+        &self,
+        evaluation_id: &str,
+        script: &str,
+    ) -> Result<(), String> {
+        let native = self.native_webview()?;
+        let token = self
+            .shared
+            .manager
+            .borrow_mut()
+            .view_mut(&self.key)?
+            .evaluations
+            .submit(evaluation_id)?;
+        let owner = Rc::downgrade(&self.shared);
+        let key = self.key.clone();
+        let evaluation_id = evaluation_id.to_owned();
+        native.evaluate_javascript(script, move |result| {
+            let Some(owner) = owner.upgrade() else { return };
+            let mut manager = owner.manager.borrow_mut();
+            let Some(view) = manager.views.get_mut(&key) else {
+                return;
+            };
+            if !view.evaluations.complete(&evaluation_id, token) {
+                return;
+            }
+            manager.emit(
+                &key,
+                host_event_from_javascript_evaluation_result(evaluation_id, result),
+            );
+        });
+        Ok(())
     }
 
     pub fn notify_javascript_evaluation_result(
@@ -217,23 +440,9 @@ impl ServoWebViewAdapter {
         evaluation_id: String,
         result: Result<servo::JSValue, servo::JavaScriptEvaluationError>,
     ) {
-        let webview_id = self.shared.manager.borrow().root_webview_id();
-        match host_event_from_javascript_evaluation_result(evaluation_id, result) {
-            HostEvent::JavaScriptEvaluationResult {
-                evaluation_id,
-                ok,
-                value_json,
-                error_type,
-            } => self.shared.manager.borrow_mut().update_root_state(|state| {
-                state.notify_javascript_evaluation_result(evaluation_id, ok, value_json, error_type)
-            }),
-            _ => {
-                unreachable!("javascript evaluation helper should always return evaluation results")
-            }
-        }
-        debug_assert!(
-            webview_id.is_some(),
-            "root webview should be registered before JavaScript results are delivered"
+        self.shared.manager.borrow_mut().emit(
+            &self.key,
+            host_event_from_javascript_evaluation_result(evaluation_id, result),
         );
     }
 
@@ -242,16 +451,17 @@ impl ServoWebViewAdapter {
         select_element_id: &str,
         selected_options: Vec<usize>,
     ) -> Result<(), String> {
-        let mut pending_select_element = self
-            .shared
-            .pending_select_elements
-            .borrow_mut()
-            .remove(select_element_id)
-            .ok_or_else(|| format!("select element {select_element_id} is no longer pending"))?;
+        let mut pending_select_element = self.take_pending(
+            &self.shared.pending_select_elements,
+            select_element_id,
+            "select element",
+        )?;
         self.shared
             .manager
             .borrow_mut()
-            .resolve_select_element(select_element_id)?;
+            .with_state_for_webview(&pending_select_element.webview_id, |state| {
+                state.resolve_select_element(select_element_id)
+            })?;
 
         pending_select_element
             .select_element
@@ -266,16 +476,17 @@ impl ServoWebViewAdapter {
         file_picker_id: &str,
         selected_paths: Vec<String>,
     ) -> Result<(), String> {
-        let mut pending_file_picker = self
-            .shared
-            .pending_file_pickers
-            .borrow_mut()
-            .remove(file_picker_id)
-            .ok_or_else(|| format!("file picker {file_picker_id} is no longer pending"))?;
+        let mut pending_file_picker = self.take_pending(
+            &self.shared.pending_file_pickers,
+            file_picker_id,
+            "file picker",
+        )?;
         self.shared
             .manager
             .borrow_mut()
-            .resolve_file_picker(file_picker_id)?;
+            .with_state_for_webview(&pending_file_picker.webview_id, |state| {
+                state.resolve_file_picker(file_picker_id)
+            })?;
 
         let selected_paths = selected_paths
             .into_iter()
@@ -288,16 +499,17 @@ impl ServoWebViewAdapter {
     }
 
     pub fn dismiss_file_picker(&self, file_picker_id: &str) -> Result<(), String> {
-        let pending_file_picker = self
-            .shared
-            .pending_file_pickers
-            .borrow_mut()
-            .remove(file_picker_id)
-            .ok_or_else(|| format!("file picker {file_picker_id} is no longer pending"))?;
+        let pending_file_picker = self.take_pending(
+            &self.shared.pending_file_pickers,
+            file_picker_id,
+            "file picker",
+        )?;
         self.shared
             .manager
             .borrow_mut()
-            .resolve_file_picker(file_picker_id)?;
+            .with_state_for_webview(&pending_file_picker.webview_id, |state| {
+                state.resolve_file_picker(file_picker_id)
+            })?;
 
         pending_file_picker.file_picker.dismiss();
 
@@ -309,16 +521,17 @@ impl ServoWebViewAdapter {
         context_menu_id: &str,
         action: ContextMenuAction,
     ) -> Result<(), String> {
-        let pending_context_menu = self
-            .shared
-            .pending_context_menus
-            .borrow_mut()
-            .remove(context_menu_id)
-            .ok_or_else(|| format!("context menu {context_menu_id} is no longer pending"))?;
+        let pending_context_menu = self.take_pending(
+            &self.shared.pending_context_menus,
+            context_menu_id,
+            "context menu",
+        )?;
         self.shared
             .manager
             .borrow_mut()
-            .resolve_context_menu(context_menu_id)?;
+            .with_state_for_webview(&pending_context_menu.webview_id, |state| {
+                state.resolve_context_menu(context_menu_id)
+            })?;
 
         pending_context_menu
             .context_menu
@@ -328,16 +541,17 @@ impl ServoWebViewAdapter {
     }
 
     pub fn dismiss_context_menu(&self, context_menu_id: &str) -> Result<(), String> {
-        let pending_context_menu = self
-            .shared
-            .pending_context_menus
-            .borrow_mut()
-            .remove(context_menu_id)
-            .ok_or_else(|| format!("context menu {context_menu_id} is no longer pending"))?;
+        let pending_context_menu = self.take_pending(
+            &self.shared.pending_context_menus,
+            context_menu_id,
+            "context menu",
+        )?;
         self.shared
             .manager
             .borrow_mut()
-            .resolve_context_menu(context_menu_id)?;
+            .with_state_for_webview(&pending_context_menu.webview_id, |state| {
+                state.resolve_context_menu(context_menu_id)
+            })?;
 
         pending_context_menu.context_menu.dismiss();
 
@@ -345,27 +559,27 @@ impl ServoWebViewAdapter {
     }
 
     pub fn has_pending_permission_request(&self) -> bool {
-        self.shared
-            .manager
-            .borrow()
-            .pending_permission_request()
-            .is_some()
+        self.pending_permission_request().is_some()
     }
 
     pub fn pending_permission_request(&self) -> Option<(String, String)> {
+        let key = self.pending_permission_key()?;
         self.shared
             .manager
             .borrow()
-            .pending_permission_request()
+            .pending_permission_request(&key)
             .map(|request| (request.permission.clone(), request.origin.clone()))
     }
 
     pub fn resolve_permission(&self, allow: bool) -> Result<(), String> {
+        let key = self
+            .pending_permission_key()
+            .ok_or_else(|| "permission request is no longer pending".to_owned())?;
         let request = self
             .shared
-            .pending_permission_request
+            .pending_permission_requests
             .borrow_mut()
-            .take()
+            .remove(&key)
             .ok_or_else(|| "permission request is no longer pending".to_owned())?;
         self.shared
             .manager
@@ -386,12 +600,11 @@ impl ServoWebViewAdapter {
         navigation_id: &str,
         allow: bool,
     ) -> Result<(), String> {
-        let navigation_request = self
-            .shared
-            .pending_navigation_requests
-            .borrow_mut()
-            .remove(navigation_id)
-            .ok_or_else(|| format!("navigation request {navigation_id} is no longer pending"))?;
+        let navigation_request = self.take_pending(
+            &self.shared.pending_navigation_requests,
+            navigation_id,
+            "navigation request",
+        )?;
         self.shared
             .manager
             .borrow_mut()
@@ -412,16 +625,17 @@ impl ServoWebViewAdapter {
         confirmed: bool,
         prompt_value: Option<&str>,
     ) -> Result<(), String> {
-        let pending_dialog = self
-            .shared
-            .pending_simple_dialogs
-            .borrow_mut()
-            .remove(dialog_id)
-            .ok_or_else(|| format!("simple dialog {dialog_id} is no longer pending"))?;
+        let pending_dialog = self.take_pending(
+            &self.shared.pending_simple_dialogs,
+            dialog_id,
+            "simple dialog",
+        )?;
         self.shared
             .manager
             .borrow_mut()
-            .resolve_simple_dialog(dialog_id)?;
+            .with_state_for_webview(&pending_dialog.webview_id, |state| {
+                state.resolve_simple_dialog(dialog_id)
+            })?;
 
         match pending_dialog.dialog {
             SimpleDialog::Alert(alert_dialog) => alert_dialog.confirm(),
@@ -446,56 +660,80 @@ impl ServoWebViewAdapter {
 
         Ok(())
     }
+
+    fn take_pending<T: PendingWebViewScoped>(
+        &self,
+        pending: &RefCell<HashMap<String, T>>,
+        id: &str,
+        kind: &str,
+    ) -> Result<T, String> {
+        let manager = self.shared.manager.borrow();
+        let view = manager.view(&self.key)?;
+        // Standalone legacy children are controlled through their sole root wrapper.
+        let scope = view.registration.as_ref().map(|_| self.key.as_str());
+        let mut pending = pending.borrow_mut();
+        let request = pending
+            .get(id)
+            .ok_or_else(|| format!("{kind} {id} is no longer pending"))?;
+        if scope.is_some_and(|key| request.webview_id() != key) {
+            return Err(format!("{kind} {id} is not pending on this view"));
+        }
+        Ok(pending.remove(id).expect("validated pending response"))
+    }
+
+    fn pending_permission_key(&self) -> Option<String> {
+        let manager = self.shared.manager.borrow();
+        let view = manager.view(&self.key).ok()?;
+        let pending = self.shared.pending_permission_requests.borrow();
+        if view.registration.is_some() {
+            pending.contains_key(&self.key).then(|| self.key.clone())
+        } else {
+            pending.keys().next().cloned()
+        }
+    }
 }
 
 struct SharedState {
-    rendering_context: Rc<dyn RenderingContext>,
+    manager: RefCell<WebViewManager>,
+    runtime: RefCell<Option<ServoRuntime>>,
     managed_child_rendering_context_factory: ManagedChildRenderingContextFactory,
     managed_child_rendering_context_is_child_scoped: bool,
-    manager: RefCell<WebViewManager>,
     pending_navigation_requests: RefCell<HashMap<String, PendingNavigationRequest>>,
     pending_simple_dialogs: RefCell<HashMap<String, PendingSimpleDialog>>,
     pending_select_elements: RefCell<HashMap<String, PendingSelectElement>>,
     pending_context_menus: RefCell<HashMap<String, PendingContextMenu>>,
     pending_file_pickers: RefCell<HashMap<String, PendingFilePicker>>,
-    pending_permission_request: RefCell<Option<PendingPermissionRequest>>,
+    pending_permission_requests: RefCell<HashMap<String, PendingPermissionRequest>>,
 }
 
 impl SharedState {
     fn new(
+        key: String,
         popup_policy: PopupRequestPolicy,
         rendering_context: Rc<dyn RenderingContext>,
-        managed_child_rendering_context_factory: ManagedChildRenderingContextFactory,
-        managed_child_rendering_context_is_child_scoped: bool,
+        factory: ManagedChildRenderingContextFactory,
+        explicit: bool,
     ) -> Self {
         Self {
-            rendering_context,
-            managed_child_rendering_context_factory,
-            managed_child_rendering_context_is_child_scoped,
-            manager: RefCell::new(WebViewManager::new(popup_policy)),
+            manager: RefCell::new(WebViewManager::new(key, popup_policy, rendering_context)),
+            runtime: RefCell::default(),
+            managed_child_rendering_context_factory: factory,
+            managed_child_rendering_context_is_child_scoped: explicit,
             pending_navigation_requests: RefCell::default(),
             pending_simple_dialogs: RefCell::default(),
             pending_select_elements: RefCell::default(),
             pending_context_menus: RefCell::default(),
             pending_file_pickers: RefCell::default(),
-            pending_permission_request: RefCell::default(),
+            pending_permission_requests: RefCell::default(),
         }
     }
 
-    fn destroy_managed_child_webview(&self, child_webview_id: &str) -> Result<(), String> {
-        self.cleanup_pending_for_webview(child_webview_id);
-        self.manager
-            .borrow_mut()
-            .destroy_managed_child_webview(child_webview_id)
-    }
-
-    fn managed_child_rendering_context(&self) -> Rc<dyn RenderingContext> {
-        (self.managed_child_rendering_context_factory)(self.rendering_context.clone())
-    }
-
-    fn notify_closed(&self, webview_id: &str) {
-        self.cleanup_pending_for_webview(webview_id);
-        self.manager.borrow_mut().notify_closed(webview_id);
+    fn notify_closed(&self, key: &str) {
+        self.manager.borrow_mut().emit(key, HostEvent::Closed);
+        self.cleanup_pending_for_webview(key);
+        let removed = self.manager.borrow_mut().views.remove(key);
+        // The callback's WebView argument keeps the native view alive until it unwinds.
+        drop(removed);
     }
 
     fn cleanup_pending_for_webview(&self, webview_id: &str) {
@@ -584,12 +822,9 @@ impl SharedState {
         &self,
         webview_id: &str,
     ) -> Option<PendingPermissionRequest> {
-        let mut pending_permission_request = self.pending_permission_request.borrow_mut();
-        pending_permission_request
-            .as_ref()
-            .is_some_and(|request| request.webview_id == webview_id)
-            .then(|| pending_permission_request.take())
-            .flatten()
+        self.pending_permission_requests
+            .borrow_mut()
+            .remove(webview_id)
     }
 
     fn remove_pending_simple_dialogs_for_webview(
@@ -625,421 +860,375 @@ impl SharedState {
     }
 }
 
+#[derive(Clone)]
+struct RuntimeBinding {
+    webview: WebViewHandle,
+    registrar: WebViewRegistrar,
+    navigation_state_events: bool,
+}
+
+#[derive(Default)]
+struct PendingEvaluations {
+    generation: u64,
+    next_submission: u64,
+    pending: HashMap<String, (u64, u64)>,
+}
+
+impl PendingEvaluations {
+    fn submit(&mut self, id: &str) -> Result<(u64, u64), String> {
+        if id.is_empty() || self.pending.contains_key(id) {
+            return Err(
+                "JavaScript evaluation ID must be nonempty and not already pending on this view"
+                    .to_owned(),
+            );
+        }
+        self.next_submission = self
+            .next_submission
+            .checked_add(1)
+            .ok_or_else(|| "JavaScript evaluation identity capacity exhausted".to_owned())?;
+        let token = (self.generation, self.next_submission);
+        self.pending.insert(id.to_owned(), token);
+        Ok(token)
+    }
+
+    fn complete(&mut self, id: &str, token: (u64, u64)) -> bool {
+        if self.pending.get(id) != Some(&token) {
+            return false;
+        }
+        self.pending.remove(id);
+        true
+    }
+
+    fn retire(&mut self) -> Vec<String> {
+        // Submission tokens remain unique even if an observed generation reaches its limit.
+        self.generation = self.generation.saturating_add(1);
+        let mut ids = self.pending.drain().map(|(id, _)| id).collect::<Vec<_>>();
+        ids.sort();
+        ids
+    }
+}
+
+struct ManagedWebView {
+    webview: Option<WebView>,
+    native_id: String,
+    parent_webview_id: Option<String>,
+    state: ServoAdapterState,
+    rendering_context: Rc<dyn RenderingContext>,
+    surface: Option<AttachedManagedChildSurface>,
+    surface_adoptable: bool,
+    factory: Option<ManagedChildWebViewFactory>,
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the native child callback signature explicit."
+    )]
+    handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+    registration: Option<RuntimeBinding>,
+    next_request: Option<u64>,
+    evaluations: PendingEvaluations,
+}
+
+impl ManagedWebView {
+    fn new(rendering_context: Rc<dyn RenderingContext>) -> Self {
+        Self {
+            webview: None,
+            native_id: String::new(),
+            parent_webview_id: None,
+            state: ServoAdapterState::default(),
+            rendering_context,
+            surface: None,
+            surface_adoptable: false,
+            factory: None,
+            handler: None,
+            registration: None,
+            next_request: Some(1),
+            evaluations: PendingEvaluations::default(),
+        }
+    }
+
+    fn next_request_id(&mut self) -> Option<String> {
+        let sequence = self.next_request?;
+        self.next_request = sequence.checked_add(1);
+        let source = self
+            .registration
+            .as_ref()
+            .map(|binding| binding.webview.raw().to_string())
+            .unwrap_or_else(|| self.native_id.clone());
+        Some(format!("{source}:{sequence}"))
+    }
+}
+
 struct WebViewManager {
-    popup_policy: PopupRequestPolicy,
-    root_webview_id: Option<String>,
-    root_state: ServoAdapterState,
-    child_states: HashMap<String, ServoAdapterState>,
-    managed_children: HashMap<String, ManagedChildWebView>,
-    events: VecDeque<ServoWebViewEvent>,
+    views: HashMap<String, ManagedWebView>,
+    legacy_popup_policy: PopupRequestPolicy,
+    events: VecDeque<(String, ServoWebViewEvent)>,
+    next_view_id: u64,
     next_navigation_request_id: u64,
 }
 
 impl WebViewManager {
-    fn new(popup_policy: PopupRequestPolicy) -> Self {
+    fn new(
+        key: String,
+        popup_policy: PopupRequestPolicy,
+        rendering_context: Rc<dyn RenderingContext>,
+    ) -> Self {
         Self {
-            popup_policy,
-            root_webview_id: None,
-            root_state: ServoAdapterState::default(),
-            child_states: HashMap::new(),
-            managed_children: HashMap::new(),
+            views: HashMap::from([(key, ManagedWebView::new(rendering_context))]),
+            legacy_popup_policy: popup_policy,
             events: VecDeque::new(),
+            next_view_id: 0,
             next_navigation_request_id: 0,
         }
     }
 
-    fn popup_policy(&self) -> PopupRequestPolicy {
-        self.popup_policy
+    fn view(&self, key: &str) -> Result<&ManagedWebView, String> {
+        self.views
+            .get(key)
+            .ok_or_else(|| format!("webview {key} is not registered"))
     }
 
-    fn set_popup_policy(&mut self, popup_policy: PopupRequestPolicy) {
-        self.popup_policy = popup_policy;
+    fn view_mut(&mut self, key: &str) -> Result<&mut ManagedWebView, String> {
+        self.views
+            .get_mut(key)
+            .ok_or_else(|| format!("webview {key} is not registered"))
     }
 
-    fn root_webview_id(&self) -> Option<String> {
-        self.root_webview_id.clone()
+    fn child_key(&self, native_id: &str) -> Result<String, String> {
+        self.views
+            .iter()
+            .find(|(_, view)| view.native_id == native_id && view.parent_webview_id.is_some())
+            .map(|(key, _)| key.clone())
+            .ok_or_else(|| format!("managed child webview {native_id} is not registered"))
     }
 
-    fn register_root_webview(&mut self, webview_id: String) {
-        self.root_webview_id = Some(webview_id);
+    fn child(&self, native_id: &str) -> Result<&ManagedWebView, String> {
+        self.view(&self.child_key(native_id)?)
     }
 
-    fn request_root_paint(&mut self) {
-        self.root_state.request_paint();
+    fn reserve_child(&mut self, parent_id: &str) -> Result<String, String> {
+        let parent = self
+            .views
+            .values()
+            .find(|view| view.native_id == parent_id)
+            .ok_or_else(|| "native child source is no longer live".to_owned())?;
+        let mut child = ManagedWebView::new(parent.rendering_context.clone());
+        child.parent_webview_id = Some(parent_id.to_owned());
+        child.factory = parent.factory.clone();
+        child.handler = parent.handler.clone();
+        self.next_view_id = self
+            .next_view_id
+            .checked_add(1)
+            .ok_or_else(|| "native child identity capacity exhausted".to_owned())?;
+        let key = format!("view-{}", self.next_view_id);
+        self.views.insert(key.clone(), child);
+        Ok(key)
     }
 
-    fn take_root_needs_paint(&mut self) -> bool {
-        self.root_state.take_needs_paint()
-    }
-
-    fn current_url(&self, webview_id: &str) -> Option<String> {
-        if self.is_root_webview(webview_id) {
-            self.root_state.current_url().map(str::to_owned)
-        } else {
-            self.child_states
-                .get(webview_id)
-                .and_then(|state| state.current_url().map(str::to_owned))
-        }
+    fn current_url(&self, key: &str) -> Option<String> {
+        self.views
+            .get(key)
+            .and_then(|view| view.state.current_url().map(str::to_owned))
     }
 
     fn managed_child_webview_ids(&self) -> Vec<String> {
         let mut ids = self
-            .managed_children
+            .views
             .values()
-            .map(|child| child.webview.id().to_string())
+            .filter(|view| view.parent_webview_id.is_some() && view.webview.is_some())
+            .map(|view| view.native_id.clone())
             .collect::<Vec<_>>();
         ids.sort();
         ids
     }
 
-    fn opener_webview_id(&self, child_webview_id: &str) -> Option<String> {
-        self.managed_children
-            .get(child_webview_id)
-            .map(|child| child.parent_webview_id.clone())
-    }
-
-    fn register_managed_child(
-        &mut self,
-        parent_webview_id: String,
-        child_webview: WebView,
-        parent_url: Option<String>,
-        surface_adoptable: bool,
-    ) -> String {
-        let child_webview_id = webview_key(&child_webview);
-        self.child_states
-            .entry(child_webview_id.clone())
-            .or_insert_with(ServoAdapterState::default);
-        self.managed_children.insert(
-            child_webview_id.clone(),
-            ManagedChildWebView {
-                parent_webview_id: parent_webview_id.clone(),
-                webview: child_webview,
-                surface: None,
-                surface_adoptable,
-            },
-        );
-        let popup_parent_webview_id = parent_webview_id.clone();
-        let popup_child_webview_id = child_webview_id.clone();
-        self.update_state_for_webview(&parent_webview_id, |state| {
-            state.notify_popup_created(PopupCreated {
-                parent_webview_id: popup_parent_webview_id,
-                child_webview_id: popup_child_webview_id,
-                parent_url,
-                target_url: None,
-                window_features: None,
-            });
-        });
-        child_webview_id
-    }
-
-    fn destroy_managed_child_webview(&mut self, child_webview_id: &str) -> Result<(), String> {
-        self.managed_children
-            .remove(child_webview_id)
-            .map(|_| ())
-            .ok_or_else(|| format!("managed child webview {child_webview_id} is not registered"))?;
-        self.child_states.remove(child_webview_id);
-        Ok(())
-    }
-
-    fn ensure_managed_child_webview(&self, child_webview_id: &str) -> Result<(), String> {
-        self.managed_children
-            .contains_key(child_webview_id)
-            .then_some(())
-            .ok_or_else(|| format!("managed child webview {child_webview_id} is not registered"))
-    }
-
-    fn managed_child_webview(&self, child_webview_id: &str) -> Result<WebView, String> {
-        self.managed_children
-            .get(child_webview_id)
-            .map(|child| child.webview.clone())
-            .ok_or_else(|| format!("managed child webview {child_webview_id} is not registered"))
-    }
-
     fn attach_managed_child_surface(
         &mut self,
-        child_webview_id: &str,
+        native_id: &str,
         surface: HostSurface,
         viewport: SurfaceViewport,
     ) -> Result<WebView, String> {
-        let child_webview = {
-            let child = self
-                .managed_children
-                .get_mut(child_webview_id)
-                .ok_or_else(|| {
-                    format!("managed child webview {child_webview_id} is not registered")
-                })?;
-            if !child.surface_adoptable {
-                return Err(format!(
-                    "managed child webview {child_webview_id} does not have a child-scoped rendering context"
-                ));
-            }
-            if child.surface.is_some() {
-                return Err(format!(
-                    "managed child webview {child_webview_id} already has an attached surface"
-                ));
-            }
-            child.surface = Some(AttachedManagedChildSurface {
-                _surface: surface,
-                viewport,
-            });
-            child.webview.clone()
-        };
-
-        self.update_state_for_webview(child_webview_id, |state| {
+        let key = self.child_key(native_id)?;
+        let child = self.view_mut(&key)?;
+        if !child.surface_adoptable {
+            return Err(format!(
+                "managed child webview {native_id} does not have a child-scoped rendering context"
+            ));
+        }
+        if child.surface.is_some() {
+            return Err(format!(
+                "managed child webview {native_id} already has an attached surface"
+            ));
+        }
+        child.surface = Some(AttachedManagedChildSurface {
+            _surface: surface,
+            viewport,
+        });
+        let native = child.webview.clone().expect("committed native child");
+        self.update_state_for_webview(&key, |state| {
             state.notify_surface_attached(viewport.size);
             state.request_paint();
         });
-        Ok(child_webview)
+        Ok(native)
     }
 
     fn update_managed_child_surface_viewport(
         &mut self,
-        child_webview_id: &str,
+        native_id: &str,
         viewport: SurfaceViewport,
     ) -> Result<WebView, String> {
-        let child_webview = {
-            let child = self
-                .managed_children
-                .get_mut(child_webview_id)
-                .ok_or_else(|| {
-                    format!("managed child webview {child_webview_id} is not registered")
-                })?;
-            let Some(attached_surface) = child.surface.as_mut() else {
-                return Err(format!(
-                    "managed child webview {child_webview_id} does not have an attached surface"
-                ));
-            };
-            attached_surface.viewport = viewport;
-            child.webview.clone()
-        };
-
-        self.update_state_for_webview(child_webview_id, |state| {
+        let key = self.child_key(native_id)?;
+        let child = self.view_mut(&key)?;
+        child
+            .surface
+            .as_mut()
+            .ok_or_else(|| {
+                format!("managed child webview {native_id} does not have an attached surface")
+            })?
+            .viewport = viewport;
+        let native = child.webview.clone().expect("committed native child");
+        self.update_state_for_webview(&key, |state| {
             state.notify_surface_resized(viewport.size);
             state.request_paint();
         });
-        Ok(child_webview)
+        Ok(native)
     }
 
-    fn detach_managed_child_surface(&mut self, child_webview_id: &str) -> Result<(), String> {
-        let removed = {
-            let child = self
-                .managed_children
-                .get_mut(child_webview_id)
-                .ok_or_else(|| {
-                    format!("managed child webview {child_webview_id} is not registered")
-                })?;
-            child.surface.take()
-        };
-        if removed.is_none() {
-            return Err(format!(
-                "managed child webview {child_webview_id} does not have an attached surface"
-            ));
-        }
-
-        self.update_state_for_webview(child_webview_id, |state| {
-            state.notify_surface_detached();
-        });
+    fn detach_managed_child_surface(&mut self, native_id: &str) -> Result<(), String> {
+        let key = self.child_key(native_id)?;
+        self.view_mut(&key)?.surface.take().ok_or_else(|| {
+            format!("managed child webview {native_id} does not have an attached surface")
+        })?;
+        self.update_state_for_webview(&key, ServoAdapterState::notify_surface_detached);
         Ok(())
     }
 
-    fn managed_child_surface_viewport(&self, child_webview_id: &str) -> Option<SurfaceViewport> {
-        self.managed_children
-            .get(child_webview_id)
-            .and_then(|child| child.surface.as_ref())
-            .map(|surface| surface.viewport)
-    }
-
-    fn managed_child_surface_attached(&self, child_webview_id: &str) -> Result<bool, String> {
-        self.managed_children
-            .get(child_webview_id)
-            .map(|child| child.surface.is_some())
-            .ok_or_else(|| format!("managed child webview {child_webview_id} is not registered"))
-    }
-
-    fn take_managed_child_needs_paint(&mut self, child_webview_id: &str) -> Result<bool, String> {
-        self.child_states
-            .get_mut(child_webview_id)
-            .map(ServoAdapterState::take_needs_paint)
-            .ok_or_else(|| format!("managed child webview {child_webview_id} is not registered"))
-    }
-
-    fn notify_closed(&mut self, webview_id: &str) {
-        self.update_state_for_webview(webview_id, |state| state.notify_closed());
-        if self.managed_children.remove(webview_id).is_some() {
-            self.child_states.remove(webview_id);
-        }
-    }
-
-    fn request_popup(&mut self, parent_webview_id: &str, parent_url: Option<String>) {
-        self.update_state_for_webview(parent_webview_id, |state| {
+    fn request_popup(
+        &mut self,
+        key: &str,
+        request_id: String,
+        parent_webview_id: String,
+        parent_url: Option<String>,
+    ) {
+        self.update_state_for_webview(key, |state| {
             state.request_popup(PopupRequest {
-                parent_webview_id: parent_webview_id.to_owned(),
+                request_id,
+                parent_webview_id,
                 parent_url,
                 target_url: None,
                 window_features: None,
-            });
+            })
         });
     }
 
-    fn request_navigation(&mut self, webview_id: &str, url: String) -> String {
-        let navigation_id = self.next_navigation_request_id();
-        let routed_navigation_id = navigation_id.clone();
-        self.update_state_for_webview(webview_id, |state| {
-            state.request_navigation_with_id(routed_navigation_id, url);
+    fn request_navigation(&mut self, key: &str, url: String) -> String {
+        self.next_navigation_request_id = self
+            .next_navigation_request_id
+            .checked_add(1)
+            .expect("native navigation identity capacity exhausted");
+        let id = format!("navigation-{}", self.next_navigation_request_id);
+        self.update_state_for_webview(key, |state| {
+            state.request_navigation_with_id(id.clone(), url);
         });
-        navigation_id
+        id
     }
 
-    fn next_navigation_request_id(&mut self) -> String {
-        self.next_navigation_request_id = self.next_navigation_request_id.wrapping_add(1);
-        format!("navigation-{}", self.next_navigation_request_id)
+    fn resolve_navigation_request(&mut self, key: &str, id: &str) -> Result<(), String> {
+        self.with_state_for_webview(key, |state| state.resolve_navigation_request(id))
     }
 
-    fn resolve_navigation_request(
-        &mut self,
-        webview_id: &str,
-        navigation_id: &str,
-    ) -> Result<(), String> {
-        self.with_state_for_webview(webview_id, |state| {
-            state.resolve_navigation_request(navigation_id)
-        })
-    }
-
-    fn resolve_select_element(&mut self, select_element_id: &str) -> Result<(), String> {
-        self.resolve_in_any_state(|state| state.resolve_select_element(select_element_id))
-    }
-
-    fn resolve_file_picker(&mut self, file_picker_id: &str) -> Result<(), String> {
-        self.resolve_in_any_state(|state| state.resolve_file_picker(file_picker_id))
-    }
-
-    fn resolve_context_menu(&mut self, context_menu_id: &str) -> Result<(), String> {
-        self.resolve_in_any_state(|state| state.resolve_context_menu(context_menu_id))
-    }
-
-    fn resolve_simple_dialog(&mut self, dialog_id: &str) -> Result<(), String> {
-        self.resolve_in_any_state(|state| state.resolve_simple_dialog(dialog_id))
-    }
-
-    fn hide_embedder_control(
-        &mut self,
-        webview_id: &str,
-        control_id: &str,
-    ) -> HiddenEmbedderControl {
+    fn hide_embedder_control(&mut self, key: &str, id: &str) -> HiddenEmbedderControl {
         let mut hidden = HiddenEmbedderControl::Unknown;
-        self.update_state_for_webview(webview_id, |state| {
-            hidden = state.hide_embedder_control(control_id);
-        });
+        self.update_state_for_webview(key, |state| hidden = state.hide_embedder_control(id));
         hidden
     }
 
-    fn resolve_permission(&mut self, webview_id: &str) -> Result<(), String> {
-        self.with_state_for_webview(webview_id, ServoAdapterState::resolve_permission)
+    fn resolve_permission(&mut self, key: &str) -> Result<(), String> {
+        self.with_state_for_webview(key, ServoAdapterState::resolve_permission)
     }
 
-    fn pending_permission_request(&self) -> Option<crate::PendingPermissionRequestInfo> {
-        self.root_state.pending_permission_request().or_else(|| {
-            self.child_states
-                .values()
-                .find_map(ServoAdapterState::pending_permission_request)
-        })
+    fn pending_permission_request(&self, key: &str) -> Option<crate::PendingPermissionRequestInfo> {
+        self.views
+            .get(key)
+            .and_then(|view| view.state.pending_permission_request())
     }
 
-    fn update_root_state(&mut self, update: impl FnOnce(&mut ServoAdapterState)) {
-        let webview_id = self.root_webview_id.clone().unwrap_or_default();
-        update(&mut self.root_state);
-        self.drain_state_events(webview_id, false);
-    }
-
-    fn update_state_for_webview(
-        &mut self,
-        webview_id: &str,
-        update: impl FnOnce(&mut ServoAdapterState),
-    ) {
-        if self.is_root_webview(webview_id) {
-            update(&mut self.root_state);
-            self.drain_state_events(webview_id.to_owned(), false);
+    fn update_state_for_webview(&mut self, key: &str, update: impl FnOnce(&mut ServoAdapterState)) {
+        let Some(view) = self.views.get_mut(key) else {
             return;
+        };
+        update(&mut view.state);
+        let events = view.state.drain_events();
+        for event in events {
+            self.emit(key, event);
         }
-
-        let state = self
-            .child_states
-            .entry(webview_id.to_owned())
-            .or_insert_with(ServoAdapterState::default);
-        update(state);
-        self.drain_state_events(webview_id.to_owned(), true);
     }
 
     fn with_state_for_webview(
         &mut self,
-        webview_id: &str,
+        key: &str,
         update: impl FnOnce(&mut ServoAdapterState) -> Result<(), String>,
     ) -> Result<(), String> {
-        if self.is_root_webview(webview_id) {
-            return update(&mut self.root_state);
+        let result = update(&mut self.view_mut(key)?.state);
+        let events = self.view_mut(key)?.state.drain_events();
+        for event in events {
+            self.emit(key, event);
         }
-        let Some(state) = self.child_states.get_mut(webview_id) else {
-            return Err(format!("webview {webview_id} is not registered"));
-        };
-        update(state)
+        result
     }
 
-    fn resolve_in_any_state(
-        &mut self,
-        mut update: impl FnMut(&mut ServoAdapterState) -> Result<(), String>,
-    ) -> Result<(), String> {
-        match update(&mut self.root_state) {
-            Ok(()) => return Ok(()),
-            Err(mut last_error) => {
-                for state in self.child_states.values_mut() {
-                    match update(state) {
-                        Ok(()) => return Ok(()),
-                        Err(error) => last_error = error,
-                    }
-                }
-                Err(last_error)
+    fn retire_evaluations(&mut self, key: &str, error: servo::JavaScriptEvaluationError) {
+        let Some(view) = self.views.get_mut(key) else {
+            return;
+        };
+        for id in view.evaluations.retire() {
+            self.emit(
+                key,
+                host_event_from_javascript_evaluation_result(id, Err(error.clone())),
+            );
+        }
+    }
+
+    fn emit(&mut self, key: &str, event: HostEvent) {
+        let Some(view) = self.views.get(key) else {
+            return;
+        };
+        if let Some(binding) = &view.registration {
+            let navigation = match &event {
+                HostEvent::HistoryChanged {
+                    can_go_back,
+                    can_go_forward,
+                    ..
+                } if binding.navigation_state_events => Some((*can_go_back, *can_go_forward)),
+                _ => None,
+            };
+            binding.registrar.record_event(binding.webview, event);
+            if let Some((can_go_back, can_go_forward)) = navigation {
+                binding.registrar.record_event(
+                    binding.webview,
+                    HostEvent::NavigationStateChanged {
+                        can_go_back,
+                        can_go_forward,
+                    },
+                );
             }
-        }
-    }
-
-    fn drain_state_events(&mut self, webview_id: String, child: bool) {
-        let events = if child {
-            self.child_states
-                .get_mut(&webview_id)
-                .map(ServoAdapterState::drain_events)
-                .unwrap_or_default()
         } else {
-            self.root_state.drain_events()
-        };
-        self.events
-            .extend(events.into_iter().map(|event| ServoWebViewEvent {
-                webview_id: webview_id.clone(),
-                event,
-            }));
+            self.events.push_back((
+                key.to_owned(),
+                ServoWebViewEvent {
+                    webview_id: view.native_id.clone(),
+                    event,
+                },
+            ));
+        }
     }
 
     fn drain_events(&mut self) -> Vec<ServoWebViewEvent> {
-        self.events.drain(..).collect()
-    }
-
-    fn is_root_webview(&self, webview_id: &str) -> bool {
-        self.root_webview_id
-            .as_deref()
-            .map(|root| root == webview_id)
-            .unwrap_or(true)
+        self.events.drain(..).map(|(_, event)| event).collect()
     }
 }
 
 struct AttachedManagedChildSurface {
     _surface: HostSurface,
     viewport: SurfaceViewport,
-}
-
-struct ManagedChildWebView {
-    parent_webview_id: String,
-    webview: WebView,
-    surface: Option<AttachedManagedChildSurface>,
-    surface_adoptable: bool,
 }
 
 trait PendingWebViewScoped {
@@ -1130,7 +1319,22 @@ fn servo_hidpi_scale_factor(density: f32) -> Scale<f32, DeviceIndependentPixel, 
 }
 
 struct ServoWebViewDelegate {
-    shared: Rc<SharedState>,
+    shared: Weak<SharedState>,
+    key: String,
+}
+
+impl ServoWebViewDelegate {
+    fn owner(&self, webview: &WebView) -> Option<Rc<SharedState>> {
+        let shared = self.shared.upgrade()?;
+        {
+            let mut manager = shared.manager.borrow_mut();
+            let view = manager.views.get_mut(&self.key)?;
+            if view.native_id.is_empty() {
+                view.native_id = webview_key(webview);
+            }
+        }
+        Some(shared)
+    }
 }
 
 struct PendingPermissionRequest {
@@ -1146,41 +1350,56 @@ impl PendingWebViewScoped for PendingPermissionRequest {
 
 impl servo::WebViewDelegate for ServoWebViewDelegate {
     fn notify_new_frame_ready(&self, webview: WebView) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| state.request_paint());
     }
 
     fn notify_url_changed(&self, webview: WebView, url: Url) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| state.notify_url_changed(url.as_str()));
     }
 
     fn notify_page_title_changed(&self, webview: WebView, title: Option<String>) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| state.notify_page_title_changed(title));
     }
 
     fn notify_favicon_changed(&self, webview: WebView) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let favicon = webview.favicon().as_deref().map(favicon_image);
-        self.shared
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| state.notify_favicon_changed(favicon));
     }
 
     fn notify_status_text_changed(&self, webview: WebView, status: Option<String>) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| {
@@ -1189,8 +1408,11 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn notify_focus_changed(&self, webview: WebView, focused: bool) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| state.notify_focus_changed(focused));
@@ -1202,18 +1424,28 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
             LoadStatus::HeadParsed => LoadStatusKind::HeadParsed,
             LoadStatus::Complete => LoadStatusKind::Complete,
         };
-        let webview_id = webview_key(&webview);
-        self.shared
-            .manager
-            .borrow_mut()
-            .update_state_for_webview(&webview_id, |state| {
-                state.notify_load_status_changed(status)
-            });
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        let mut manager = shared.manager.borrow_mut();
+        if status == LoadStatusKind::Started {
+            manager.retire_evaluations(
+                &webview_id,
+                servo::JavaScriptEvaluationError::DocumentNotFound,
+            );
+        }
+        manager.update_state_for_webview(&webview_id, |state| {
+            state.notify_load_status_changed(status)
+        });
     }
 
     fn notify_cursor_changed(&self, webview: WebView, cursor: servo::Cursor) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| {
@@ -1222,11 +1454,14 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn notify_history_changed(&self, webview: WebView, entries: Vec<Url>, current: usize) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let can_go_back = webview.can_go_back();
         let can_go_forward = webview.can_go_forward();
         let entries = entries.into_iter().map(|entry| entry.to_string()).collect();
-        self.shared
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| {
@@ -1235,13 +1470,19 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn notify_closed(&self, webview: WebView) {
-        let webview_id = webview_key(&webview);
-        self.shared.notify_closed(&webview_id);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared.notify_closed(&webview_id);
     }
 
     fn notify_fullscreen_state_changed(&self, webview: WebView, is_fullscreen: bool) {
-        let webview_id = webview_key(&webview);
-        self.shared
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| {
@@ -1250,9 +1491,12 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn notify_crashed(&self, webview: WebView, reason: String, backtrace: Option<String>) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let webview_url = webview.url().map(|url| url.to_string());
-        self.shared
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| {
@@ -1261,15 +1505,17 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn request_navigation(&self, webview: WebView, request: servo::NavigationRequest) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let url = request.url.to_string();
-        let navigation_id = self
-            .shared
+        let navigation_id = shared
             .manager
             .borrow_mut()
             .request_navigation(&webview_id, url);
 
-        self.shared.pending_navigation_requests.borrow_mut().insert(
+        shared.pending_navigation_requests.borrow_mut().insert(
             navigation_id.clone(),
             PendingNavigationRequest {
                 webview_id,
@@ -1278,68 +1524,173 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
         );
     }
 
-    fn request_create_new(&self, parent_webview: WebView, request: servo::CreateNewWebViewRequest) {
-        let parent_webview_id = webview_key(&parent_webview);
-        let parent_url = parent_webview
+    fn request_create_new(&self, parent: WebView, request: servo::CreateNewWebViewRequest) {
+        let Some(shared) = self.owner(&parent) else {
+            return;
+        };
+        let key = &self.key;
+        let parent_id = webview_key(&parent);
+        let parent_url = parent
             .url()
             .map(|url| url.to_string())
-            .or_else(|| self.shared.manager.borrow().current_url(&parent_webview_id));
-
-        let popup_policy = self.shared.manager.borrow().popup_policy();
-        match popup_policy {
+            .or_else(|| shared.manager.borrow().current_url(key));
+        let (request_id, factory, handler, registration, policy) = {
+            let mut manager = shared.manager.borrow_mut();
+            let policy = manager.legacy_popup_policy;
+            let Ok(view) = manager.view_mut(key) else {
+                return;
+            };
+            let Some(id) = view.next_request_id() else {
+                return;
+            };
+            (
+                id,
+                view.factory.clone(),
+                view.handler.clone(),
+                view.registration.clone(),
+                policy,
+            )
+        };
+        if let Some(factory) = factory {
+            let decision = match (handler, registration) {
+                (Some(handler), Some(binding)) => handler(&NewWebViewRequest {
+                    source: binding.webview,
+                    request_id: request_id.clone(),
+                    parent_url: parent_url.clone(),
+                    target_url: None,
+                    window_features: None,
+                }),
+                _ => NewWebViewDecision::Deny,
+            };
+            if decision == NewWebViewDecision::Deny {
+                shared
+                    .manager
+                    .borrow_mut()
+                    .request_popup(key, request_id, parent_id, parent_url);
+                return;
+            }
+            let prepared = match factory(&parent, &request_id) {
+                Ok(prepared) => prepared,
+                Err(error_message) => {
+                    shared.manager.borrow_mut().emit(
+                        key,
+                        HostEvent::PopupCreationFailed {
+                            request_id,
+                            error_message,
+                        },
+                    );
+                    return;
+                }
+            };
+            let child = request
+                .builder(prepared.rendering_context)
+                .hidpi_scale_factor(parent.hidpi_scale_factor())
+                .clipboard_delegate(parent.clipboard_delegate())
+                .delegate(prepared.delegate)
+                .build();
+            (prepared.commit)(child);
+            return;
+        }
+        match policy {
             PopupRequestPolicy::DefaultDeny => {
                 // Do not synthesize target URL/window-feature metadata, and do not retain the
                 // request across an async host bridge. Dropping it applies Servo's default-deny
                 // response (None) and creates no child WebView.
-                self.shared
+                shared
                     .manager
                     .borrow_mut()
-                    .request_popup(&parent_webview_id, parent_url);
-                drop(request);
+                    .request_popup(key, request_id, parent_id, parent_url);
             }
             PopupRequestPolicy::ManagedChild => {
-                let child_rendering_context = self.shared.managed_child_rendering_context();
-                let child_webview = request
-                    .builder(child_rendering_context)
-                    .hidpi_scale_factor(parent_webview.hidpi_scale_factor())
-                    .clipboard_delegate(parent_webview.clipboard_delegate())
-                    .delegate(parent_webview.delegate())
+                let rendering_context =
+                    (shared.managed_child_rendering_context_factory)(parent.rendering_context());
+                let reservation = shared.manager.borrow_mut().reserve_child(&parent_id);
+                let child_key = match reservation {
+                    Ok(key) => key,
+                    Err(error_message) => {
+                        shared.manager.borrow_mut().emit(
+                            key,
+                            HostEvent::PopupCreationFailed {
+                                request_id,
+                                error_message,
+                            },
+                        );
+                        return;
+                    }
+                };
+                let adapter = ServoWebViewAdapter {
+                    shared: shared.clone(),
+                    key: child_key.clone(),
+                };
+                {
+                    let mut manager = shared.manager.borrow_mut();
+                    let child = manager.view_mut(&child_key).expect("reserved native child");
+                    child.rendering_context = rendering_context.clone();
+                    child.surface_adoptable =
+                        shared.managed_child_rendering_context_is_child_scoped;
+                }
+                let child = request
+                    .builder(rendering_context)
+                    .hidpi_scale_factor(parent.hidpi_scale_factor())
+                    .clipboard_delegate(parent.clipboard_delegate())
+                    .delegate(adapter.webview_delegate())
                     .build();
-                self.shared.manager.borrow_mut().register_managed_child(
-                    parent_webview_id,
-                    child_webview,
-                    parent_url,
-                    self.shared.managed_child_rendering_context_is_child_scoped,
-                );
+                adapter.register_root_webview(&child);
+                shared
+                    .manager
+                    .borrow_mut()
+                    .update_state_for_webview(key, |state| {
+                        state.notify_popup_created(PopupCreated {
+                            request_id,
+                            parent_webview_id: parent_id,
+                            child_webview_id: webview_key(&child),
+                            parent_url,
+                            target_url: None,
+                            window_features: None,
+                        });
+                    });
             }
         }
     }
 
     fn request_permission(&self, webview: WebView, request: servo::PermissionRequest) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let permission = permission_feature_name(request.feature());
         let origin = permission_request_origin(&webview)
-            .or_else(|| self.shared.manager.borrow().current_url(&webview_id))
+            .or_else(|| shared.manager.borrow().current_url(&webview_id))
             .unwrap_or_default();
 
-        // Deny any previously pending request before replacing.
-        if let Some(old) = self.shared.pending_permission_request.borrow_mut().take() {
-            let _ = self
-                .shared
+        // Legacy callers expose one permission response; registered views each own theirs.
+        let registered = shared.manager.borrow().views[&webview_id]
+            .registration
+            .is_some();
+        let old = {
+            let mut pending = shared.pending_permission_requests.borrow_mut();
+            if registered {
+                pending.remove(&webview_id).into_iter().collect::<Vec<_>>()
+            } else {
+                pending.drain().map(|(_, request)| request).collect()
+            }
+        };
+        for old in old {
+            let _ = shared
                 .manager
                 .borrow_mut()
                 .resolve_permission(&old.webview_id);
             old.request.deny();
         }
 
-        self.shared
-            .pending_permission_request
-            .borrow_mut()
-            .replace(PendingPermissionRequest {
+        shared.pending_permission_requests.borrow_mut().insert(
+            webview_id.clone(),
+            PendingPermissionRequest {
                 webview_id: webview_id.clone(),
                 request,
-            });
-        self.shared
+            },
+        );
+        shared
             .manager
             .borrow_mut()
             .update_state_for_webview(&webview_id, |state| {
@@ -1348,12 +1699,15 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn show_embedder_control(&self, webview: WebView, embedder_control: servo::EmbedderControl) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let control_id = embedder_control_key(embedder_control.id());
 
         match embedder_control {
             servo::EmbedderControl::InputMethod(input_method) => {
-                self.shared
+                shared
                     .manager
                     .borrow_mut()
                     .update_state_for_webview(&webview_id, |state| {
@@ -1368,7 +1722,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     });
             }
             servo::EmbedderControl::SelectElement(select_element) => {
-                self.shared.pending_select_elements.borrow_mut().insert(
+                shared.pending_select_elements.borrow_mut().insert(
                     control_id.clone(),
                     PendingSelectElement {
                         webview_id: webview_id.clone(),
@@ -1376,18 +1730,18 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     },
                 );
 
-                let select_element_ref = self.shared.pending_select_elements.borrow();
+                let select_element_ref = shared.pending_select_elements.borrow();
                 let select_element = &select_element_ref.get(&control_id).unwrap().select_element;
 
                 let options = select_element
                     .options()
                     .iter()
-                    .map(|opt| convert_select_element_option(opt))
+                    .map(convert_select_element_option)
                     .collect();
                 let selected_options = select_element.selected_options();
                 let allow_select_multiple = select_element.allow_select_multiple();
 
-                self.shared
+                shared
                     .manager
                     .borrow_mut()
                     .update_state_for_webview(&webview_id, |state| {
@@ -1414,7 +1768,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     position.size().height,
                 );
 
-                self.shared.pending_context_menus.borrow_mut().insert(
+                shared.pending_context_menus.borrow_mut().insert(
                     control_id.clone(),
                     PendingContextMenu {
                         webview_id: webview_id.clone(),
@@ -1422,7 +1776,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     },
                 );
 
-                self.shared
+                shared
                     .manager
                     .borrow_mut()
                     .update_state_for_webview(&webview_id, |state| {
@@ -1435,7 +1789,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     });
             }
             servo::EmbedderControl::FilePicker(file_picker) => {
-                self.shared.pending_file_pickers.borrow_mut().insert(
+                shared.pending_file_pickers.borrow_mut().insert(
                     control_id.clone(),
                     PendingFilePicker {
                         webview_id: webview_id.clone(),
@@ -1443,7 +1797,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     },
                 );
 
-                let file_picker_ref = self.shared.pending_file_pickers.borrow();
+                let file_picker_ref = shared.pending_file_pickers.borrow();
                 let file_picker = &file_picker_ref.get(&control_id).unwrap().file_picker;
                 let current_paths = file_picker
                     .current_paths()
@@ -1457,7 +1811,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     .collect();
                 let allow_select_multiple = file_picker.allow_select_multiple();
 
-                self.shared
+                shared
                     .manager
                     .borrow_mut()
                     .update_state_for_webview(&webview_id, |state| {
@@ -1473,14 +1827,14 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                 let kind = simple_dialog_kind(&dialog);
                 let message = dialog.message().to_owned();
                 let default_value = simple_dialog_default_value(&dialog);
-                self.shared.pending_simple_dialogs.borrow_mut().insert(
+                shared.pending_simple_dialogs.borrow_mut().insert(
                     control_id.clone(),
                     PendingSimpleDialog {
                         webview_id: webview_id.clone(),
                         dialog,
                     },
                 );
-                self.shared
+                shared
                     .manager
                     .borrow_mut()
                     .update_state_for_webview(&webview_id, |state| {
@@ -1497,38 +1851,41 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
     }
 
     fn hide_embedder_control(&self, webview: WebView, control_id: servo::EmbedderControlId) {
-        let webview_id = webview_key(&webview);
+        let Some(shared) = self.owner(&webview) else {
+            return;
+        };
+        let webview_id = self.key.clone();
         let control_id = embedder_control_key(control_id);
-        let hidden_control = self
-            .shared
+        let hidden_control = shared
             .manager
             .borrow_mut()
             .hide_embedder_control(&webview_id, &control_id);
         match hidden_control {
             HiddenEmbedderControl::InputMethod => {}
             HiddenEmbedderControl::SelectElement => {
-                self.shared
+                let removed = shared
                     .pending_select_elements
                     .borrow_mut()
                     .remove(&control_id);
+                drop(removed);
             }
             HiddenEmbedderControl::FilePicker => {
-                self.shared
-                    .pending_file_pickers
-                    .borrow_mut()
-                    .remove(&control_id);
+                let removed = shared.pending_file_pickers.borrow_mut().remove(&control_id);
+                drop(removed);
             }
             HiddenEmbedderControl::ContextMenu => {
-                self.shared
+                let removed = shared
                     .pending_context_menus
                     .borrow_mut()
                     .remove(&control_id);
+                drop(removed);
             }
             HiddenEmbedderControl::SimpleDialog => {
-                self.shared
+                let removed = shared
                     .pending_simple_dialogs
                     .borrow_mut()
                     .remove(&control_id);
+                drop(removed);
             }
             HiddenEmbedderControl::Unknown => {}
         }
@@ -1768,8 +2125,189 @@ fn convert_context_menu_action(action: ContextMenuAction) -> servo::ContextMenuA
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Host, HostError, Runtime, SessionHandle};
+    use servo::SoftwareRenderingContext;
     use servo_base::generic_channel::GenericSharedMemory;
+    use std::cell::Cell;
     use std::sync::Arc;
+
+    #[derive(Default)]
+    struct RegistrationHost(Rc<RefCell<Option<WebViewRegistrar>>>);
+
+    impl Host for RegistrationHost {
+        fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+            *self.0.borrow_mut() = Some(registrar);
+        }
+
+        fn create_webview(&mut self, _: SessionHandle, _: WebViewHandle) -> Result<(), HostError> {
+            Ok(())
+        }
+
+        fn observe_webview_events(
+            &mut self,
+            _: WebViewHandle,
+            _: &[HostEvent],
+        ) -> Result<(), HostError> {
+            Ok(())
+        }
+    }
+
+    fn test_adapter() -> ServoWebViewAdapter {
+        ServoWebViewAdapter::new(
+            PopupRequestPolicy::DefaultDeny,
+            Rc::new(SoftwareRenderingContext::new(PhysicalSize::new(8, 8)).unwrap()),
+        )
+    }
+
+    fn register(adapter: &ServoWebViewAdapter) -> Runtime<RegistrationHost> {
+        let host = RegistrationHost::default();
+        let registrar = host.0.clone();
+        let mut runtime = Runtime::new(host);
+        let session = runtime.create_session();
+        let handle = runtime.create_webview(session).unwrap();
+        adapter.bind_runtime(handle, registrar.borrow().clone().unwrap(), false);
+        runtime
+    }
+
+    #[test]
+    fn registered_responses_are_scoped_while_legacy_children_use_the_root() {
+        struct Response(String);
+        impl PendingWebViewScoped for Response {
+            fn webview_id(&self) -> &str {
+                &self.0
+            }
+        }
+        let adapter = test_adapter();
+        let pending = RefCell::new(HashMap::from([(
+            "request".into(),
+            Response("view-child".into()),
+        )]));
+        let response = adapter
+            .take_pending(&pending, "request", "navigation request")
+            .unwrap();
+        assert_eq!(response.0, "view-child");
+        pending.borrow_mut().insert("request".into(), response);
+        let _runtime = register(&adapter);
+        assert!(adapter
+            .take_pending(&pending, "request", "navigation request")
+            .is_err());
+        assert!(pending.borrow().contains_key("request"));
+        pending.borrow_mut().get_mut("request").unwrap().0 = adapter.key.clone();
+        assert!(adapter
+            .take_pending(&pending, "request", "navigation request")
+            .is_ok());
+    }
+
+    #[test]
+    fn replacing_handlers_releases_captures_after_the_owner_borrow() {
+        struct Capture(Weak<SharedState>, Rc<Cell<usize>>);
+        impl Drop for Capture {
+            fn drop(&mut self) {
+                self.0.upgrade().unwrap().manager.borrow_mut();
+                self.1.set(self.1.get() + 1);
+            }
+        }
+        let adapter = test_adapter();
+        adapter
+            .set_managed_child_webview_factory(Rc::new(|_, _| unreachable!()))
+            .unwrap();
+        let _runtime = register(&adapter);
+        let released = Rc::new(Cell::new(0));
+        for clear_by_policy in [false, true] {
+            let capture = Capture(Rc::downgrade(&adapter.shared), released.clone());
+            adapter
+                .set_new_webview_handler(Some(Rc::new(move |_| {
+                    let _ = &capture;
+                    NewWebViewDecision::Create
+                })))
+                .unwrap();
+            if clear_by_policy {
+                adapter.set_popup_policy(PopupRequestPolicy::DefaultDeny);
+            } else {
+                adapter.set_new_webview_handler(None).unwrap();
+            }
+        }
+        assert_eq!(released.get(), 2);
+        let weak = Rc::downgrade(&adapter.shared);
+        drop(adapter);
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn children_copy_registered_handlers_and_legacy_policy_remains_shared() {
+        let adapter = test_adapter();
+        adapter
+            .shared
+            .manager
+            .borrow_mut()
+            .views
+            .get_mut(&adapter.key)
+            .unwrap()
+            .native_id = "root".into();
+        adapter.set_popup_policy(PopupRequestPolicy::ManagedChild);
+        let child = adapter
+            .shared
+            .manager
+            .borrow_mut()
+            .reserve_child("root")
+            .unwrap();
+        adapter.set_popup_policy(PopupRequestPolicy::DefaultDeny);
+        assert_eq!(
+            adapter.shared.manager.borrow().legacy_popup_policy,
+            PopupRequestPolicy::DefaultDeny
+        );
+        adapter.shared.manager.borrow_mut().views.remove(&child);
+        adapter
+            .set_managed_child_webview_factory(Rc::new(|_, _| unreachable!()))
+            .unwrap();
+        let _runtime = register(&adapter);
+        let handle = adapter.shared.manager.borrow().views[&adapter.key]
+            .registration
+            .as_ref()
+            .unwrap()
+            .webview;
+        adapter
+            .set_new_webview_handler(Some(Rc::new(|_| NewWebViewDecision::Create)))
+            .unwrap();
+        let child = adapter
+            .shared
+            .manager
+            .borrow_mut()
+            .reserve_child("root")
+            .unwrap();
+        adapter.set_new_webview_handler(None).unwrap();
+        let request = NewWebViewRequest {
+            source: handle,
+            request_id: "child:1".into(),
+            parent_url: None,
+            target_url: None,
+            window_features: None,
+        };
+        let handler = adapter.shared.manager.borrow().views[&child]
+            .handler
+            .clone()
+            .unwrap();
+        assert_eq!(handler(&request), NewWebViewDecision::Create);
+        assert!(adapter.shared.manager.borrow().views[&adapter.key]
+            .handler
+            .is_none());
+    }
+
+    #[test]
+    fn evaluation_completion_cannot_consume_a_reused_id_or_a_sibling() {
+        let mut first = PendingEvaluations::default();
+        let mut sibling = PendingEvaluations::default();
+        assert!(first.submit("").is_err());
+        let old = first.submit("same").unwrap();
+        assert!(first.submit("same").is_err());
+        let sibling_token = sibling.submit("same").unwrap();
+        assert_eq!(first.retire(), vec!["same"]);
+        let current = first.submit("same").unwrap();
+        assert!(!first.complete("same", old));
+        assert!(first.complete("same", current));
+        assert!(!first.complete("same", current));
+        assert!(sibling.complete("same", sibling_token));
+    }
 
     #[test]
     fn favicon_copy_preserves_every_servo_format_and_owns_the_bytes() {

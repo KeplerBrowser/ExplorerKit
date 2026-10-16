@@ -66,8 +66,9 @@ pub use portable_controller::{
     PortableController, PortableControllerError, PortableControllerResult,
 };
 pub use runtime::{
-    ConfigurableHost, ExplorerKitEvent, Host, HostCall, HostError, MockHost, PlaceholderHost,
-    Runtime, RuntimeError, SessionHandle, WebViewCommand, WebViewHandle,
+    ChildWebViewRegistration, ConfigurableHost, ExplorerKitEvent, Host, HostCall, HostError,
+    MockHost, NewWebViewDecision, NewWebViewRequest, PlaceholderHost, Runtime, RuntimeError,
+    SessionHandle, WebViewCommand, WebViewHandle, WebViewRegistrar,
 };
 #[cfg(all(
     feature = "servo",
@@ -107,7 +108,8 @@ pub use servo_webview::{ServoRuntime, ServoWebView, ServoWebViewInit};
     )
 ))]
 pub use servo_webview_adapter::{
-    ManagedChildRenderingContextFactory, ServoWebViewAdapter, ServoWebViewEvent,
+    ManagedChildRenderingContextFactory, ManagedChildWebViewFactory, PreparedManagedChild,
+    ServoWebViewAdapter, ServoWebViewEvent,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -203,6 +205,7 @@ pub enum HostEvent {
         url: String,
     },
     PopupRequested {
+        request_id: String,
         parent_webview_id: String,
         parent_url: Option<String>,
         target_url: Option<String>,
@@ -210,12 +213,20 @@ pub enum HostEvent {
         policy: PopupRequestPolicy,
     },
     PopupCreated {
+        request_id: String,
         parent_webview_id: String,
         child_webview_id: String,
         parent_url: Option<String>,
         target_url: Option<String>,
         window_features: Option<String>,
         policy: PopupRequestPolicy,
+    },
+    /// A permitted native child could not be prepared before native acceptance.
+    PopupCreationFailed {
+        /// The original creation attempt's opaque identifier.
+        request_id: String,
+        /// The ordinary preparation or construction error.
+        error_message: String,
     },
     UrlChanged {
         url: String,
@@ -474,16 +485,11 @@ pub enum LoadStatusKind {
     Complete,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum PopupRequestPolicy {
+    #[default]
     DefaultDeny,
     ManagedChild,
-}
-
-impl Default for PopupRequestPolicy {
-    fn default() -> Self {
-        Self::DefaultDeny
-    }
 }
 
 impl PopupRequestPolicy {
@@ -628,6 +634,10 @@ impl ContextMenuAction {
         }
     }
 
+    #[allow(
+        clippy::should_implement_trait,
+        reason = "Preserve the shared command interface's existing optional parser."
+    )]
     pub fn from_str(value: &str) -> Option<Self> {
         match value {
             "go-back" => Some(Self::GoBack),

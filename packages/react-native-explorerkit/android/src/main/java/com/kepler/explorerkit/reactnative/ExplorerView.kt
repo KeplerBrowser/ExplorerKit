@@ -393,7 +393,8 @@ class ExplorerView : FrameLayout {
               )
             )
           }
-        is ExplorerHostEvent.PopupCreated -> Unit
+        is ExplorerHostEvent.PopupCreated,
+        is ExplorerHostEvent.PopupCreationFailed -> Unit
         is ExplorerHostEvent.UrlChanged -> {
           currentUrl = event.url
           if (eventDispatcher != null && surfaceId != null) {

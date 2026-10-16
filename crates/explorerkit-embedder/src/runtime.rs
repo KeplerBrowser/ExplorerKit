@@ -7,10 +7,12 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
+use std::rc::Rc;
+use std::sync::{Arc, Mutex, Weak};
 
 use crate::{
     ContextMenuAction, HostEvent, HostInputEvent, LoadStatusKind, NavigationError,
-    NavigationRequest, PopupRequestPolicy, ServoAdapterState,
+    NavigationRequest, PopupCreated, PopupRequestPolicy, ServoAdapterState,
 };
 use explorerkit_host::{HostSurface, SurfaceSize, SurfaceViewport};
 
@@ -35,8 +37,40 @@ impl WebViewHandle {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExplorerKitEvent {
     pub webview: WebViewHandle,
+    /// The registered original child, only on its source's `PopupCreated` receipt.
+    pub created_webview: Option<WebViewHandle>,
     pub managed_child_webview_id: Option<String>,
     pub event: HostEvent,
+}
+
+/// Metadata supplied during a synchronous native child-creation request.
+///
+/// ExplorerKit owns this interface. Servo's `request_create_new` supplies no
+/// target URL or window features; absent native metadata remains `None`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewWebViewRequest {
+    /// The actual source, including for a request made by an existing child.
+    pub source: WebViewHandle,
+    /// Opaque identifier unique within this Runtime's lifetime.
+    pub request_id: String,
+    /// The source's last known URL, when available.
+    pub parent_url: Option<String>,
+    /// The native target URL, when the engine supplies one.
+    pub target_url: Option<String>,
+    /// Native window-feature metadata, when supplied.
+    pub window_features: Option<String>,
+}
+
+/// Immediate disposition of an original native child-creation request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewWebViewDecision {
+    /// Apply the engine's native denial.
+    Deny,
+    /// Prepare and retain the original child using the backend's presentation requirements.
+    ///
+    /// Servo allows later surface attachment. A native backend may require an
+    /// application-provided destination during the synchronous creation callback.
+    Create,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -227,6 +261,11 @@ impl From<HostError> for RuntimeError {
 }
 
 pub trait Host {
+    /// Installs the Runtime's weak registrar once, before root creation.
+    ///
+    /// Ignoring this integration hook does not enable child creation.
+    fn set_webview_registrar(&mut self, _registrar: WebViewRegistrar) {}
+
     /// Performs final host shutdown after view destruction has been attempted.
     ///
     /// Releases any views whose individual destruction failed before retiring shared
@@ -257,6 +296,10 @@ pub trait Host {
     ///
     /// A shared-engine host can pump once and then present/drain every view. The outer
     /// error belongs to the host/engine; individual failures remain view-scoped.
+    #[allow(
+        clippy::type_complexity,
+        reason = "Preserve the host's existing per-view result shape."
+    )]
     fn perform_all_updates(
         &mut self,
         webviews: &[WebViewHandle],
@@ -329,6 +372,25 @@ pub trait Host {
         _popup_policy: PopupRequestPolicy,
     ) -> Result<Vec<HostEvent>, HostError> {
         Ok(Vec::new())
+    }
+
+    /// Installs the synchronous per-request handler for one view.
+    ///
+    /// This ExplorerKit-owned seam wraps the engine's original native request.
+    /// The callback must not reenter Runtime or present app UI. Unsupported hosts
+    /// reject the operation; `None` means denial on hosts implementing this seam.
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the approved callback signature explicit."
+    )]
+    fn set_new_webview_handler(
+        &mut self,
+        _webview: WebViewHandle,
+        _handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+    ) -> Result<(), HostError> {
+        Err(HostError::new(
+            "this host does not support registered native children",
+        ))
     }
 
     fn attach_managed_child_surface(
@@ -571,32 +633,319 @@ impl WebViewState {
     }
 }
 
-#[derive(Debug)]
-pub struct Runtime<H> {
-    host: H,
+#[derive(Debug, Default)]
+struct RuntimeRegistry {
     next_session_id: u64,
     next_webview_id: u64,
     sessions: HashSet<SessionHandle>,
-    webviews: HashMap<WebViewHandle, WebViewState>,
+    webviews: HashMap<WebViewHandle, RegisteredWebView>,
+    journal: VecDeque<ExplorerKitEvent>,
     events: VecDeque<ExplorerKitEvent>,
 }
 
-impl<H: Host> Runtime<H> {
-    pub fn new(host: H) -> Self {
+#[derive(Debug)]
+struct RegisteredWebView {
+    session: SessionHandle,
+    state: WebViewState,
+    lineage: Option<ChildLineage>,
+    reservation: Option<ReservedChild>,
+    registers_children: bool,
+}
+
+#[derive(Debug)]
+struct ChildLineage {
+    source: WebViewHandle,
+    originating_root: WebViewHandle,
+    native_id: String,
+}
+
+#[derive(Debug, Default)]
+struct ReservedChild {
+    events: VecDeque<HostEvent>,
+    retired: bool,
+}
+
+impl RegisteredWebView {
+    fn new(session: SessionHandle) -> Self {
         Self {
-            host,
-            next_session_id: 0,
-            next_webview_id: 0,
-            sessions: HashSet::new(),
-            webviews: HashMap::new(),
-            events: VecDeque::new(),
+            session,
+            state: WebViewState::default(),
+            lineage: None,
+            reservation: None,
+            registers_children: false,
+        }
+    }
+}
+
+impl RuntimeRegistry {
+    fn allocate_webview(&mut self) -> Result<WebViewHandle, HostError> {
+        self.next_webview_id = self
+            .next_webview_id
+            .checked_add(1)
+            .ok_or_else(|| HostError::new("webview handle capacity exhausted"))?;
+        Ok(WebViewHandle(self.next_webview_id))
+    }
+
+    fn live_view(&self, webview: WebViewHandle) -> Option<&RegisteredWebView> {
+        self.webviews
+            .get(&webview)
+            .filter(|view| view.reservation.is_none())
+    }
+
+    fn drain_journal(&mut self) {
+        self.events.append(&mut self.journal);
+    }
+
+    fn destroy_webview(&mut self, webview: WebViewHandle) {
+        self.webviews.remove(&webview);
+        for queue in [&mut self.events, &mut self.journal] {
+            queue.retain(|event| event.webview != webview || event.created_webview.is_some());
+        }
+    }
+}
+
+/// Weak, capability-limited access to a Runtime's registration and event journal.
+///
+/// Native objects and application callbacks stay in the owning host. No registry
+/// guard is held across a host, engine, presentation or application callback.
+#[derive(Debug, Clone)]
+pub struct WebViewRegistrar {
+    registry: Weak<Mutex<RuntimeRegistry>>,
+}
+
+impl WebViewRegistrar {
+    /// Reserves an ordinary handle in the live source's existing session.
+    ///
+    /// Reserve before accepting the native request. Until commit, the handle is
+    /// not commandable and its callbacks are staged. Dropping the reservation
+    /// rolls it back without reusing its handle.
+    pub fn reserve_child(
+        &self,
+        source: WebViewHandle,
+        request_id: String,
+    ) -> Result<ChildWebViewRegistration, HostError> {
+        let registry = self
+            .registry
+            .upgrade()
+            .ok_or_else(|| HostError::new("the child Runtime has been dropped"))?;
+        let mut registry = registry.lock().expect("Runtime registry poisoned");
+        let source_view = registry
+            .live_view(source)
+            .ok_or_else(|| HostError::new("the child source is not live"))?;
+        let session = source_view.session;
+        let originating_root = source_view
+            .lineage
+            .as_ref()
+            .map_or(source, |lineage| lineage.originating_root);
+        let webview = registry.allocate_webview()?;
+        let mut view = RegisteredWebView::new(session);
+        view.registers_children = true;
+        view.reservation = Some(ReservedChild::default());
+        view.lineage = Some(ChildLineage {
+            source,
+            originating_root,
+            native_id: String::new(),
+        });
+        registry.webviews.insert(webview, view);
+        registry
+            .webviews
+            .get_mut(&source)
+            .unwrap()
+            .registers_children = true;
+        Ok(ChildWebViewRegistration {
+            registrar: self.clone(),
+            webview,
+            request_id,
+            committed: false,
+        })
+    }
+
+    /// Records a host-processed event for an existing live or reserved identity.
+    ///
+    /// Late events for retired identities are discarded. Native close uses
+    /// [`Self::retire_webview`] instead of separately recording `Closed`.
+    pub fn record_event(&self, webview: WebViewHandle, event: HostEvent) {
+        if matches!(event, HostEvent::Closed) {
+            self.retire_webview(webview);
+            return;
+        }
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut registry = registry.lock().expect("Runtime registry poisoned");
+        let Some(view) = registry.webviews.get_mut(&webview) else {
+            return;
+        };
+        if let Some(reserved) = &mut view.reservation {
+            if !reserved.retired {
+                reserved.events.push_back(event);
+            }
+        } else {
+            registry.journal.push_back(ExplorerKitEvent {
+                webview,
+                created_webview: None,
+                managed_child_webview_id: None,
+                event,
+            });
         }
     }
 
+    /// Retires one native document and records `Closed` exactly once.
+    ///
+    /// A pre-commit close is staged after its future creation receipt. Other
+    /// documents and inert source lineage remain valid.
+    pub fn retire_webview(&self, webview: WebViewHandle) {
+        let Some(registry) = self.registry.upgrade() else {
+            return;
+        };
+        let mut registry = registry.lock().expect("Runtime registry poisoned");
+        let Some(view) = registry.webviews.get_mut(&webview) else {
+            return;
+        };
+        if let Some(reserved) = &mut view.reservation {
+            if !reserved.retired {
+                reserved.retired = true;
+                reserved.events.push_back(HostEvent::Closed);
+            }
+        } else {
+            registry.webviews.remove(&webview);
+            registry.journal.push_back(ExplorerKitEvent {
+                webview,
+                created_webview: None,
+                managed_child_webview_id: None,
+                event: HostEvent::Closed,
+            });
+        }
+    }
+}
+
+/// A prepared child handle whose native acceptance has not yet been committed.
+#[derive(Debug)]
+pub struct ChildWebViewRegistration {
+    registrar: WebViewRegistrar,
+    webview: WebViewHandle,
+    request_id: String,
+    committed: bool,
+}
+
+impl ChildWebViewRegistration {
+    /// Returns the fixed identity to capture in the child's native delegates.
+    pub fn webview(&self) -> WebViewHandle {
+        self.webview
+    }
+
+    /// Commits the already accepted original native child without a fallible step.
+    ///
+    /// The creation receipt precedes staged child callbacks, including an early
+    /// close. The native host must finish all recoverable preparation first.
+    pub fn commit(self, created: PopupCreated) {
+        self.commit_prepared(created, None);
+    }
+
+    /// Commits an original native child already attached to an app-owned surface.
+    ///
+    /// Records the initial surface without reentering the host. The creation
+    /// receipt precedes `SurfaceAttached` and any staged native callbacks. Finish
+    /// all recoverable native preparation before calling this method.
+    pub fn commit_with_surface(
+        self,
+        created: PopupCreated,
+        surface: HostSurface,
+        viewport: SurfaceViewport,
+    ) {
+        self.commit_prepared(created, Some(AttachedSurface { surface, viewport }));
+    }
+
+    fn commit_prepared(mut self, created: PopupCreated, surface: Option<AttachedSurface>) {
+        self.committed = true;
+        let Some(registry) = self.registrar.registry.upgrade() else {
+            return;
+        };
+        let mut registry = registry.lock().expect("Runtime registry poisoned");
+        let view = registry
+            .webviews
+            .get_mut(&self.webview)
+            .expect("prepared child remains reserved until commit");
+        let reserved = view.reservation.take().expect("child commits once");
+        let initial_size = surface.as_ref().map(|attached| attached.viewport.size);
+        view.state.surface = surface;
+        let lineage = view.lineage.as_mut().expect("child has source lineage");
+        lineage.native_id = created.child_webview_id.clone();
+        let source = lineage.source;
+        registry.journal.push_back(ExplorerKitEvent {
+            webview: source,
+            created_webview: Some(self.webview),
+            managed_child_webview_id: None,
+            event: HostEvent::PopupCreated {
+                request_id: self.request_id.clone(),
+                parent_webview_id: created.parent_webview_id,
+                child_webview_id: created.child_webview_id,
+                parent_url: created.parent_url,
+                target_url: created.target_url,
+                window_features: created.window_features,
+                policy: PopupRequestPolicy::ManagedChild,
+            },
+        });
+        if let Some(size) = initial_size {
+            registry.journal.push_back(ExplorerKitEvent {
+                webview: self.webview,
+                created_webview: None,
+                managed_child_webview_id: None,
+                event: HostEvent::SurfaceAttached { size },
+            });
+        }
+        registry
+            .journal
+            .extend(reserved.events.into_iter().map(|event| ExplorerKitEvent {
+                webview: self.webview,
+                created_webview: None,
+                managed_child_webview_id: None,
+                event,
+            }));
+        if reserved.retired {
+            registry.webviews.remove(&self.webview);
+        }
+    }
+}
+
+impl Drop for ChildWebViewRegistration {
+    fn drop(&mut self) {
+        if !self.committed {
+            if let Some(registry) = self.registrar.registry.upgrade() {
+                registry
+                    .lock()
+                    .expect("Runtime registry poisoned")
+                    .webviews
+                    .remove(&self.webview);
+            }
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct Runtime<H> {
+    host: H,
+    registry: Arc<Mutex<RuntimeRegistry>>,
+}
+
+impl<H: Host> Runtime<H> {
+    pub fn new(mut host: H) -> Self {
+        let registry = Arc::new(Mutex::new(RuntimeRegistry::default()));
+        host.set_webview_registrar(WebViewRegistrar {
+            registry: Arc::downgrade(&registry),
+        });
+        Self { host, registry }
+    }
+
     pub fn create_session(&mut self) -> SessionHandle {
-        self.next_session_id = self.next_session_id.wrapping_add(1);
-        let session = SessionHandle(self.next_session_id);
-        self.sessions.insert(session);
+        let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+        registry.drain_journal();
+        registry.next_session_id = registry
+            .next_session_id
+            .checked_add(1)
+            .expect("session handle capacity exhausted");
+        let session = SessionHandle(registry.next_session_id);
+        registry.sessions.insert(session);
         session
     }
 
@@ -604,14 +953,15 @@ impl<H: Host> Runtime<H> {
         &mut self,
         session: SessionHandle,
     ) -> Result<WebViewHandle, RuntimeError> {
-        if !self.sessions.contains(&session) {
-            return Err(RuntimeError::UnknownSession(session));
+        let webview = self.register_root(session)?;
+        if let Err(error) = self.call_host(|host| host.create_webview(session, webview)) {
+            self.registry
+                .lock()
+                .expect("Runtime registry poisoned")
+                .webviews
+                .remove(&webview);
+            return Err(error);
         }
-
-        self.next_webview_id = self.next_webview_id.wrapping_add(1);
-        let webview = WebViewHandle(self.next_webview_id);
-        self.host.create_webview(session, webview)?;
-        self.webviews.insert(webview, WebViewState::default());
         Ok(webview)
     }
 
@@ -627,27 +977,32 @@ impl<H: Host> Runtime<H> {
     where
         H: ConfigurableHost,
     {
-        if !self.sessions.contains(&session) {
-            return Err(RuntimeError::UnknownSession(session));
+        let webview = self.register_root(session)?;
+        if let Err(error) =
+            self.call_host(|host| host.create_webview_with_options(session, webview, options))
+        {
+            self.registry
+                .lock()
+                .expect("Runtime registry poisoned")
+                .webviews
+                .remove(&webview);
+            return Err(error);
         }
-
-        self.next_webview_id = self.next_webview_id.wrapping_add(1);
-        let webview = WebViewHandle(self.next_webview_id);
-        self.host
-            .create_webview_with_options(session, webview, options)?;
-        self.webviews.insert(webview, WebViewState::default());
         Ok(webview)
     }
 
     /// Closes one view and invalidates its handle without closing its siblings or session.
     ///
     /// The host detaches the renderer before dropping the underlying view. On success,
-    /// queued events for this view are discarded; later commands return `UnknownWebView`.
+    /// queued ordinary events for this view are discarded; committed child-creation
+    /// receipts survive. Later commands return `UnknownWebView`.
     pub fn destroy_webview(&mut self, webview: WebViewHandle) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
-        self.host.destroy_webview(webview)?;
-        self.webviews.remove(&webview);
-        self.events.retain(|event| event.webview != webview);
+        self.webview_state(webview, |_| ())?;
+        self.call_host(|host| host.destroy_webview(webview))?;
+        self.registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .destroy_webview(webview);
         Ok(())
     }
 
@@ -659,16 +1014,18 @@ impl<H: Host> Runtime<H> {
     /// All views and the host receive a cleanup attempt even if one fails; the first
     /// error is returned after final cleanup.
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
-        let mut views: Vec<_> = self.webviews.keys().copied().collect();
-        views.sort_by_key(|view| view.raw());
+        let views = self.live_views();
         let mut first_error = None;
         for view in views {
+            if self.webview_state(view, |_| ()).is_err() {
+                continue;
+            }
             if let Err(error) = self.destroy_webview(view) {
                 first_error.get_or_insert(error);
             }
         }
-        if let Err(error) = self.host.shutdown() {
-            first_error.get_or_insert(RuntimeError::Host(error));
+        if let Err(error) = self.call_host(|host| host.shutdown()) {
+            first_error.get_or_insert(error);
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -679,21 +1036,23 @@ impl<H: Host> Runtime<H> {
         surface: HostSurface,
         size: SurfaceSize,
     ) -> Result<(), RuntimeError> {
-        let state = self.webview_state(webview)?;
-        if state.surface.is_some() {
+        if self.webview_state(webview, |state| state.surface.is_some())? {
             return Err(RuntimeError::SurfaceAlreadyAttached(webview));
         }
-
-        let host_events = self.host.attach_surface(webview, &surface, size)?;
-        let state = self
-            .webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked");
-        state.surface = Some(AttachedSurface {
-            surface,
-            viewport: SurfaceViewport::new(size, 1.0),
-        });
-        let mut events = vec![HostEvent::SurfaceAttached { size }];
+        let host_events = self.call_host(|host| host.attach_surface(webview, &surface, size))?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state.surface = Some(AttachedSurface {
+                    surface,
+                    viewport: SurfaceViewport::new(size, 1.0),
+                });
+            })
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceAttached { size }]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_events(webview, events)
     }
@@ -703,21 +1062,23 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         size: SurfaceSize,
     ) -> Result<(), RuntimeError> {
-        let state = self.webview_state(webview)?;
-        if state.surface.is_none() {
-            return Err(RuntimeError::SurfaceNotAttached(webview));
-        }
-
-        let host_events = self.host.resize_surface(webview, size)?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .surface
-            .as_mut()
-            .expect("surface presence was checked")
-            .viewport
-            .size = size;
-        let mut events = vec![HostEvent::SurfaceResized { size }];
+        self.surface_viewport(webview)?;
+        let host_events = self.call_host(|host| host.resize_surface(webview, size))?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state
+                    .surface
+                    .as_mut()
+                    .expect("surface presence was checked")
+                    .viewport
+                    .size = size;
+            })
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceResized { size }]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_events(webview, events)
     }
@@ -727,20 +1088,16 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         scale_factor: f32,
     ) -> Result<(), RuntimeError> {
-        let state = self.webview_state(webview)?;
-        if state.surface.is_none() {
-            return Err(RuntimeError::SurfaceNotAttached(webview));
-        }
-
-        let events = self.host.set_surface_scale_factor(webview, scale_factor)?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .surface
-            .as_mut()
-            .expect("surface presence was checked")
-            .viewport
-            .scale_factor = scale_factor;
+        self.surface_viewport(webview)?;
+        let events = self.call_host(|host| host.set_surface_scale_factor(webview, scale_factor))?;
+        self.update_webview(webview, |state| {
+            state
+                .surface
+                .as_mut()
+                .expect("surface presence was checked")
+                .viewport
+                .scale_factor = scale_factor;
+        });
         self.record_events(webview, events)
     }
 
@@ -750,22 +1107,23 @@ impl<H: Host> Runtime<H> {
         surface: HostSurface,
         viewport: SurfaceViewport,
     ) -> Result<(), RuntimeError> {
-        let state = self.webview_state(webview)?;
-        if state.surface.is_some() {
+        if self.webview_state(webview, |state| state.surface.is_some())? {
             return Err(RuntimeError::SurfaceAlreadyAttached(webview));
         }
-
-        let host_events = self
-            .host
-            .attach_surface_with_viewport(webview, &surface, viewport)?;
-        let state = self
-            .webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked");
-        state.surface = Some(AttachedSurface { surface, viewport });
-        let mut events = vec![HostEvent::SurfaceAttached {
-            size: viewport.size,
-        }];
+        let host_events =
+            self.call_host(|host| host.attach_surface_with_viewport(webview, &surface, viewport))?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state.surface = Some(AttachedSurface { surface, viewport });
+            })
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceAttached {
+                size: viewport.size,
+            }]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_events(webview, events)
     }
@@ -775,24 +1133,20 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         viewport: SurfaceViewport,
     ) -> Result<(), RuntimeError> {
-        let state = self.webview_state(webview)?;
-        let Some(attached_surface) = &state.surface else {
-            return Err(RuntimeError::SurfaceNotAttached(webview));
-        };
-        let previous_viewport = attached_surface.viewport;
-
-        let host_events =
-            self.host
-                .update_surface_viewport(webview, viewport, previous_viewport)?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .surface
-            .as_mut()
-            .expect("surface presence was checked")
-            .viewport = viewport;
+        let previous_viewport = self.surface_viewport(webview)?;
+        let host_events = self
+            .call_host(|host| host.update_surface_viewport(webview, viewport, previous_viewport))?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state
+                    .surface
+                    .as_mut()
+                    .expect("surface presence was checked")
+                    .viewport = viewport;
+            })
+            .is_some();
         let mut events = Vec::new();
-        if previous_viewport.size != viewport.size {
+        if updated && previous_viewport.size != viewport.size {
             events.push(HostEvent::SurfaceResized {
                 size: viewport.size,
             });
@@ -802,17 +1156,16 @@ impl<H: Host> Runtime<H> {
     }
 
     pub fn detach_surface(&mut self, webview: WebViewHandle) -> Result<(), RuntimeError> {
-        let state = self.webview_state(webview)?;
-        if state.surface.is_none() {
-            return Err(RuntimeError::SurfaceNotAttached(webview));
-        }
-
-        let host_events = self.host.detach_surface(webview)?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .surface = None;
-        let mut events = vec![HostEvent::SurfaceDetached];
+        self.surface_viewport(webview)?;
+        let host_events = self.call_host(|host| host.detach_surface(webview))?;
+        let updated = self
+            .update_webview(webview, |state| state.surface = None)
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceDetached]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_events(webview, events)
     }
@@ -822,8 +1175,8 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         popup_policy: PopupRequestPolicy,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
-        let events = self.host.set_popup_policy(webview, popup_policy)?;
+        self.webview_state(webview, |_| ())?;
+        let events = self.call_host(|host| host.set_popup_policy(webview, popup_policy))?;
         self.record_events(webview, events)
     }
 
@@ -835,33 +1188,37 @@ impl<H: Host> Runtime<H> {
         viewport: SurfaceViewport,
     ) -> Result<(), RuntimeError> {
         let child_webview_id = child_webview_id.into();
-        let state = self.webview_state(webview)?;
-        if state.managed_child_surfaces.contains_key(&child_webview_id) {
+        if let Some(child) = self.registered_child(webview, &child_webview_id)? {
+            return self.attach_surface_with_viewport(child, surface, viewport);
+        }
+        if self.webview_state(webview, |state| {
+            state.managed_child_surfaces.contains_key(&child_webview_id)
+        })? {
             return Err(RuntimeError::ManagedChildSurfaceAlreadyAttached(
                 webview,
                 child_webview_id,
             ));
         }
-
-        let host_events = self.host.attach_managed_child_surface(
-            webview,
-            &child_webview_id,
-            &surface,
-            viewport,
-        )?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .managed_child_surfaces
-            .insert(
-                child_webview_id.clone(),
-                AttachedSurface { surface, viewport },
-            );
-        let mut events = vec![HostEvent::SurfaceAttached {
-            size: viewport.size,
-        }];
+        let host_events = self.call_host(|host| {
+            host.attach_managed_child_surface(webview, &child_webview_id, &surface, viewport)
+        })?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state.managed_child_surfaces.insert(
+                    child_webview_id.clone(),
+                    AttachedSurface { surface, viewport },
+                );
+            })
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceAttached {
+                size: viewport.size,
+            }]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
-        self.record_managed_child_events(webview, child_webview_id, events)
+        self.record_managed_child_events(webview, child_webview_id.to_owned(), events)
     }
 
     pub fn resize_managed_child_surface(
@@ -871,26 +1228,27 @@ impl<H: Host> Runtime<H> {
         size: SurfaceSize,
     ) -> Result<(), RuntimeError> {
         let child_webview_id = child_webview_id.as_ref();
-        let state = self.webview_state(webview)?;
-        if !state.managed_child_surfaces.contains_key(child_webview_id) {
-            return Err(RuntimeError::ManagedChildSurfaceNotAttached(
-                webview,
-                child_webview_id.to_owned(),
-            ));
+        if let Some(child) = self.registered_child(webview, child_webview_id)? {
+            return self.resize_surface(child, size);
         }
-
-        let host_events =
-            self.host
-                .resize_managed_child_surface(webview, child_webview_id, size)?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .managed_child_surfaces
-            .get_mut(child_webview_id)
-            .expect("child surface presence was checked")
-            .viewport
-            .size = size;
-        let mut events = vec![HostEvent::SurfaceResized { size }];
+        self.managed_child_viewport(webview, child_webview_id)?;
+        let host_events = self
+            .call_host(|host| host.resize_managed_child_surface(webview, child_webview_id, size))?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state
+                    .managed_child_surfaces
+                    .get_mut(child_webview_id)
+                    .expect("child surface presence was checked")
+                    .viewport
+                    .size = size;
+            })
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceResized { size }]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_managed_child_events(webview, child_webview_id.to_owned(), events)
     }
@@ -902,34 +1260,38 @@ impl<H: Host> Runtime<H> {
         viewport: SurfaceViewport,
     ) -> Result<(), RuntimeError> {
         let child_webview_id = child_webview_id.as_ref();
-        let state = self.webview_state(webview)?;
-        let Some(attached_surface) = state.managed_child_surfaces.get(child_webview_id) else {
-            return Err(RuntimeError::ManagedChildSurfaceNotAttached(
-                webview,
-                child_webview_id.to_owned(),
-            ));
-        };
-        let previous_viewport = attached_surface.viewport;
-
-        let host_events = self.host.update_managed_child_surface_viewport(
-            webview,
-            child_webview_id,
-            viewport,
-            previous_viewport,
-        )?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .managed_child_surfaces
-            .get_mut(child_webview_id)
-            .expect("child surface presence was checked")
-            .viewport = viewport;
-        let mut events = Vec::new();
-        if previous_viewport.size != viewport.size {
-            events.push(HostEvent::SurfaceResized {
-                size: viewport.size,
-            });
+        if let Some(child) = self.registered_child(webview, child_webview_id)? {
+            return self.update_surface_viewport(child, viewport);
         }
+        let previous_viewport = self.managed_child_viewport(webview, child_webview_id)?;
+        let host_events = self.call_host(|host| {
+            host.update_managed_child_surface_viewport(
+                webview,
+                child_webview_id,
+                viewport,
+                previous_viewport,
+            )
+        })?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state
+                    .managed_child_surfaces
+                    .get_mut(child_webview_id)
+                    .expect("child surface presence was checked")
+                    .viewport = viewport;
+            })
+            .is_some();
+        let mut events = if updated {
+            if previous_viewport.size != viewport.size {
+                vec![HostEvent::SurfaceResized {
+                    size: viewport.size,
+                }]
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_managed_child_events(webview, child_webview_id.to_owned(), events)
     }
@@ -940,23 +1302,22 @@ impl<H: Host> Runtime<H> {
         child_webview_id: impl AsRef<str>,
     ) -> Result<(), RuntimeError> {
         let child_webview_id = child_webview_id.as_ref();
-        let state = self.webview_state(webview)?;
-        if !state.managed_child_surfaces.contains_key(child_webview_id) {
-            return Err(RuntimeError::ManagedChildSurfaceNotAttached(
-                webview,
-                child_webview_id.to_owned(),
-            ));
+        if let Some(child) = self.registered_child(webview, child_webview_id)? {
+            return self.detach_surface(child);
         }
-
-        let host_events = self
-            .host
-            .detach_managed_child_surface(webview, child_webview_id)?;
-        self.webviews
-            .get_mut(&webview)
-            .expect("webview presence was checked")
-            .managed_child_surfaces
-            .remove(child_webview_id);
-        let mut events = vec![HostEvent::SurfaceDetached];
+        self.managed_child_viewport(webview, child_webview_id)?;
+        let host_events =
+            self.call_host(|host| host.detach_managed_child_surface(webview, child_webview_id))?;
+        let updated = self
+            .update_webview(webview, |state| {
+                state.managed_child_surfaces.remove(child_webview_id);
+            })
+            .is_some();
+        let mut events = if updated {
+            vec![HostEvent::SurfaceDetached]
+        } else {
+            Vec::new()
+        };
         events.extend(host_events);
         self.record_managed_child_events(webview, child_webview_id.to_owned(), events)
     }
@@ -967,17 +1328,12 @@ impl<H: Host> Runtime<H> {
         child_webview_id: impl AsRef<str>,
     ) -> Result<(), RuntimeError> {
         let child_webview_id = child_webview_id.as_ref();
-        let state = self.webview_state(webview)?;
-        if !state.managed_child_surfaces.contains_key(child_webview_id) {
-            return Err(RuntimeError::ManagedChildSurfaceNotAttached(
-                webview,
-                child_webview_id.to_owned(),
-            ));
+        if let Some(child) = self.registered_child(webview, child_webview_id)? {
+            return self.perform_updates(child);
         }
-
-        let events = self
-            .host
-            .perform_managed_child_updates(webview, child_webview_id)?;
+        self.managed_child_viewport(webview, child_webview_id)?;
+        let events =
+            self.call_host(|host| host.perform_managed_child_updates(webview, child_webview_id))?;
         self.record_managed_child_events(webview, child_webview_id.to_owned(), events)
     }
 
@@ -986,6 +1342,10 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         url: impl AsRef<str>,
     ) -> Result<(), RuntimeError> {
+        self.registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .drain_journal();
         let request = NavigationRequest::new(url.as_ref())?;
         self.dispatch_webview_command(webview, WebViewCommand::LoadUrl(request))
     }
@@ -1015,16 +1375,15 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         command: WebViewCommand,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
+        self.webview_state(webview, |_| ())?;
         let synthesize_events = self.host.synthesize_webview_command_events();
-        let mut events = self.host.dispatch_webview_command(webview, &command)?;
-
+        let mut events = self.call_host(|host| host.dispatch_webview_command(webview, &command))?;
         if synthesize_events {
-            let state = self
-                .webviews
-                .get_mut(&webview)
-                .expect("webview presence was checked");
-            events.extend(dispatch_embedder_command(state, command));
+            if let Some(synthesized) =
+                self.update_webview(webview, |state| dispatch_embedder_command(state, command))
+            {
+                events.extend(synthesized);
+            }
         }
         self.record_events(webview, events)
     }
@@ -1039,7 +1398,7 @@ impl<H: Host> Runtime<H> {
         navigation_id: impl AsRef<str>,
         allow: bool,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
+        self.webview_state(webview, |_| ())?;
         let navigation_id = navigation_id.as_ref();
         if navigation_id.trim().is_empty() {
             return Err(RuntimeError::Host(HostError::new(
@@ -1047,9 +1406,8 @@ impl<H: Host> Runtime<H> {
             )));
         }
 
-        let events = self
-            .host
-            .resolve_navigation_request(webview, navigation_id, allow)?;
+        let events =
+            self.call_host(|host| host.resolve_navigation_request(webview, navigation_id, allow))?;
         self.record_events(webview, events)
     }
 
@@ -1066,7 +1424,7 @@ impl<H: Host> Runtime<H> {
         confirmed: bool,
         prompt_value: Option<&str>,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
+        self.webview_state(webview, |_| ())?;
         let dialog_id = dialog_id.as_ref();
         if dialog_id.trim().is_empty() {
             return Err(RuntimeError::Host(HostError::new(
@@ -1074,9 +1432,9 @@ impl<H: Host> Runtime<H> {
             )));
         }
 
-        let events =
-            self.host
-                .resolve_simple_dialog(webview, dialog_id, confirmed, prompt_value)?;
+        let events = self.call_host(|host| {
+            host.resolve_simple_dialog(webview, dialog_id, confirmed, prompt_value)
+        })?;
         self.record_events(webview, events)
     }
 
@@ -1092,7 +1450,7 @@ impl<H: Host> Runtime<H> {
         context_menu_id: impl AsRef<str>,
         action: ContextMenuAction,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
+        self.webview_state(webview, |_| ())?;
         let context_menu_id = context_menu_id.as_ref();
         if context_menu_id.trim().is_empty() {
             return Err(RuntimeError::Host(HostError::new(
@@ -1100,9 +1458,8 @@ impl<H: Host> Runtime<H> {
             )));
         }
 
-        let events = self
-            .host
-            .resolve_context_menu(webview, context_menu_id, action)?;
+        let events =
+            self.call_host(|host| host.resolve_context_menu(webview, context_menu_id, action))?;
         self.record_events(webview, events)
     }
 
@@ -1117,7 +1474,7 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         context_menu_id: impl AsRef<str>,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
+        self.webview_state(webview, |_| ())?;
         let context_menu_id = context_menu_id.as_ref();
         if context_menu_id.trim().is_empty() {
             return Err(RuntimeError::Host(HostError::new(
@@ -1125,7 +1482,7 @@ impl<H: Host> Runtime<H> {
             )));
         }
 
-        let events = self.host.dismiss_context_menu(webview, context_menu_id)?;
+        let events = self.call_host(|host| host.dismiss_context_menu(webview, context_menu_id))?;
         self.record_events(webview, events)
     }
 
@@ -1164,7 +1521,7 @@ impl<H: Host> Runtime<H> {
         evaluation_id: impl AsRef<str>,
         script: impl AsRef<str>,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
+        self.webview_state(webview, |_| ())?;
         let evaluation_id = evaluation_id.as_ref();
         if evaluation_id.trim().is_empty() {
             return Err(RuntimeError::Host(HostError::new(
@@ -1172,8 +1529,7 @@ impl<H: Host> Runtime<H> {
             )));
         }
         let events = self
-            .host
-            .evaluate_javascript(webview, evaluation_id, script.as_ref())?;
+            .call_host(|host| host.evaluate_javascript(webview, evaluation_id, script.as_ref()))?;
         self.record_events(webview, events)
     }
 
@@ -1182,14 +1538,14 @@ impl<H: Host> Runtime<H> {
         webview: WebViewHandle,
         event: HostInputEvent,
     ) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
-        let events = self.host.dispatch_input_event(webview, &event)?;
+        self.webview_state(webview, |_| ())?;
+        let events = self.call_host(|host| host.dispatch_input_event(webview, &event))?;
         self.record_events(webview, events)
     }
 
     pub fn perform_updates(&mut self, webview: WebViewHandle) -> Result<(), RuntimeError> {
-        self.webview_state(webview)?;
-        let events = self.host.perform_updates(webview)?;
+        self.webview_state(webview, |_| ())?;
+        let events = self.call_host(|host| host.perform_updates(webview))?;
         self.record_events(webview, events)
     }
 
@@ -1200,9 +1556,8 @@ impl<H: Host> Runtime<H> {
     /// when this method returns the first view-scoped error. Host-wide errors have no
     /// view handle and are returned as `RuntimeError::Host`.
     pub fn perform_all_updates(&mut self) -> Result<(), RuntimeError> {
-        let mut views: Vec<_> = self.webviews.keys().copied().collect();
-        views.sort_by_key(|view| view.raw());
-        let results = self.host.perform_all_updates(&views)?;
+        let views = self.live_views();
+        let results = self.call_host(|host| host.perform_all_updates(&views))?;
         let mut first_error = None;
         for (webview, result) in results {
             let result = match result {
@@ -1217,12 +1572,21 @@ impl<H: Host> Runtime<H> {
     }
 
     pub fn drain_events(&mut self) -> Vec<ExplorerKitEvent> {
-        self.events.drain(..).collect()
+        let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+        registry.drain_journal();
+        registry.events.drain(..).collect()
     }
 
-    fn webview_state(&self, webview: WebViewHandle) -> Result<&WebViewState, RuntimeError> {
-        self.webviews
-            .get(&webview)
+    fn webview_state<R>(
+        &mut self,
+        webview: WebViewHandle,
+        read: impl FnOnce(&WebViewState) -> R,
+    ) -> Result<R, RuntimeError> {
+        let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+        registry.drain_journal();
+        registry
+            .live_view(webview)
+            .map(|view| read(&view.state))
             .ok_or(RuntimeError::UnknownWebView(webview))
     }
 
@@ -1252,20 +1616,169 @@ impl<H: Host> Runtime<H> {
         if events.is_empty() {
             return Ok(());
         }
-
-        if let Some(child_webview_id) = managed_child_webview_id.as_deref() {
-            self.host
-                .observe_managed_child_webview_events(webview, child_webview_id, &events)?;
-        } else {
-            self.host.observe_webview_events(webview, &events)?;
+        {
+            let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+            registry.drain_journal();
+            for event in &events {
+                if managed_child_webview_id.is_none() && matches!(event, HostEvent::Closed) {
+                    registry.webviews.remove(&webview);
+                }
+                registry.events.push_back(ExplorerKitEvent {
+                    webview,
+                    created_webview: None,
+                    managed_child_webview_id: managed_child_webview_id.clone(),
+                    event: event.clone(),
+                });
+            }
         }
-        self.events
-            .extend(events.into_iter().map(|event| ExplorerKitEvent {
-                webview,
-                managed_child_webview_id: managed_child_webview_id.clone(),
-                event,
-            }));
+        self.call_host(|host| {
+            if let Some(child_webview_id) = managed_child_webview_id.as_deref() {
+                host.observe_managed_child_webview_events(webview, child_webview_id, &events)
+            } else {
+                host.observe_webview_events(webview, &events)
+            }
+        })
+    }
+
+    /// Installs this view's immediate native child-creation decision handler.
+    ///
+    /// No handler denies. A created child copies the source's current handler and
+    /// then owns it independently. The handler runs synchronously on the native
+    /// owning thread and must not reenter this Runtime or present application UI.
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the approved callback signature explicit."
+    )]
+    pub fn set_new_webview_handler(
+        &mut self,
+        webview: WebViewHandle,
+        handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+    ) -> Result<(), RuntimeError> {
+        self.webview_state(webview, |_| ())?;
+        self.call_host(|host| host.set_new_webview_handler(webview, handler))?;
+        if let Some(view) = self
+            .registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .webviews
+            .get_mut(&webview)
+        {
+            view.registers_children = true;
+        }
         Ok(())
+    }
+
+    fn call_host<R>(
+        &mut self,
+        call: impl FnOnce(&mut H) -> Result<R, HostError>,
+    ) -> Result<R, RuntimeError> {
+        self.registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .drain_journal();
+        let result = call(&mut self.host);
+        self.registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .drain_journal();
+        result.map_err(RuntimeError::Host)
+    }
+
+    fn register_root(&mut self, session: SessionHandle) -> Result<WebViewHandle, RuntimeError> {
+        let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+        registry.drain_journal();
+        if !registry.sessions.contains(&session) {
+            return Err(RuntimeError::UnknownSession(session));
+        }
+        let webview = registry.allocate_webview()?;
+        registry
+            .webviews
+            .insert(webview, RegisteredWebView::new(session));
+        Ok(webview)
+    }
+
+    fn update_webview<R>(
+        &mut self,
+        webview: WebViewHandle,
+        update: impl FnOnce(&mut WebViewState) -> R,
+    ) -> Option<R> {
+        self.registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .webviews
+            .get_mut(&webview)
+            .filter(|view| view.reservation.is_none())
+            .map(|view| update(&mut view.state))
+    }
+
+    fn live_views(&mut self) -> Vec<WebViewHandle> {
+        let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+        registry.drain_journal();
+        let mut views: Vec<_> = registry
+            .webviews
+            .iter()
+            .filter(|(_, view)| view.reservation.is_none())
+            .map(|(&handle, _)| handle)
+            .collect();
+        views.sort_by_key(|view| view.raw());
+        views
+    }
+
+    fn surface_viewport(
+        &mut self,
+        webview: WebViewHandle,
+    ) -> Result<SurfaceViewport, RuntimeError> {
+        self.webview_state(webview, |state| {
+            state.surface.as_ref().map(|surface| surface.viewport)
+        })?
+        .ok_or(RuntimeError::SurfaceNotAttached(webview))
+    }
+
+    fn managed_child_viewport(
+        &mut self,
+        webview: WebViewHandle,
+        child: &str,
+    ) -> Result<SurfaceViewport, RuntimeError> {
+        self.webview_state(webview, |state| {
+            state
+                .managed_child_surfaces
+                .get(child)
+                .map(|surface| surface.viewport)
+        })?
+        .ok_or_else(|| RuntimeError::ManagedChildSurfaceNotAttached(webview, child.to_owned()))
+    }
+
+    fn registered_child(
+        &mut self,
+        root: WebViewHandle,
+        native_id: &str,
+    ) -> Result<Option<WebViewHandle>, RuntimeError> {
+        let mut registry = self.registry.lock().expect("Runtime registry poisoned");
+        registry.drain_journal();
+        let child = registry.webviews.iter().find_map(|(&handle, view)| {
+            view.lineage
+                .as_ref()
+                .filter(|lineage| {
+                    view.reservation.is_none()
+                        && lineage.originating_root == root
+                        && lineage.native_id == native_id
+                })
+                .map(|_| handle)
+        });
+        if child.is_some() {
+            return Ok(child);
+        }
+        if registry
+            .live_view(root)
+            .is_some_and(|view| !view.registers_children)
+        {
+            return Ok(None);
+        }
+        Err(HostError::new(format!(
+            "registered child {native_id} for webview {} is absent",
+            root.raw()
+        ))
+        .into())
     }
 }
 
@@ -1726,6 +2239,7 @@ impl Host for PlaceholderHost {
         self.observed_events
             .extend(events.iter().cloned().map(|event| ExplorerKitEvent {
                 webview,
+                created_webview: None,
                 managed_child_webview_id: None,
                 event,
             }));
@@ -1742,6 +2256,7 @@ impl Host for PlaceholderHost {
         self.observed_events
             .extend(events.iter().cloned().map(|event| ExplorerKitEvent {
                 webview,
+                created_webview: None,
                 managed_child_webview_id: Some(child_webview_id.to_owned()),
                 event,
             }));
@@ -1767,6 +2282,444 @@ mod tests {
         KeyboardInputEvent, KeyboardInputKey, KeyboardInputState, PointerInputEvent,
         PopupRequestPolicy,
     };
+
+    type JournalUpdate = Box<dyn FnOnce(&WebViewRegistrar) -> Result<Vec<HostEvent>, HostError>>;
+
+    #[derive(Default)]
+    struct JournalHost {
+        registrar: Option<WebViewRegistrar>,
+        update: Option<JournalUpdate>,
+        commands: Vec<WebViewHandle>,
+        observed: usize,
+        fail_observer: bool,
+        fail_destroy: bool,
+        supports_children: bool,
+    }
+
+    impl Host for JournalHost {
+        fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+            self.registrar = Some(registrar);
+        }
+        fn create_webview(&mut self, _: SessionHandle, _: WebViewHandle) -> Result<(), HostError> {
+            Ok(())
+        }
+        fn set_new_webview_handler(
+            &mut self,
+            _: WebViewHandle,
+            _: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
+        ) -> Result<(), HostError> {
+            if self.supports_children {
+                Ok(())
+            } else {
+                Err(HostError::new("native child creation is unsupported"))
+            }
+        }
+        fn destroy_webview(&mut self, _: WebViewHandle) -> Result<(), HostError> {
+            if self.fail_destroy {
+                Err(HostError::new("outstanding frame"))
+            } else {
+                Ok(())
+            }
+        }
+        fn dispatch_webview_command(
+            &mut self,
+            webview: WebViewHandle,
+            _: &WebViewCommand,
+        ) -> Result<Vec<HostEvent>, HostError> {
+            self.commands.push(webview);
+            Ok(Vec::new())
+        }
+        fn synthesize_webview_command_events(&self) -> bool {
+            false
+        }
+        fn perform_updates(&mut self, _: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
+            match self.update.take() {
+                Some(update) => update(self.registrar.as_ref().unwrap()),
+                None => Ok(Vec::new()),
+            }
+        }
+        fn observe_webview_events(
+            &mut self,
+            _: WebViewHandle,
+            _: &[HostEvent],
+        ) -> Result<(), HostError> {
+            self.observed += 1;
+            if self.fail_observer {
+                Err(HostError::new("observer failed"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn creation(request_id: &str, child_id: &str) -> PopupCreated {
+        PopupCreated {
+            request_id: request_id.into(),
+            parent_webview_id: "native-source".into(),
+            child_webview_id: child_id.into(),
+            parent_url: None,
+            target_url: None,
+            window_features: None,
+        }
+    }
+
+    #[test]
+    fn child_commit_precedes_staged_callbacks_and_close_without_resurrecting_either_view() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reservation = registrar.reserve_child(source, "attempt-1".into()).unwrap();
+        let child = reservation.webview();
+        assert_eq!(
+            runtime.reload(child),
+            Err(RuntimeError::UnknownWebView(child))
+        );
+        let title = HostEvent::PageTitleChanged {
+            title: Some("original child".into()),
+        };
+        registrar.record_event(child, title.clone());
+        registrar.retire_webview(child);
+        registrar.retire_webview(child);
+        registrar.record_event(child, HostEvent::UrlChanged { url: "late".into() });
+        registrar.retire_webview(source);
+        reservation.commit(creation("attempt-1", "native-child"));
+        let events = runtime.drain_events();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0], event(source, HostEvent::Closed));
+        assert_eq!(events[1].webview, source);
+        assert_eq!(events[1].created_webview, Some(child));
+        assert!(
+            matches!(&events[1].event, HostEvent::PopupCreated { request_id, .. } if request_id == "attempt-1")
+        );
+        assert_eq!(events[2], event(child, title));
+        assert_eq!(events[3], event(child, HostEvent::Closed));
+        assert_eq!(
+            runtime.reload(child),
+            Err(RuntimeError::UnknownWebView(child))
+        );
+        assert_eq!(
+            runtime.reload(source),
+            Err(RuntimeError::UnknownWebView(source))
+        );
+        assert_eq!(
+            runtime.host().observed,
+            0,
+            "journal records bypass legacy observation"
+        );
+        assert!(runtime.host().commands.is_empty());
+    }
+
+    #[test]
+    fn journal_child_and_sibling_events_survive_host_failure_and_source_destruction() {
+        use std::cell::Cell;
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let sibling = runtime.create_webview(session).unwrap();
+        let child_sink = Rc::new(Cell::new(None));
+        let child_result = child_sink.clone();
+        runtime.host_mut().update = Some(Box::new(move |registrar| {
+            let child = registrar.reserve_child(source, "attempt-2".into())?;
+            let handle = child.webview();
+            registrar.record_event(
+                handle,
+                HostEvent::UrlChanged {
+                    url: "https://child.test/".into(),
+                },
+            );
+            child.commit(creation("attempt-2", "native-child-2"));
+            child_result.set(Some(handle));
+            registrar.record_event(
+                sibling,
+                HostEvent::PageTitleChanged {
+                    title: Some("sibling".into()),
+                },
+            );
+            Err(HostError::new("presentation failed after creation"))
+        }));
+        assert!(matches!(
+            runtime.perform_updates(source),
+            Err(RuntimeError::Host(_))
+        ));
+        let child = child_sink.get().unwrap();
+        runtime.destroy_webview(source).unwrap();
+        runtime.reload(child).unwrap();
+        runtime.reload(sibling).unwrap();
+        let events = runtime.drain_events();
+        assert_eq!(events.len(), 3);
+        assert_eq!(
+            (events[0].webview, events[0].created_webview),
+            (source, Some(child))
+        );
+        assert_eq!(events[1].webview, child);
+        assert_eq!(events[2].webview, sibling);
+        assert_eq!(runtime.host().commands, vec![child, sibling]);
+        assert_eq!(runtime.host().observed, 0);
+    }
+
+    #[test]
+    fn reservation_rollback_never_reuses_a_handle_or_retains_the_runtime() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<Runtime<PlaceholderHost>>();
+        assert_send_sync::<WebViewRegistrar>();
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let abandoned = registrar.reserve_child(source, "abandoned".into()).unwrap();
+        let old = abandoned.webview();
+        registrar.record_event(
+            old,
+            HostEvent::PageTitleChanged {
+                title: Some("never published".into()),
+            },
+        );
+        drop(abandoned);
+        let reserved = registrar
+            .reserve_child(source, "replacement".into())
+            .unwrap();
+        let replacement = reserved.webview();
+        assert_ne!(old, replacement);
+        assert_eq!(runtime.reload(old), Err(RuntimeError::UnknownWebView(old)));
+        assert_eq!(
+            runtime.reload(replacement),
+            Err(RuntimeError::UnknownWebView(replacement))
+        );
+        assert!(runtime.drain_events().is_empty());
+        assert_eq!(
+            runtime.registry.lock().unwrap().webviews[&replacement].session,
+            session
+        );
+        drop(runtime);
+        assert!(registrar.reserve_child(source, "too late".into()).is_err());
+        drop(reserved);
+    }
+
+    #[test]
+    fn native_child_initial_surface_is_live_before_receipts_and_detaches_normally() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reserved = registrar.reserve_child(source, "attached".into()).unwrap();
+        let child = reserved.webview();
+        let viewport = SurfaceViewport::new(SurfaceSize::new(120, 90), 2.0);
+        registrar.record_event(
+            child,
+            HostEvent::PageTitleChanged {
+                title: Some("ready".into()),
+            },
+        );
+        reserved.commit_with_surface(
+            creation("attached", "native-attached"),
+            HostSurface::new("initial-slot"),
+            viewport,
+        );
+
+        assert_eq!(runtime.surface_viewport(child).unwrap(), viewport);
+        assert_eq!(
+            runtime.attach_surface(child, HostSurface::new("duplicate"), viewport.size),
+            Err(RuntimeError::SurfaceAlreadyAttached(child))
+        );
+        let events = runtime.drain_events();
+        assert_eq!(events[0].created_webview, Some(child));
+        assert!(
+            matches!(events[1].event, HostEvent::SurfaceAttached { size } if size == viewport.size)
+        );
+        assert!(matches!(
+            events[2].event,
+            HostEvent::PageTitleChanged { .. }
+        ));
+        assert!(events[1..].iter().all(|event| event.webview == child));
+        runtime.destroy_webview(source).unwrap();
+        runtime.detach_surface(child).unwrap();
+        assert_eq!(
+            runtime.detach_surface(child),
+            Err(RuntimeError::SurfaceNotAttached(child))
+        );
+        runtime
+            .attach_surface(child, HostSurface::new("replacement"), viewport.size)
+            .unwrap();
+        runtime.destroy_webview(child).unwrap();
+    }
+
+    #[test]
+    fn initially_attached_child_early_close_keeps_ordered_receipts() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reserved = registrar.reserve_child(source, "closed".into()).unwrap();
+        let child = reserved.webview();
+        registrar.retire_webview(child);
+        let viewport = SurfaceViewport::new(SurfaceSize::new(120, 90), 1.0);
+        reserved.commit_with_surface(
+            creation("closed", "native-closed"),
+            HostSurface::new("slot"),
+            viewport,
+        );
+        assert_eq!(
+            runtime.reload(child),
+            Err(RuntimeError::UnknownWebView(child))
+        );
+        let events = runtime.drain_events();
+        assert_eq!(events[0].created_webview, Some(child));
+        assert!(matches!(events[1].event, HostEvent::SurfaceAttached { .. }));
+        assert!(matches!(events[2].event, HostEvent::Closed));
+    }
+
+    #[test]
+    fn retained_legacy_alias_reuses_child_surface_after_source_closes() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reserved = registrar
+            .reserve_child(source, "surface-child".into())
+            .unwrap();
+        let child = reserved.webview();
+        reserved.commit(creation("surface-child", "native-surface-child"));
+        runtime.destroy_webview(source).unwrap();
+        let viewport = SurfaceViewport::new(SurfaceSize::new(120, 90), 2.0);
+        runtime
+            .attach_managed_child_surface(
+                source,
+                "native-surface-child",
+                HostSurface::new("canvas-slot"),
+                viewport,
+            )
+            .unwrap();
+        assert_eq!(
+            runtime.attach_surface(child, HostSurface::new("second-slot"), viewport.size),
+            Err(RuntimeError::SurfaceAlreadyAttached(child))
+        );
+        runtime
+            .resize_managed_child_surface(
+                source,
+                "native-surface-child",
+                SurfaceSize::new(150, 100),
+            )
+            .unwrap();
+        runtime.detach_surface(child).unwrap();
+        assert_eq!(
+            runtime.detach_managed_child_surface(source, "native-surface-child"),
+            Err(RuntimeError::SurfaceNotAttached(child))
+        );
+        let events = runtime.drain_events();
+        assert!(events
+            .iter()
+            .skip(1)
+            .all(|event| event.webview == child && event.managed_child_webview_id.is_none()));
+        runtime.destroy_webview(child).unwrap();
+        assert!(matches!(
+            runtime.perform_managed_child_updates(source, "native-surface-child"),
+            Err(RuntimeError::Host(_))
+        ));
+    }
+
+    #[test]
+    fn registered_routes_reject_missing_legacy_aliases_before_their_first_request() {
+        let mut runtime = Runtime::new(JournalHost {
+            supports_children: true,
+            ..JournalHost::default()
+        });
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        runtime.set_new_webview_handler(source, None).unwrap();
+        assert!(matches!(
+            runtime.attach_managed_child_surface(
+                source,
+                "absent-child",
+                HostSurface::new("slot"),
+                SurfaceViewport::new(SurfaceSize::new(100, 100), 1.0),
+            ),
+            Err(RuntimeError::Host(_))
+        ));
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reserved = registrar.reserve_child(source, "child".into()).unwrap();
+        let child = reserved.webview();
+        reserved.commit(creation("child", "native-child"));
+        for view in [source, child] {
+            assert!(matches!(
+                runtime.attach_managed_child_surface(
+                    view,
+                    "absent-child",
+                    HostSurface::new("slot"),
+                    SurfaceViewport::new(SurfaceSize::new(100, 100), 1.0),
+                ),
+                Err(RuntimeError::Host(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn successful_app_retirement_discards_callbacks_racing_the_last_host_drain() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        runtime
+            .call_host(|host| host.destroy_webview(source))
+            .unwrap();
+        let reserved = registrar
+            .reserve_child(source, "racing-child".into())
+            .unwrap();
+        let child = reserved.webview();
+        reserved.commit(creation("racing-child", "native-child"));
+        registrar.record_event(source, HostEvent::PageTitleChanged { title: None });
+        runtime.registry.lock().unwrap().destroy_webview(source);
+        registrar.record_event(source, HostEvent::PageTitleChanged { title: None });
+        let events = runtime.drain_events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].created_webview, Some(child));
+        runtime.reload(child).unwrap();
+    }
+
+    #[test]
+    fn failed_destroy_is_retryable_and_native_retirement_drops_late_callbacks() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        runtime.host_mut().fail_destroy = true;
+        assert!(runtime.destroy_webview(source).is_err());
+        runtime.reload(source).unwrap();
+        runtime.host_mut().fail_destroy = false;
+        let registrar = runtime.host().registrar.clone().unwrap();
+        registrar.retire_webview(source);
+        registrar.retire_webview(source);
+        registrar.record_event(source, HostEvent::UrlChanged { url: "late".into() });
+        assert_eq!(
+            runtime.reload(source),
+            Err(RuntimeError::UnknownWebView(source))
+        );
+        assert_eq!(
+            runtime.drain_events(),
+            vec![event(source, HostEvent::Closed)]
+        );
+        assert!(runtime.drain_events().is_empty());
+    }
+
+    #[test]
+    fn legacy_observer_failure_preserves_events_once_and_unsupported_handler_is_explicit() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let title = HostEvent::PageTitleChanged {
+            title: Some("historical title".into()),
+        };
+        let returned = title.clone();
+        runtime.host_mut().update = Some(Box::new(move |_| Ok(vec![returned])));
+        runtime.host_mut().fail_observer = true;
+        assert!(runtime.perform_updates(source).is_err());
+        assert_eq!(runtime.drain_events(), vec![event(source, title)]);
+        assert!(runtime.drain_events().is_empty());
+        assert_eq!(runtime.host().observed, 1);
+        assert!(matches!(
+            runtime.set_new_webview_handler(source, Some(Rc::new(|_| NewWebViewDecision::Create))),
+            Err(RuntimeError::Host(_))
+        ));
+    }
 
     #[test]
     fn destroying_either_view_preserves_sibling_routing_and_allows_replacement() {
@@ -1863,6 +2816,7 @@ mod tests {
     fn event(webview: WebViewHandle, event: HostEvent) -> ExplorerKitEvent {
         ExplorerKitEvent {
             webview,
+            created_webview: None,
             managed_child_webview_id: None,
             event,
         }
@@ -1875,6 +2829,7 @@ mod tests {
     ) -> ExplorerKitEvent {
         ExplorerKitEvent {
             webview,
+            created_webview: None,
             managed_child_webview_id: Some(child_webview_id.into()),
             event,
         }
@@ -1963,6 +2918,7 @@ mod tests {
             self.observed_events
                 .extend(events.iter().cloned().map(|event| ExplorerKitEvent {
                     webview,
+                    created_webview: None,
                     managed_child_webview_id: None,
                     event,
                 }));
@@ -2452,6 +3408,7 @@ mod tests {
         let webview = runtime.create_webview(session).unwrap();
         let child_webview_id = "servo-child-1".to_owned();
         let popup_created = HostEvent::PopupCreated {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "servo-parent-1".to_owned(),
             child_webview_id: child_webview_id.clone(),
             parent_url: Some("https://parent.test/".to_owned()),
@@ -2590,6 +3547,7 @@ mod tests {
     #[test]
     fn default_denied_popup_events_flow_through_runtime_without_child_webview() {
         let popup_event = HostEvent::PopupRequested {
+            request_id: "request-1".to_owned(),
             parent_webview_id: "servo-parent-1".to_owned(),
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
