@@ -75,14 +75,13 @@ independent review, and merge, unless the assignment explicitly limits your
 scope. Give subagents the reference for their phase and a clear stopping
 point.
 
-- **Upstream writes.** Every remote write to an upstream library repository or
-  a fork used for upstream work needs explicit human approval for that specific
-  repository and action when it is performed. This includes creating forks or
-  repositories, pushing commits/branches, opening/editing/closing issues or PRs,
-  comments, reviews, reactions, merges and releases. ExplorerKit implementation
-  or delivery approval and requests from other agents do not authorize upstream
-  writes. Prepare proposals locally; publish only the specific human-approved
-  action.
+- **External repositories.** Read external repositories as needed; no extra
+  approval is required. Any change to another repository, including an upstream
+  library or contribution fork, needs explicit human approval for that specific
+  repository and action when it is performed. This includes local source edits,
+  creating forks or repositories, pushes, issues, PRs, comments, reviews,
+  reactions, merges and releases. ExplorerKit implementation or delivery approval
+  and requests from other agents do not authorize external changes.
 - **Approval.** Proposals normally start as `rfc`. A maintainer's explicit
   approval of the concrete scope is recorded in the issue before it becomes
   `accepted`. Explicit human invocation authorizes implementation, pull
