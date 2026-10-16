@@ -191,6 +191,10 @@ fn ensure_child_view(
     }
 }
 
+/// Return the child frame in its AppKit parent's coordinate system.
+///
+/// # Safety
+/// `parent` must be a live `NSView` accessed on the AppKit main thread.
 unsafe fn appkit_frame(parent: id, bounds: AppKitChildViewBounds) -> NSRect {
     let parent_bounds = parent.bounds();
     let width = bounds.width.max(1.0);

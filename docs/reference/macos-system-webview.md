@@ -66,6 +66,45 @@ your window.
   parent. Destroying a view, or dropping the host normally, removes system
   views before your parent view's services are released.
 
+## Favicons
+
+WebKit supplies standard favicon candidates and loads their image data in the
+view's own browser context. ExplorerKit decodes the first image into owned
+straight RGBA8 pixels and sends `HostEvent::FaviconChanged` through the existing
+runtime event stream. Match the event's view handle to the view whose icon you
+are displaying. Touch icons are ignored; ExplorerKit adds no downloader,
+resizing, animation playback, or app icon cache.
+
+The adapter uses WebKit's private icon-loading delegate alongside WRY's own
+navigation and UI delegates. If the private selector is unavailable, the view
+continues working and emits no favicon events. See
+[capability limits](capabilities.md#favicons) before depending on this behavior.
+
+A new document commit retires unfinished icon work, including a reload of the
+same URL. A newer candidate supersedes unfinished work for the preceding
+candidate. Destroying the view ends its stream, while detaching its surface
+keeps the native view and icon delegate alive. Already queued events stay in
+order; receiving an image does not prove its document is still current.
+
+When the icon delegate is attached, each document commit queues
+the `Started` load status, then a favicon event. Back and Forward restore
+`Some(image)` from retained native history data. A missing, evicted or unobserved
+value produces `None`, including a fresh document commit; your app should show
+its fallback image. Native icon loading can subsequently supply a new `Some`.
+Reloading an entry invalidates its previous document's retained image, including
+shared same-document entries, before lookup. Decode failure supplies no replacement image. Servo's forwarded events retain
+their existing engine behavior.
+
+Each system view retains at most 8 MiB of unique encoded icon bytes and 128
+native history-entry records, including the current entry. Known same-document
+entries share retained bytes. Entries removed from native history are pruned
+first, then least recently used records or data are evicted until both limits
+hold. An image larger than the retention budget can be delivered initially but
+cannot be restored from this store. Unknown native entries safely produce
+`None`; URLs are not used to guess document identity. Detaching preserves this
+state, and destroying the view releases it. The limits cover retained history
+data; transient decoding allocations and queued events are separate.
+
 ## Evaluating JavaScript
 
 `Runtime::evaluate_javascript(view, evaluation_id, script)` works for both

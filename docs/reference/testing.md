@@ -160,7 +160,8 @@ macOS session.
 
 ### System web view on macOS
 
-Rerun these when you change `MacOsViewHost` or system JavaScript evaluation.
+Rerun these when you change `MacOsViewHost`, system JavaScript evaluation,
+or system favicon decoding, history retention and callback lifetimes.
 
 Automatic regressions (macOS):
 
@@ -170,7 +171,11 @@ cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-sys
 
 These cover callback and runtime queue ordering, retiring pending requests on a
 same-URL commit, evaluation ID reuse, closing and replacing sibling views, and
-both orderings of process-termination and evaluation errors.
+both orderings of process-termination and evaluation errors. Favicon regressions
+also check decoded first-frame pixels, malformed and oversized data, missing
+private-selector handling, per-view retirement at commit, process termination
+and destruction, retained history identity and reload invalidation, shared
+same-document data, byte and entry limits, eviction and orphan cleanup.
 
 Manual check in an interactive AppKit app:
 
@@ -191,6 +196,18 @@ Manual check in an interactive AppKit app:
    pages, with two views at once, on hidden views, and across navigation,
    reload, history traversal, failed navigation, and single-page-app changes.
    A standalone `WKWebView` demo or a successful compile is not enough.
+6. For favicon changes, use two WRY-owned runtime views with distinct declared
+   PNG/ICO icons, including relative and cross-origin URLs. Inspect the owning
+   view handle, pixel channels, row order and semitransparent pixels. Exercise
+   reload, failed navigation, icon-free destinations, delayed loads,
+   detach/reattach and destruction while a load is pending. For Back/Forward,
+   verify exact retained pixels with no new icon requests, both retention limits,
+   eviction fallback, oversized initial-only images, duplicate URLs, same-document
+   history, stale completions and pruning. Confirm `Started` precedes the commit
+   favicon event and missing data reports `None`. Confirm cookie-gated
+   icons use the view's WebKit data store and a separate store stays isolated.
+   Post-load DOM icon changes are outside this native capability; see
+   [favicon limits](capabilities.md#favicons).
 
 Record the final URL and title, the input results, the event order, and the
 exact revision and OS in the pull request. This evidence covers macOS only.
