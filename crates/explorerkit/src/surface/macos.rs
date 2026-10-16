@@ -191,7 +191,7 @@ fn ensure_child_view(
     }
 }
 
-/// Return the child frame in its AppKit parent's coordinate system.
+/// Converts top-left child bounds into the AppKit parent's coordinate space.
 ///
 /// # Safety
 /// `parent` must be a live `NSView` accessed on the AppKit main thread.

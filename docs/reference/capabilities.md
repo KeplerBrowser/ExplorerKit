@@ -176,9 +176,11 @@ opens a `target="_blank"` link.
   becomes an ordinary Runtime handle with independent controls, events,
   lifetime, and exportable GPU frames. It can execute before attachment. See
   [Runtime and views](../concepts/runtime.md#popups-and-new-windows).
-- **macOS system web view:** child creation remains unsupported and handler
-  installation returns an error. The published Wry dependency lacks the
-  required ownership and close hooks. Windows, Linux, Android, iOS, and React
+- **macOS system web view:** child creation remains unsupported and enabling
+  its handler returns an error. Published Wry can build an original child in
+  an attached app view, but lacks native-close forwarding and a creation
+  callback safe for sources without a window or target URL. Clearing the
+  handler keeps creation denied. Windows, Linux, Android, iOS, and React
   Native child presentation are not validated by the macOS Servo support.
 
 ### JavaScript evaluation

@@ -1,16 +1,17 @@
 //! macOS host adapter for create-time Servo or system-WebView selection.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 
 use dpi::{PhysicalPosition, PhysicalSize};
 use explorerkit_embedder::{
     ConfigurableHost, ContextMenuAction, Host, HostError, HostEvent, HostInputEvent,
     JavaScriptEvaluationErrorKind, LoadStatusKind, NewWebViewDecision, NewWebViewRequest,
-    PopupRequestPolicy, SessionHandle, WebViewCommand, WebViewHandle, WebViewRegistrar,
+    PopupCreated, PopupRequestPolicy, SessionHandle, WebViewCommand, WebViewHandle,
+    WebViewRegistrar,
 };
 use explorerkit_host::{
     HostSurface, NativeSurface, SurfaceDelegate, SurfaceError, SurfaceSize, SurfaceViewport,
@@ -21,8 +22,8 @@ use raw_window_handle::{
     AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
 };
 use wry::{
-    NewWindowResponse, PageLoadEvent, PermissionResponse, Rect, WebView, WebViewBuilder,
-    WebViewBuilderExtDarwin, WebViewExtMacOS,
+    NewWindowFeatures, NewWindowResponse, PageLoadEvent, PermissionResponse, Rect, WebView,
+    WebViewBuilder, WebViewBuilderExtDarwin, WebViewBuilderExtMacos, WebViewExtMacOS,
 };
 
 use crate::surface::{SurfaceFrame, SurfaceHost, SurfaceHostOptions};
@@ -67,6 +68,38 @@ impl MacOsWebViewOptions {
 pub struct MacOsViewHostOptions {
     surface_host: SurfaceHostOptions,
     webkit_data_store_identifier: WebKitDataStoreIdentifier,
+    new_webview_destination_handler: Option<Rc<NewWebViewDestinationHandler>>,
+}
+
+type NewWebViewDestinationHandler =
+    dyn Fn(&NewWebViewRequest) -> Result<AppKitNewWebViewDestination, SurfaceError>;
+type NewWebViewHandler = dyn Fn(&NewWebViewRequest) -> NewWebViewDecision;
+type SystemChildViews = RefCell<HashMap<WebViewHandle, Box<SystemWebViewState>>>;
+
+/// An already mounted app-owned destination for an original native child.
+///
+/// The retained parent must own its AppKit view and keep its containing window
+/// valid until successful detach or destruction. ExplorerKit owns only the
+/// native webview and its inner container, not the app window or layout policy.
+pub struct AppKitNewWebViewDestination {
+    surface: HostSurface,
+    viewport: SurfaceViewport,
+    parent: Rc<dyn HasWindowHandle>,
+}
+
+impl AppKitNewWebViewDestination {
+    /// Supplies the surface identity, physical viewport and retained native parent.
+    pub fn new(
+        surface: HostSurface,
+        viewport: SurfaceViewport,
+        parent: Rc<dyn HasWindowHandle>,
+    ) -> Self {
+        Self {
+            surface,
+            viewport,
+            parent,
+        }
+    }
 }
 
 impl MacOsViewHostOptions {
@@ -78,7 +111,31 @@ impl MacOsViewHostOptions {
         Self {
             surface_host,
             webkit_data_store_identifier,
+            new_webview_destination_handler: None,
         }
+    }
+
+    /// Supplies an attached AppKit destination after a native request is allowed.
+    ///
+    /// The handler runs synchronously on the AppKit thread. It may mount a slot
+    /// using independently retained native parents and placement data, but must
+    /// not reenter Runtime/GUI state, wait for rendering, or run a nested event
+    /// loop. Dropping its returned parent releases a failed provisional slot.
+    ///
+    /// This does not enable SystemWebView creation: the published Wry backend
+    /// still lacks native-close forwarding and source-safe request callbacks.
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the native destination callback explicit."
+    )]
+    pub fn with_new_webview_destination_handler(
+        mut self,
+        handler: Rc<
+            dyn Fn(&NewWebViewRequest) -> Result<AppKitNewWebViewDestination, SurfaceError>,
+        >,
+    ) -> Self {
+        self.new_webview_destination_handler = Some(handler);
+        self
     }
 }
 
@@ -348,6 +405,10 @@ impl SystemCallbackSink {
     fn invalidate(&self) {
         self.callbacks.borrow_mut().views.remove(&self.target);
     }
+
+    fn is_live(&self) -> bool {
+        self.callbacks.borrow().views.contains_key(&self.target)
+    }
 }
 
 enum MacOsView {
@@ -360,6 +421,8 @@ struct SystemWebViewState {
     icon_registration: Option<favicon::IconRegistration>,
     webview: Option<WebView>,
     container: Option<AppKitContainer>,
+    destination_parent: Option<Rc<dyn HasWindowHandle>>,
+    handler: Rc<RefCell<Option<Rc<NewWebViewHandler>>>>,
     pending_commands: VecDeque<WebViewCommand>,
     viewport: Option<SurfaceViewport>,
     last_url: Option<String>,
@@ -373,12 +436,182 @@ impl SystemWebViewState {
             icon_registration: None,
             webview: None,
             container: None,
+            destination_parent: None,
+            handler: Rc::default(),
             pending_commands: VecDeque::new(),
             viewport: None,
             last_url: None,
             last_navigation_state: None,
         }
     }
+}
+
+#[derive(Clone)]
+struct SystemNewWebView {
+    source: WebViewHandle,
+    sink: SystemCallbackSink,
+    registrar: Option<WebViewRegistrar>,
+    pending: Weak<SystemChildViews>,
+    destination: Option<Rc<NewWebViewDestinationHandler>>,
+    handler: Rc<RefCell<Option<Rc<NewWebViewHandler>>>>,
+    next_request: Rc<Cell<u64>>,
+}
+
+impl SystemNewWebView {
+    fn request(&self, target_url: String, features: NewWindowFeatures) -> NewWindowResponse {
+        if !self.sink.is_live() {
+            return NewWindowResponse::Deny;
+        }
+        let Some(sequence) = self.next_request.get().checked_add(1) else {
+            return NewWindowResponse::Deny;
+        };
+        self.next_request.set(sequence);
+        // SAFETY: Wry invokes this callback with its retained opener on AppKit's thread.
+        let parent_url = unsafe { features.opener.webview.URL() }
+            .and_then(|url| url.absoluteString())
+            .map(|url| url.to_string());
+        let request = NewWebViewRequest {
+            source: self.source,
+            request_id: format!("{}:{}:{sequence}", self.source.raw(), self.sink.target.1),
+            parent_url,
+            target_url: Some(target_url),
+            window_features: window_features(&features),
+        };
+        let handler = self.handler.borrow().clone();
+        if handler.as_ref().map(|handler| handler(&request)) != Some(NewWebViewDecision::Create) {
+            self.sink.push(HostEvent::PopupRequested {
+                request_id: request.request_id,
+                parent_webview_id: format!("{:p}", Retained::as_ptr(&features.opener.webview)),
+                parent_url: request.parent_url,
+                target_url: request.target_url,
+                window_features: request.window_features,
+                policy: PopupRequestPolicy::DefaultDeny,
+            });
+            return NewWindowResponse::Deny;
+        }
+        match self.create(&request, features, handler.expect("Create has a handler")) {
+            Ok(native) => NewWindowResponse::Create { webview: native },
+            Err(error) => {
+                self.sink.push(HostEvent::PopupCreationFailed {
+                    request_id: request.request_id,
+                    error_message: error.to_string(),
+                });
+                NewWindowResponse::Deny
+            }
+        }
+    }
+
+    fn create(
+        &self,
+        request: &NewWebViewRequest,
+        features: NewWindowFeatures,
+        handler: Rc<NewWebViewHandler>,
+    ) -> Result<Retained<objc2_web_kit::WKWebView>, HostError> {
+        let pending = self
+            .pending
+            .upgrade()
+            .ok_or_else(|| HostError::new("native host has closed"))?;
+        let registrar = self
+            .registrar
+            .as_ref()
+            .ok_or_else(|| HostError::new("native host has no Runtime registrar"))?;
+        let registration = registrar.reserve_child(self.source, request.request_id.clone())?;
+        let destination =
+            self.destination.as_ref().ok_or_else(|| {
+                HostError::new("no AppKit child destination handler is installed")
+            })?(request)
+            .map_err(|error| HostError::new(error.to_string()))?;
+        validate_destination(&destination)?;
+        let child = registration.webview();
+        let sink = SystemCallbackSink::register(self.sink.callbacks.clone(), child, 1);
+        let mut state = Box::new(SystemWebViewState::new(1));
+        *state.handler.borrow_mut() = Some(handler);
+        let callbacks = Self {
+            source: child,
+            sink: sink.clone(),
+            registrar: self.registrar.clone(),
+            pending: self.pending.clone(),
+            destination: self.destination.clone(),
+            handler: state.handler.clone(),
+            next_request: Rc::default(),
+        };
+        let built = (|| {
+            let container = AppKitContainer::new(&destination.parent)?;
+            let native = system_webview_builder(sink.clone(), callbacks)
+                .with_webview_configuration(features.opener.target_configuration)
+                .with_bounds(wry_rect(destination.viewport))
+                .with_focused(false)
+                .build_as_child(&container)
+                .map_err(wry_error)?;
+            Ok::<_, HostError>((native, container))
+        })();
+        let (native, container) = match built {
+            Ok(built) => built,
+            Err(error) => {
+                sink.invalidate();
+                return Err(error);
+            }
+        };
+        let native_view = native.webview().into_super();
+        let created = PopupCreated {
+            request_id: request.request_id.clone(),
+            parent_webview_id: format!("{:p}", Retained::as_ptr(&features.opener.webview)),
+            child_webview_id: format!("{:p}", Retained::as_ptr(&native_view)),
+            parent_url: request.parent_url.clone(),
+            target_url: request.target_url.clone(),
+            window_features: request.window_features.clone(),
+        };
+        state.icon_registration = favicon::IconRegistration::attach(&native, sink);
+        state.webview = Some(native);
+        state.container = Some(container);
+        state.destination_parent = Some(destination.parent);
+        state.viewport = Some(destination.viewport);
+        // No native call or last-owner drop occurs under this short staging borrow.
+        let previous = pending.borrow_mut().insert(child, state);
+        debug_assert!(previous.is_none(), "reserved child handles are unique");
+        drop(previous);
+        registration.commit_with_surface(created, destination.surface, destination.viewport);
+        Ok(native_view)
+    }
+}
+
+fn validate_destination(destination: &AppKitNewWebViewDestination) -> Result<(), HostError> {
+    MainThreadMarker::new()
+        .ok_or_else(|| HostError::new("native child must be created on the AppKit main thread"))?;
+    let viewport = destination.viewport;
+    if viewport.size.width == 0
+        || viewport.size.height == 0
+        || !viewport.scale_factor.is_finite()
+        || viewport.scale_factor <= 0.0
+    {
+        return Err(HostError::new(
+            "native child destination needs a positive viewport and scale factor",
+        ));
+    }
+    let parent = appkit_parent_view(&destination.parent)?;
+    if parent.window().and_then(|window| window.screen()).is_none() {
+        return Err(HostError::new(
+            "native child destination is not attached to a window and screen",
+        ));
+    }
+    Ok(())
+}
+
+fn window_features(features: &NewWindowFeatures) -> Option<String> {
+    let mut values = Vec::new();
+    if let Some(size) = features.size {
+        values.extend([
+            format!("width={}", size.width),
+            format!("height={}", size.height),
+        ]);
+    }
+    if let Some(position) = features.position {
+        values.extend([
+            format!("left={}", position.x),
+            format!("top={}", position.y),
+        ]);
+    }
+    (!values.is_empty()).then(|| values.join(","))
 }
 
 /// One macOS runtime host that owns both Servo and WRY/WKWebView view lifetimes.
@@ -393,6 +626,8 @@ pub struct MacOsViewHost<S> {
     callbacks: Rc<RefCell<SystemCallbacks>>,
     registrar: Option<WebViewRegistrar>,
     next_generation: u64,
+    pending_children: Rc<SystemChildViews>,
+    new_webview_destination_handler: Option<Rc<NewWebViewDestinationHandler>>,
 }
 
 impl<S> MacOsViewHost<S> {
@@ -407,6 +642,8 @@ impl<S> MacOsViewHost<S> {
             callbacks: Rc::new(RefCell::new(SystemCallbacks::default())),
             registrar: None,
             next_generation: 0,
+            pending_children: Rc::default(),
+            new_webview_destination_handler: options.new_webview_destination_handler,
         }
     }
 
@@ -420,6 +657,10 @@ impl<S> MacOsViewHost<S> {
         self.servo.services_mut()
     }
 
+    #[allow(
+        clippy::type_complexity,
+        reason = "Preserve the host batch-update result shape."
+    )]
     fn finish_servo_pump(
         &self,
         webviews: &[WebViewHandle],
@@ -445,6 +686,14 @@ impl<S> MacOsViewHost<S> {
     }
 
     fn sync_servo_views(&mut self) {
+        // Callbacks stage complete owners without borrowing this host. End the
+        // staging guard before transfer or destruction can call native code.
+        let children = std::mem::take(&mut *self.pending_children.borrow_mut());
+        for (handle, state) in children {
+            if self.system_sink(handle, state.generation).is_live() {
+                self.views.insert(handle, MacOsView::System(state));
+            }
+        }
         let live = self.servo.native_view_handles();
         self.views
             .retain(|handle, view| !matches!(view, MacOsView::Servo) || live.contains(handle));
@@ -487,6 +736,10 @@ impl<S> MacOsViewHost<S> {
 
 impl<S> Drop for MacOsViewHost<S> {
     fn drop(&mut self) {
+        let pending = std::mem::take(&mut *self.pending_children.borrow_mut());
+        for (&webview, state) in &pending {
+            self.system_sink(webview, state.generation).invalidate();
+        }
         for (&webview, view) in &self.views {
             if let MacOsView::System(state) = view {
                 self.system_sink(webview, state.generation).invalidate();
@@ -495,6 +748,7 @@ impl<S> Drop for MacOsViewHost<S> {
         // WRY removes each WKWebView from its AppKit superview on drop. Do that
         // while the delegate owning those parent views is still alive.
         self.views.clear();
+        drop(pending);
     }
 }
 
@@ -545,12 +799,21 @@ where
         if self.view_is_servo(webview)? {
             return self.servo.set_new_webview_handler(webview, handler);
         }
+        if handler.is_none() {
+            let previous = system_state_mut(&mut self.views, webview)?
+                .handler
+                .borrow_mut()
+                .take();
+            drop(previous);
+            return Ok(());
+        }
         Err(HostError::new(
-            "native child creation is unavailable with the published system-WebView backend",
+            "native child creation needs native-close forwarding and source-safe callbacks, both unavailable in Wry 0.57.0",
         ))
     }
 
     fn shutdown(&mut self) -> Result<(), HostError> {
+        self.sync_servo_views();
         for (&webview, view) in &self.views {
             if let MacOsView::System(state) = view {
                 self.system_sink(webview, state.generation).invalidate();
@@ -716,6 +979,10 @@ where
             .expect("attached system webview has a container")
             .detach();
         state.viewport = None;
+        // The SDK container and native document survive independently of the
+        // initial app slot. Release its lease only after leaving the hierarchy.
+        let parent = state.destination_parent.take();
+        drop(parent);
         Ok(Vec::new())
     }
 
@@ -728,6 +995,7 @@ where
             return with_navigation_state(self.servo.set_popup_policy(webview, popup_policy));
         }
         if popup_policy == PopupRequestPolicy::DefaultDeny {
+            self.set_new_webview_handler(webview, None)?;
             Ok(Vec::new())
         } else {
             Err(system_unsupported(webview, "managed child popup policy"))
@@ -1036,6 +1304,15 @@ where
     };
     let sink = host.system_sink(webview, generation);
     let data_store_identifier = host.webkit_data_store_identifier;
+    let new_window = SystemNewWebView {
+        source: webview,
+        sink: sink.clone(),
+        registrar: host.registrar.clone(),
+        pending: Rc::downgrade(&host.pending_children),
+        destination: host.new_webview_destination_handler.clone(),
+        handler: system_state_mut(&mut host.views, webview)?.handler.clone(),
+        next_request: Rc::default(),
+    };
 
     let parent_surface = host
         .servo
@@ -1101,6 +1378,7 @@ where
             initial_url,
             data_store_identifier,
             sink.clone(),
+            new_window,
         )
     };
 
@@ -1149,21 +1427,31 @@ fn build_system_webview(
     initial_url: &str,
     data_store_identifier: WebKitDataStoreIdentifier,
     sink: SystemCallbackSink,
+    new_window: SystemNewWebView,
 ) -> Result<WebView, HostError> {
+    system_webview_builder(sink, new_window)
+        .with_url(initial_url)
+        .with_bounds(wry_rect(viewport))
+        .with_data_store_identifier(data_store_identifier.0)
+        .build_as_child(parent)
+        .map_err(wry_error)
+}
+
+fn system_webview_builder(
+    sink: SystemCallbackSink,
+    new_window: SystemNewWebView,
+) -> WebViewBuilder<'static> {
     let title_sink = sink.clone();
     let load_sink = sink.clone();
     let navigation_sink = sink.clone();
     let crash_sink = sink;
     WebViewBuilder::new()
-        .with_url(initial_url)
-        .with_bounds(wry_rect(viewport))
         .with_accept_first_mouse(true)
-        .with_data_store_identifier(data_store_identifier.0)
         .with_navigation_handler(move |_| {
             navigation_sink.navigation_requested();
             true
         })
-        .with_new_window_req_handler(|_, _| NewWindowResponse::Deny)
+        .with_new_window_req_handler(move |url, features| new_window.request(url, features))
         .with_download_started_handler(|_, _| false)
         .with_permission_handler(|_| PermissionResponse::Default)
         .with_document_title_changed_handler(move |title| {
@@ -1180,8 +1468,6 @@ fn build_system_webview(
         .with_on_web_content_process_terminate_handler(move || {
             crash_sink.process_terminated();
         })
-        .build_as_child(parent)
-        .map_err(wry_error)
 }
 
 fn dispatch_system_command(
@@ -1522,6 +1808,254 @@ mod tests {
                 WebKitDataStoreIdentifier([0x34; 16]),
             ),
         ))
+    }
+
+    struct StagedHost(Rc<RefCell<MacOsViewHost<NoopDelegate>>>);
+
+    impl Host for StagedHost {
+        fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+            self.0.borrow_mut().set_webview_registrar(registrar);
+        }
+        fn create_webview(
+            &mut self,
+            session: SessionHandle,
+            webview: WebViewHandle,
+        ) -> Result<(), HostError> {
+            self.0.borrow_mut().create_webview_with_options(
+                session,
+                webview,
+                MacOsWebViewOptions::new(MacOsWebViewKind::SystemWebView),
+            )
+        }
+        fn destroy_webview(&mut self, webview: WebViewHandle) -> Result<(), HostError> {
+            self.0.borrow_mut().destroy_webview(webview)
+        }
+        fn dispatch_webview_command(
+            &mut self,
+            webview: WebViewHandle,
+            command: &WebViewCommand,
+        ) -> Result<Vec<HostEvent>, HostError> {
+            self.0
+                .borrow_mut()
+                .dispatch_webview_command(webview, command)
+        }
+        fn observe_webview_events(
+            &mut self,
+            webview: WebViewHandle,
+            events: &[HostEvent],
+        ) -> Result<(), HostError> {
+            self.0.borrow_mut().observe_webview_events(webview, events)
+        }
+        fn perform_updates(&mut self, webview: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
+            self.0.borrow_mut().perform_updates(webview)
+        }
+        fn shutdown(&mut self) -> Result<(), HostError> {
+            self.0.borrow_mut().shutdown()
+        }
+    }
+
+    fn staging_runtime() -> (
+        Runtime<StagedHost>,
+        Rc<RefCell<MacOsViewHost<NoopDelegate>>>,
+    ) {
+        let host = Rc::new(RefCell::new(MacOsViewHost::new(
+            NoopDelegate,
+            MacOsViewHostOptions::new(
+                SurfaceHostOptions::default(),
+                WebKitDataStoreIdentifier([0x34; 16]),
+            ),
+        )));
+        (Runtime::new(StagedHost(host.clone())), host)
+    }
+
+    fn staged_child(host: &MacOsViewHost<NoopDelegate>, source: WebViewHandle) -> WebViewHandle {
+        let registration = host
+            .registrar
+            .as_ref()
+            .unwrap()
+            .reserve_child(source, "staged".into())
+            .unwrap();
+        let child = registration.webview();
+        SystemCallbackSink::register(host.callbacks.clone(), child, 1);
+        host.pending_children
+            .borrow_mut()
+            .insert(child, Box::new(SystemWebViewState::new(1)));
+        registration.commit_with_surface(
+            PopupCreated {
+                request_id: "staged".into(),
+                parent_webview_id: source.raw().to_string(),
+                child_webview_id: child.raw().to_string(),
+                parent_url: None,
+                target_url: None,
+                window_features: None,
+            },
+            HostSurface::new(format!("slot-{}", child.raw())),
+            SurfaceViewport::new(SurfaceSize::new(120, 90), 1.0),
+        );
+        child
+    }
+
+    #[test]
+    fn staged_children_and_nested_sources_are_commandable_before_the_next_pump() {
+        let (mut runtime, host) = staging_runtime();
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let child = staged_child(&host.borrow(), source);
+        let nested = staged_child(&host.borrow(), child);
+        assert!(!host.borrow().views.contains_key(&child));
+        let events = runtime.drain_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.created_webview.is_some())
+                .count(),
+            2
+        );
+        runtime.reload(nested).unwrap();
+        assert!(host.borrow().pending_children.borrow().is_empty());
+        assert!(
+            matches!(host.borrow().views.get(&nested), Some(MacOsView::System(state)) if state.pending_commands.back() == Some(&WebViewCommand::Reload))
+        );
+        runtime.destroy_webview(source).unwrap();
+        runtime.reload(child).unwrap();
+        runtime.destroy_webview(child).unwrap();
+        runtime.reload(nested).unwrap();
+    }
+
+    #[test]
+    fn staged_child_favicon_callbacks_survive_source_close_and_retire_with_the_child() {
+        let (mut runtime, host) = staging_runtime();
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let child = staged_child(&host.borrow(), source);
+        let sink = host.borrow().system_sink(child, 1);
+        sink.document_committed();
+        let token = sink.begin_favicon().unwrap();
+        sink.complete_favicon(token, favicon(1));
+        assert!(!host.borrow().views.contains_key(&child));
+
+        runtime.destroy_webview(source).unwrap();
+        runtime.perform_updates(child).unwrap();
+        let events = runtime.drain_events();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event.event, HostEvent::FaviconChanged { .. }))
+                .map(|event| (event.webview, event.event.clone()))
+                .collect::<Vec<_>>(),
+            vec![(
+                child,
+                HostEvent::FaviconChanged {
+                    favicon: Some(favicon(1))
+                }
+            )]
+        );
+
+        let stale = sink.begin_favicon().unwrap();
+        sink.document_committed();
+        sink.complete_favicon(stale, favicon(2));
+        runtime.perform_updates(child).unwrap();
+        assert!(!runtime
+            .drain_events()
+            .iter()
+            .any(|event| matches!(event.event, HostEvent::FaviconChanged { .. })));
+        let pending = sink.begin_favicon().unwrap();
+        runtime.destroy_webview(child).unwrap();
+        runtime.drain_events();
+        sink.complete_favicon(pending, favicon(3));
+        assert!(runtime.drain_events().is_empty());
+    }
+
+    struct ParentLeaseProbe {
+        pending: Weak<SystemChildViews>,
+        dropped: Rc<Cell<usize>>,
+    }
+
+    impl HasWindowHandle for ParentLeaseProbe {
+        fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+            Err(HandleError::Unavailable)
+        }
+    }
+
+    impl Drop for ParentLeaseProbe {
+        fn drop(&mut self) {
+            if let Some(pending) = self.pending.upgrade() {
+                assert!(
+                    pending.try_borrow_mut().is_ok(),
+                    "lease dropped under staging guard"
+                );
+            }
+            self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    #[test]
+    fn pending_owner_leases_release_after_early_retirement_and_host_shutdown() {
+        for early_close in [false, true] {
+            let (mut runtime, host) = staging_runtime();
+            let session = runtime.create_session();
+            let source = runtime.create_webview(session).unwrap();
+            let child = staged_child(&host.borrow(), source);
+            let dropped = Rc::new(Cell::new(0));
+            {
+                let host = host.borrow();
+                host.pending_children
+                    .borrow_mut()
+                    .get_mut(&child)
+                    .unwrap()
+                    .destination_parent = Some(Rc::new(ParentLeaseProbe {
+                    pending: Rc::downgrade(&host.pending_children),
+                    dropped: dropped.clone(),
+                }));
+                if early_close {
+                    host.system_sink(child, 1).invalidate();
+                    host.registrar.as_ref().unwrap().retire_webview(child);
+                }
+            }
+            if early_close {
+                runtime.perform_updates(source).unwrap();
+                assert!(!host.borrow().views.contains_key(&child));
+                assert_eq!(
+                    runtime.reload(child),
+                    Err(ExplorerKitError::UnknownWebView(child))
+                );
+            } else {
+                runtime.shutdown().unwrap();
+            }
+            assert_eq!(dropped.get(), 1);
+        }
+    }
+
+    #[test]
+    fn published_backend_does_not_enable_children_even_with_a_destination_provider() {
+        let calls = Rc::new(Cell::new(0));
+        let requested = calls.clone();
+        let mut runtime = Runtime::new(MacOsViewHost::new(
+            NoopDelegate,
+            MacOsViewHostOptions::new(
+                SurfaceHostOptions::default(),
+                WebKitDataStoreIdentifier([0x34; 16]),
+            )
+            .with_new_webview_destination_handler(Rc::new(move |_| {
+                requested.set(requested.get() + 1);
+                Err(SurfaceError::new("no slot"))
+            })),
+        ));
+        let session = runtime.create_session();
+        let source = runtime
+            .create_webview_with_options(
+                session,
+                MacOsWebViewOptions::new(MacOsWebViewKind::SystemWebView),
+            )
+            .unwrap();
+        let error = runtime
+            .set_new_webview_handler(source, Some(Rc::new(|_| NewWebViewDecision::Create)))
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("native-close forwarding and source-safe callbacks"));
+        runtime.set_new_webview_handler(source, None).unwrap();
+        assert_eq!(calls.get(), 0);
     }
 
     #[test]
