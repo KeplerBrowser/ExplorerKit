@@ -150,6 +150,10 @@ impl ServoWebView {
     }
 
     #[doc(hidden)]
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the native child callback signature explicit."
+    )]
     pub fn __set_new_webview_handler(
         &self,
         handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
@@ -158,6 +162,10 @@ impl ServoWebView {
     }
 
     #[doc(hidden)]
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the prepared native child callback signature explicit."
+    )]
     pub fn __child_factory(
         &self,
         prepare: Rc<
@@ -831,11 +839,13 @@ impl ProcessServoRuntime {
         let waker = RoutedEventLoopWaker::default();
         waker.activate(event_loop_waker);
 
-        let mut preferences = Preferences::default();
-        preferences.viewport_meta_enabled = true;
-        preferences.dom_permissions_enabled = true;
-        preferences.dom_geolocation_enabled = true;
-        preferences.dom_notification_enabled = true;
+        let preferences = Preferences {
+            viewport_meta_enabled: true,
+            dom_permissions_enabled: true,
+            dom_geolocation_enabled: true,
+            dom_notification_enabled: true,
+            ..Preferences::default()
+        };
 
         if let Some(config_directory) = &config_directory {
             std::fs::create_dir_all(config_directory).map_err(|error| {
@@ -935,7 +945,7 @@ fn acquire_process_servo_runtime(
         );
     }
     let current_thread = std::thread::current().id();
-    let owner_thread = PROCESS_SERVO_THREAD.get_or_init(|| current_thread.clone());
+    let owner_thread = PROCESS_SERVO_THREAD.get_or_init(|| current_thread);
     if *owner_thread != current_thread {
         return Err("ExplorerKit process runtime must stay on its owning UI thread".into());
     }

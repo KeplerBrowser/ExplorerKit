@@ -161,6 +161,10 @@ impl ServoWebViewAdapter {
         }
     }
 
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the native child callback signature explicit."
+    )]
     pub(crate) fn set_new_webview_handler(
         &self,
         handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
@@ -197,6 +201,10 @@ impl ServoWebViewAdapter {
         Ok(())
     }
 
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the prepared native child callback signature explicit."
+    )]
     pub(crate) fn child_factory(
         &self,
         prepare: Rc<
@@ -909,6 +917,10 @@ struct ManagedWebView {
     surface: Option<AttachedManagedChildSurface>,
     surface_adoptable: bool,
     factory: Option<ManagedChildWebViewFactory>,
+    #[allow(
+        clippy::type_complexity,
+        reason = "Keep the native child callback signature explicit."
+    )]
     handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
     registration: Option<RuntimeBinding>,
     next_request: Option<u64>,
@@ -1724,7 +1736,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                 let options = select_element
                     .options()
                     .iter()
-                    .map(|opt| convert_select_element_option(opt))
+                    .map(convert_select_element_option)
                     .collect();
                 let selected_options = select_element.selected_options();
                 let allow_select_multiple = select_element.allow_select_multiple();

@@ -66,7 +66,10 @@ pub struct NewWebViewRequest {
 pub enum NewWebViewDecision {
     /// Apply the engine's native denial.
     Deny,
-    /// Prepare and retain the original child; the application presents it later.
+    /// Prepare and retain the original child using the backend's presentation requirements.
+    ///
+    /// Servo allows later surface attachment. A native backend may require an
+    /// application-provided destination during the synchronous creation callback.
     Create,
 }
 
@@ -835,7 +838,25 @@ impl ChildWebViewRegistration {
     ///
     /// The creation receipt precedes staged child callbacks, including an early
     /// close. The native host must finish all recoverable preparation first.
-    pub fn commit(mut self, created: PopupCreated) {
+    pub fn commit(self, created: PopupCreated) {
+        self.commit_prepared(created, None);
+    }
+
+    /// Commits an original native child already attached to an app-owned surface.
+    ///
+    /// Records the initial surface without reentering the host. The creation
+    /// receipt precedes `SurfaceAttached` and any staged native callbacks. Finish
+    /// all recoverable native preparation before calling this method.
+    pub fn commit_with_surface(
+        self,
+        created: PopupCreated,
+        surface: HostSurface,
+        viewport: SurfaceViewport,
+    ) {
+        self.commit_prepared(created, Some(AttachedSurface { surface, viewport }));
+    }
+
+    fn commit_prepared(mut self, created: PopupCreated, surface: Option<AttachedSurface>) {
         self.committed = true;
         let Some(registry) = self.registrar.registry.upgrade() else {
             return;
@@ -846,6 +867,8 @@ impl ChildWebViewRegistration {
             .get_mut(&self.webview)
             .expect("prepared child remains reserved until commit");
         let reserved = view.reservation.take().expect("child commits once");
+        let initial_size = surface.as_ref().map(|attached| attached.viewport.size);
+        view.state.surface = surface;
         let lineage = view.lineage.as_mut().expect("child has source lineage");
         lineage.native_id = created.child_webview_id.clone();
         let source = lineage.source;
@@ -863,6 +886,14 @@ impl ChildWebViewRegistration {
                 policy: PopupRequestPolicy::ManagedChild,
             },
         });
+        if let Some(size) = initial_size {
+            registry.journal.push_back(ExplorerKitEvent {
+                webview: self.webview,
+                created_webview: None,
+                managed_child_webview_id: None,
+                event: HostEvent::SurfaceAttached { size },
+            });
+        }
         registry
             .journal
             .extend(reserved.events.into_iter().map(|event| ExplorerKitEvent {
@@ -2463,6 +2494,79 @@ mod tests {
         drop(runtime);
         assert!(registrar.reserve_child(source, "too late".into()).is_err());
         drop(reserved);
+    }
+
+    #[test]
+    fn native_child_initial_surface_is_live_before_receipts_and_detaches_normally() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reserved = registrar.reserve_child(source, "attached".into()).unwrap();
+        let child = reserved.webview();
+        let viewport = SurfaceViewport::new(SurfaceSize::new(120, 90), 2.0);
+        registrar.record_event(
+            child,
+            HostEvent::PageTitleChanged {
+                title: Some("ready".into()),
+            },
+        );
+        reserved.commit_with_surface(
+            creation("attached", "native-attached"),
+            HostSurface::new("initial-slot"),
+            viewport,
+        );
+
+        assert_eq!(runtime.surface_viewport(child).unwrap(), viewport);
+        assert_eq!(
+            runtime.attach_surface(child, HostSurface::new("duplicate"), viewport.size),
+            Err(RuntimeError::SurfaceAlreadyAttached(child))
+        );
+        let events = runtime.drain_events();
+        assert_eq!(events[0].created_webview, Some(child));
+        assert!(
+            matches!(events[1].event, HostEvent::SurfaceAttached { size } if size == viewport.size)
+        );
+        assert!(matches!(
+            events[2].event,
+            HostEvent::PageTitleChanged { .. }
+        ));
+        assert!(events[1..].iter().all(|event| event.webview == child));
+        runtime.destroy_webview(source).unwrap();
+        runtime.detach_surface(child).unwrap();
+        assert_eq!(
+            runtime.detach_surface(child),
+            Err(RuntimeError::SurfaceNotAttached(child))
+        );
+        runtime
+            .attach_surface(child, HostSurface::new("replacement"), viewport.size)
+            .unwrap();
+        runtime.destroy_webview(child).unwrap();
+    }
+
+    #[test]
+    fn initially_attached_child_early_close_keeps_ordered_receipts() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        let reserved = registrar.reserve_child(source, "closed".into()).unwrap();
+        let child = reserved.webview();
+        registrar.retire_webview(child);
+        let viewport = SurfaceViewport::new(SurfaceSize::new(120, 90), 1.0);
+        reserved.commit_with_surface(
+            creation("closed", "native-closed"),
+            HostSurface::new("slot"),
+            viewport,
+        );
+        assert_eq!(
+            runtime.reload(child),
+            Err(RuntimeError::UnknownWebView(child))
+        );
+        let events = runtime.drain_events();
+        assert_eq!(events[0].created_webview, Some(child));
+        assert!(matches!(events[1].event, HostEvent::SurfaceAttached { .. }));
+        assert!(matches!(events[2].event, HostEvent::Closed));
     }
 
     #[test]

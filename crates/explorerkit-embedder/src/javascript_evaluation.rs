@@ -32,6 +32,10 @@ pub fn host_event_from_javascript_evaluation_result(
     }
 }
 
+#[allow(
+    clippy::result_unit_err,
+    reason = "Preserve the existing serialization failure contract."
+)]
 pub fn serialize_javascript_value_json(value: &JSValue) -> Result<String, ()> {
     serde_json::to_string(&serialize_javascript_value(value)?).map_err(|_| ())
 }
@@ -89,7 +93,7 @@ fn serialize_javascript_value(value: &JSValue) -> Result<Value, ()> {
         )),
         JSValue::Object(values) => {
             let mut entries: Vec<_> = values.iter().collect();
-            entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+            entries.sort_by_key(|(key, _)| *key);
 
             let mut object_value = Map::new();
             for (key, value) in entries {
