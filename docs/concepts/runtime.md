@@ -89,7 +89,8 @@ losing the page.
 ## Popups and new windows
 
 When a page needs a new browsing context, Servo asks the embedder through
-`WebViewDelegate::request_create_new`. Creation is denied unless the source
+`WebViewDelegate::request_create_new`; macOS system views use WebKit's native
+creation callback. Creation is denied unless the source
 view has a handler installed with `Runtime::set_new_webview_handler`:
 
 ```rust
@@ -104,10 +105,11 @@ the owning thread. It receives a `NewWebViewRequest` with the actual source
 handle, a unique opaque request ID, and the source URL when known. Servo does
 not supply the destination URL or window features; those fields remain
 `None`. The handler cannot infer a user click or destination from this
-metadata. Do not call back into the Runtime or wait for UI inside it.
+metadata. WebKit supplies its native target URL and window features when
+available. Do not call back into the Runtime or wait for UI inside it.
 
 On `Create`, ExplorerKit retains the original native child and registers an
-ordinary `WebViewHandle` in the source's session. It preserves Servo's native
+ordinary `WebViewHandle` in the source's session. It preserves the engine's native
 POST, `about:blank`, opener, named-window, and `noopener` behavior. It does not
 recreate the page by loading its URL.
 
@@ -115,7 +117,7 @@ recreate the page by loading its URL.
 | --- | --- |
 | `PopupRequested` | Creation was denied; this is information, not a pending question. |
 | `PopupCreated` | The child is registered. `ExplorerKitEvent::created_webview` contains its handle; `webview` identifies the immediate source. |
-| `PopupCreationFailed` | The handler accepted, but preparation failed before native creation. |
+| `PopupCreationFailed` | The handler accepted, but preparation failed before registration. |
 
 Each receipt carries the attempt's `request_id`. The creation receipt remains
 available even if its source closes before you drain events. Subsequent
@@ -125,8 +127,10 @@ surface methods. Answers to prompts must target the view that asked. See
 [evaluation lifetime](controller.md#javascript-evaluation-results) for result
 identity and navigation behavior.
 
-The child can execute before your app attaches a surface. Your app chooses
+A Servo child can execute before your app attaches a surface. Your app chooses
 its layout slot later; see [attaching and detaching](surfaces.md#attaching-and-detaching).
+A system child needs an attached app-owned destination during the native
+callback; see [system child destinations](../reference/macos-system-webview.md#popups-and-new-windows).
 Source and child have independent lifetimes. Closing either leaves the
 other's document, history, and pending work intact. Source lineage records
 IDs only and does not keep its document alive.

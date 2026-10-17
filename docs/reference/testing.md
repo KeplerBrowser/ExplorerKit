@@ -161,7 +161,7 @@ macOS session.
 ### System web view on macOS
 
 Rerun these when you change `MacOsViewHost`, system JavaScript evaluation,
-or system favicon decoding, history retention and callback lifetimes.
+or system favicon decoding, history retention, child callbacks and native lifetimes.
 
 Automatic regressions (macOS):
 
@@ -184,7 +184,7 @@ Manual check in an interactive AppKit app:
 2. The system view must resize with its slot; accept native pointer, scroll,
    focus, text, and IME composition input; load, reload, go back and forward;
    report URL, load, title, crash, and navigation-state events; reject forwarded
-   `HostInputEvent`s; and deny new windows and downloads.
+   `HostInputEvent`s; and deny new windows by default and downloads.
 3. Recreate the view and restart the app with the same
    `WebKitDataStoreIdentifier`. Cookies, local storage, and IndexedDB must
    persist. A different identifier must give isolated storage.
@@ -208,6 +208,17 @@ Manual check in an interactive AppKit app:
    icons use the view's WebKit data store and a separate store stays isolated.
    Post-load DOM icon changes are outside this native capability; see
    [favicon limits](capabilities.md#favicons).
+
+7. For accepted children, install an attached AppKit destination provider and
+   drive creation through the public Runtime. Verify default and explicit
+   denial, destination rollback, original blank and fresh POST children, named
+   reuse, nested sources, `noopener`, redirects, cookies, cross-origin access
+   restrictions and opener messaging. Exercise ordinary child controls,
+   detach/reattach, a request from a detached source, and independent source
+   and child close. Check that native close reports the correct handle once,
+   rejects later commands, and releases the last container on an empty Runtime
+   update. Confirm UI-selector availability still matches WRY's file/media
+   callbacks and that root and child favicons still arrive on their own handles.
 
 Record the final URL and title, the input results, the event order, and the
 exact revision and OS in the pull request. This evidence covers macOS only.
