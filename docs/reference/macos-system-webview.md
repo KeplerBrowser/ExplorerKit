@@ -54,7 +54,8 @@ your window.
 - **Input.** AppKit delivers input straight to the view. ExplorerKit rejects
   `HostInputEvent`s forwarded to a system view.
 - **Defaults.** WebKit applies its own defaults for normal navigation and
-  permissions. New windows and downloads are denied.
+  permissions. New windows are denied unless explicitly enabled as described
+  below. Downloads are denied.
 - **Storage.** System views use a WebKit data store named by your
   `WebKitDataStoreIdentifier`. Use the same identifier to keep cookies, local
   storage, and IndexedDB across launches; use a different one to isolate
@@ -65,6 +66,48 @@ your window.
   alive. Reattaching can move the same container under a different live
   parent. Destroying a view, or dropping the host normally, removes system
   views before your parent view's services are released.
+
+## Popups and new windows
+
+Install a destination provider on `MacOsViewHostOptions` with
+`with_new_webview_destination_handler`, then enable the source's
+[per-view creation handler](../concepts/runtime.md#popups-and-new-windows).
+Enabling a system handler without a provider returns an error.
+
+The provider receives the same `NewWebViewRequest` after the source handler
+returns `Create`. Return `AppKitNewWebViewDestination::new(surface, viewport,
+parent)`, where `parent` is an `Rc<dyn HasWindowHandle>` retaining a live AppKit
+view in a window. The viewport must have nonzero dimensions and a finite,
+positive scale. ExplorerKit mounts its container there and reports
+`PopupCreated`, then `SurfaceAttached`, using the new ordinary Runtime handle.
+The app owns the slot, window, layout, and selection.
+
+Both callbacks run synchronously on AppKit's thread. The provider may mount a
+slot using independently retained native parents and placement data. Neither
+callback may reenter Runtime or GUI state, wait for rendering, or run a nested
+event loop. Return an error to abandon a provisional destination; creation is
+then denied and `PopupCreationFailed` reports the failure.
+
+ExplorerKit builds with WebKit's original configuration and returns the native
+child directly. WebKit performs its original navigation, including POST and
+redirects, and preserves its data store, opener, named-target, messaging, and
+origin rules. ExplorerKit does not replay the URL or choose a different store.
+Use the child's ordinary handle for navigation, evaluation and surface controls.
+A child copies its source's handler; later policy changes are per view.
+
+The source may be detached when it requests a child, but the new destination
+must already be attached. Detaching either view preserves its document and
+callbacks. Closing the source or child leaves the other alive. A browser
+`webViewDidClose` callback retires exactly that handle and emits `Closed` once;
+the next Runtime update releases its native owner, including when no live
+views remain. Keep pumping AppKit and Runtime during cleanup.
+
+ExplorerKit installs its own UI delegate before the first navigation and on
+each child. It handles creation and close, forwarding WRY's existing file-panel
+and media-permission callbacks with their native arguments and completion
+blocks. WRY continues to own the web view and navigation callbacks. Recheck
+this forwarding list when updating WRY. Favicon loading uses its separate
+delegate and keeps the same behavior below.
 
 ## Favicons
 
