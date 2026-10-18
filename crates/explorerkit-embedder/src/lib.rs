@@ -216,6 +216,7 @@ pub enum HostEvent {
         parent_url: Option<String>,
         target_url: Option<String>,
         window_features: Option<String>,
+        wants_popup: Option<bool>,
         policy: PopupRequestPolicy,
     },
     PopupCreated {
@@ -225,6 +226,7 @@ pub enum HostEvent {
         parent_url: Option<String>,
         target_url: Option<String>,
         window_features: Option<String>,
+        wants_popup: Option<bool>,
         policy: PopupRequestPolicy,
     },
     /// A permitted native child could not be prepared before native acceptance.

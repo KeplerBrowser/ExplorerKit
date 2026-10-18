@@ -80,6 +80,9 @@ pub struct PopupRequest {
     pub parent_url: Option<String>,
     pub target_url: Option<String>,
     pub window_features: Option<String>,
+    /// Engine-computed popup preference; `None` when unavailable.
+    /// A known `false` does not promise tab placement.
+    pub wants_popup: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -90,6 +93,9 @@ pub struct PopupCreated {
     pub parent_url: Option<String>,
     pub target_url: Option<String>,
     pub window_features: Option<String>,
+    /// Engine-computed popup preference; `None` when unavailable.
+    /// A known `false` does not promise tab placement.
+    pub wants_popup: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -269,6 +275,7 @@ impl ServoAdapterState {
             parent_url: request.parent_url,
             target_url: request.target_url,
             window_features: request.window_features,
+            wants_popup: request.wants_popup,
             policy: PopupRequestPolicy::DefaultDeny,
         });
     }
@@ -281,6 +288,7 @@ impl ServoAdapterState {
             parent_url: created.parent_url,
             target_url: created.target_url,
             window_features: created.window_features,
+            wants_popup: created.wants_popup,
             policy: PopupRequestPolicy::ManagedChild,
         });
     }
@@ -685,6 +693,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
         });
 
         assert_eq!(
@@ -695,6 +704,7 @@ mod tests {
                 parent_url: Some("https://parent.test/".to_owned()),
                 target_url: None,
                 window_features: None,
+                wants_popup: None,
                 policy: PopupRequestPolicy::DefaultDeny,
             }]
         );
@@ -712,6 +722,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
         });
 
         assert_eq!(
@@ -723,6 +734,7 @@ mod tests {
                 parent_url: Some("https://parent.test/".to_owned()),
                 target_url: None,
                 window_features: None,
+                wants_popup: None,
                 policy: PopupRequestPolicy::ManagedChild,
             }]
         );

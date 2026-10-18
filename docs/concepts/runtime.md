@@ -108,6 +108,15 @@ not supply the destination URL or window features; those fields remain
 metadata. WebKit supplies its native target URL and window features when
 available. Do not call back into the Runtime or wait for UI inside it.
 
+`NewWebViewRequest::wants_popup` preserves the engine's computed popup
+preference: `Some(true)` or `Some(false)` when known, and `None` when unavailable.
+False does not promise a tab. The app chooses presentation. The same value
+reaches the destination provider and `PopupRequested` / `PopupCreated` receipts;
+JSON encodes it as `wantsPopup: true`, `false`, or `null`. Existing
+`window_features` geometry metadata is unchanged. Servo's current public
+delegate supplies no preference, so it remains `None`. See the
+[macOS source and compatibility limits](../reference/macos-system-webview.md#popups-and-new-windows).
+
 On `Create`, ExplorerKit retains the original native child and registers an
 ordinary `WebViewHandle` in the source's session. It preserves the engine's native
 POST, `about:blank`, opener, named-window, and `noopener` behavior. It does not

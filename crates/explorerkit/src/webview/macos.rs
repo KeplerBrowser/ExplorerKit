@@ -16,8 +16,9 @@ use explorerkit_embedder::{
 use explorerkit_host::{
     HostSurface, NativeSurface, SurfaceDelegate, SurfaceError, SurfaceSize, SurfaceViewport,
 };
-use objc2::{rc::Retained, MainThreadMarker, MainThreadOnly, Message};
+use objc2::{msg_send, rc::Retained, sel, MainThreadMarker, MainThreadOnly, Message};
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
+use objc2_foundation::{NSObject, NSObjectProtocol};
 use raw_window_handle::{
     AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
 };
@@ -489,6 +490,7 @@ impl SystemNewWebView {
                 .and_then(|url| url.absoluteString())
                 .map(|url| url.to_string()),
             window_features: window_features(features),
+            wants_popup: wants_popup(features),
         };
         let handler = self.handler.borrow().clone();
         if handler.as_ref().map(|handler| handler(&request)) != Some(NewWebViewDecision::Create) {
@@ -498,6 +500,7 @@ impl SystemNewWebView {
                 parent_url: request.parent_url,
                 target_url: request.target_url,
                 window_features: request.window_features,
+                wants_popup: request.wants_popup,
                 policy: PopupRequestPolicy::DefaultDeny,
             });
             return None;
@@ -594,6 +597,7 @@ impl SystemNewWebView {
             parent_url: request.parent_url.clone(),
             target_url: request.target_url.clone(),
             window_features: request.window_features.clone(),
+            wants_popup: request.wants_popup,
         };
         state.ui_registration = Some(ui);
         state.icon_registration = favicon::IconRegistration::attach(&native, sink);
@@ -630,6 +634,16 @@ fn validate_destination(destination: &AppKitNewWebViewDestination) -> Result<(),
         ));
     }
     Ok(())
+}
+
+// WebKit's private computed preference, never the optional explicit `_popup` token.
+fn wants_popup(features: &NSObject) -> Option<bool> {
+    if !features.respondsToSelector(sel!(_wantsPopup)) {
+        return None;
+    }
+    // SAFETY: The guarded WebKit getter returns Objective-C BOOL. objc2 maps bool
+    // to that ABI; no OS-version annotation is used as proof of availability.
+    Some(unsafe { msg_send![features, _wantsPopup] })
 }
 
 fn window_features(features: &WKWindowFeatures) -> Option<String> {
@@ -1844,6 +1858,35 @@ fn appkit_parent_view(parent: &impl HasWindowHandle) -> Result<&NSView, HostErro
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    objc2::define_class!(
+        #[unsafe(super(NSObject))]
+        #[ivars = bool]
+        struct PopupPreferenceFixture;
+
+        unsafe impl NSObjectProtocol for PopupPreferenceFixture {}
+
+        impl PopupPreferenceFixture {
+            #[unsafe(method(_wantsPopup))]
+            fn native_preference(&self) -> bool {
+                *objc2::DefinedClass::ivars(self)
+            }
+        }
+    );
+
+    #[test]
+    fn native_popup_preference_preserves_bool_and_missing_selector() {
+        use objc2::AnyThread;
+        assert_eq!(wants_popup(&NSObject::new()), None);
+        for value in [false, true] {
+            let allocated = PopupPreferenceFixture::alloc().set_ivars(value);
+            // SAFETY: Initialize the fixture's NSObject superclass normally.
+            let receiver: Retained<PopupPreferenceFixture> =
+                unsafe { msg_send![super(allocated), init] };
+            assert_eq!(wants_popup(&receiver), Some(value));
+        }
+    }
+
     use crate::input::HostInputEvent;
     use crate::runtime::{ExplorerKitError, Runtime};
     use crate::surface::SurfaceTarget;
@@ -1984,6 +2027,7 @@ mod tests {
                 parent_url: None,
                 target_url: None,
                 window_features: None,
+                wants_popup: None,
             },
             HostSurface::new(format!("slot-{}", child.raw())),
             SurfaceViewport::new(SurfaceSize::new(120, 90), 1.0),

@@ -1981,6 +1981,7 @@ impl ServoWebViewDriver for SurfaceWebView {
                                     parent_url,
                                     target_url: None,
                                     window_features: None,
+                                    wants_popup: None,
                                 });
                             }),
                         ))
@@ -2907,6 +2908,7 @@ mod tests {
                     parent_url: None,
                     target_url: None,
                     window_features: None,
+                    wants_popup: None,
                 });
                 if pump_fails {
                     Err(HostError::new("engine failed after creation"))
@@ -3009,6 +3011,7 @@ mod tests {
                             parent_url: None,
                             target_url: None,
                             window_features: None,
+                            wants_popup: None,
                         });
                         child_faults.retired.borrow_mut().insert(source);
                         binding.registrar.retire_webview(source);

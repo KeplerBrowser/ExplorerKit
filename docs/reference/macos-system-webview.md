@@ -82,6 +82,14 @@ positive scale. ExplorerKit mounts its container there and reports
 `PopupCreated`, then `SurfaceAttached`, using the new ordinary Runtime handle.
 The app owns the slot, window, layout, and selection.
 
+On SystemWebView, `wants_popup` comes from WebKit's private
+`WKWindowFeatures._wantsPopup` computed preference, guarded at runtime with
+`respondsToSelector:`. An unavailable selector yields `None`; a known false
+stays `Some(false)`. This is distinct from WebKit's explicit `_popup` token.
+Private API can change or disappear with an OS update; the availability guard
+does not make it public API. This
+mapping covers only this macOS backend and does not choose presentation.
+
 Both callbacks run synchronously on AppKit's thread. The provider may mount a
 slot using independently retained native parents and placement data. Neither
 callback may reenter Runtime or GUI state, wait for rendering, or run a nested

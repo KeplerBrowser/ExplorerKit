@@ -1180,6 +1180,7 @@ mod tests {
                 parent_url,
                 target_url,
                 window_features,
+                wants_popup,
                 policy,
             } => {
                 assert!(!request_id.is_empty());
@@ -1189,6 +1190,7 @@ mod tests {
                     .is_some_and(|url| url.starts_with("data:text/html,")));
                 assert_eq!(target_url, &None);
                 assert_eq!(window_features, &None);
+                assert_eq!(wants_popup, &None);
                 assert_eq!(*policy, PopupRequestPolicy::DefaultDeny);
             }
             other => panic!("expected popup request event, got {other:?}"),
@@ -2003,6 +2005,7 @@ mod tests {
                 parent_url,
                 target_url,
                 window_features,
+                wants_popup,
                 policy,
                 ..
             } => {
@@ -2012,6 +2015,7 @@ mod tests {
                     .is_some_and(|url| url.starts_with("data:text/html,")));
                 assert_eq!(target_url, &None);
                 assert_eq!(window_features, &None);
+                assert_eq!(wants_popup, &None);
                 parent_webview_id.clone()
             }
             other => panic!("expected popup-created event, got {other:?}"),

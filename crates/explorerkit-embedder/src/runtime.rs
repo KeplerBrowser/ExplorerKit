@@ -46,7 +46,7 @@ pub struct ExplorerKitEvent {
 /// Metadata supplied during a synchronous native child-creation request.
 ///
 /// ExplorerKit owns this interface. Servo's `request_create_new` supplies no
-/// target URL or window features; absent native metadata remains `None`.
+/// target URL, window features or popup preference; absent native metadata remains `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewWebViewRequest {
     /// The actual source, including for a request made by an existing child.
@@ -59,6 +59,9 @@ pub struct NewWebViewRequest {
     pub target_url: Option<String>,
     /// Native window-feature metadata, when supplied.
     pub window_features: Option<String>,
+    /// Engine-computed popup preference; `None` when unavailable.
+    /// A known `false` does not promise tab placement.
+    pub wants_popup: Option<bool>,
 }
 
 /// Immediate disposition of an original native child-creation request.
@@ -883,6 +886,7 @@ impl ChildWebViewRegistration {
                 parent_url: created.parent_url,
                 target_url: created.target_url,
                 window_features: created.window_features,
+                wants_popup: created.wants_popup,
                 policy: PopupRequestPolicy::ManagedChild,
             },
         });
@@ -2360,6 +2364,25 @@ mod tests {
             parent_url: None,
             target_url: None,
             window_features: None,
+            wants_popup: None,
+        }
+    }
+
+    #[test]
+    fn registered_child_receipt_preserves_engine_popup_preference() {
+        let mut runtime = Runtime::new(JournalHost::default());
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let registrar = runtime.host().registrar.clone().unwrap();
+        runtime.drain_events();
+        for wants_popup in [Some(true), Some(false), None] {
+            let reservation = registrar.reserve_child(source, "attempt".into()).unwrap();
+            let mut metadata = creation("attempt", "native-child");
+            metadata.wants_popup = wants_popup;
+            reservation.commit(metadata);
+            assert!(runtime.drain_events().iter().any(|event| matches!(
+                event.event, HostEvent::PopupCreated { wants_popup: actual, .. } if actual == wants_popup
+            )));
         }
     }
 
@@ -3414,6 +3437,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
             policy: PopupRequestPolicy::ManagedChild,
         };
         let surface = HostSurface::new("popup-child-surface");
@@ -3552,6 +3576,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
             policy: PopupRequestPolicy::DefaultDeny,
         };
         let host = PlaceholderHost::with_update_events([popup_event.clone()]);
