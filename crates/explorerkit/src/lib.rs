@@ -178,6 +178,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
             policy: PopupRequestPolicy::ManagedChild,
         };
         let mut runtime = Runtime::new(PlaceholderHost::with_update_events([popup_created]));

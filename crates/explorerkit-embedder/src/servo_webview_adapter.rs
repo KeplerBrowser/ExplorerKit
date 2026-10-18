@@ -1115,6 +1115,7 @@ impl WebViewManager {
                 parent_url,
                 target_url: None,
                 window_features: None,
+                wants_popup: None,
             })
         });
     }
@@ -1559,6 +1560,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                     parent_url: parent_url.clone(),
                     target_url: None,
                     window_features: None,
+                    wants_popup: None,
                 }),
                 _ => NewWebViewDecision::Deny,
             };
@@ -1647,6 +1649,7 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
                             parent_url,
                             target_url: None,
                             window_features: None,
+                            wants_popup: None,
                         });
                     });
             }
@@ -2282,6 +2285,7 @@ mod tests {
             parent_url: None,
             target_url: None,
             window_features: None,
+            wants_popup: None,
         };
         let handler = adapter.shared.manager.borrow().views[&child]
             .handler

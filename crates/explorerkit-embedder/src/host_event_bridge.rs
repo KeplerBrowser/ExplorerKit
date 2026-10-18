@@ -70,6 +70,7 @@ fn write_payload(output: &mut String, event: &HostEvent) {
             parent_url,
             target_url,
             window_features,
+            wants_popup,
             policy,
         } => {
             write_string_field(output, &mut first, "requestId", request_id);
@@ -82,6 +83,7 @@ fn write_payload(output: &mut String, event: &HostEvent) {
                 "windowFeatures",
                 window_features.as_deref(),
             );
+            write_optional_bool_field(output, &mut first, "wantsPopup", *wants_popup);
             write_string_field(output, &mut first, "policy", policy.as_str());
         }
         HostEvent::PopupCreated {
@@ -91,6 +93,7 @@ fn write_payload(output: &mut String, event: &HostEvent) {
             parent_url,
             target_url,
             window_features,
+            wants_popup,
             policy,
         } => {
             write_string_field(output, &mut first, "requestId", request_id);
@@ -104,6 +107,7 @@ fn write_payload(output: &mut String, event: &HostEvent) {
                 "windowFeatures",
                 window_features.as_deref(),
             );
+            write_optional_bool_field(output, &mut first, "wantsPopup", *wants_popup);
             write_string_field(output, &mut first, "policy", policy.as_str());
         }
         HostEvent::PopupCreationFailed {
@@ -522,6 +526,20 @@ fn write_optional_u32_field(output: &mut String, first: &mut bool, name: &str, v
     }
 }
 
+fn write_optional_bool_field(
+    output: &mut String,
+    first: &mut bool,
+    name: &str,
+    value: Option<bool>,
+) {
+    write_field_name(output, first, name);
+    output.push_str(match value {
+        Some(true) => "true",
+        Some(false) => "false",
+        None => "null",
+    });
+}
+
 fn write_bool_field(output: &mut String, first: &mut bool, name: &str, value: bool) {
     write_field_name(output, first, name);
     output.push_str(if value { "true" } else { "false" });
@@ -719,6 +737,42 @@ mod tests {
     }
 
     #[test]
+    fn popup_receipts_preserve_three_state_engine_preference() {
+        let mut state = crate::ServoAdapterState::default();
+        for wants_popup in [Some(true), Some(false), None] {
+            state.request_popup(crate::PopupRequest {
+                request_id: "request-1".into(),
+                parent_webview_id: "source".into(),
+                parent_url: None,
+                target_url: None,
+                window_features: None,
+                wants_popup,
+            });
+            state.notify_popup_created(crate::PopupCreated {
+                request_id: "request-1".into(),
+                parent_webview_id: "source".into(),
+                child_webview_id: "child".into(),
+                parent_url: None,
+                target_url: None,
+                window_features: None,
+                wants_popup,
+            });
+            for event in state.drain_events() {
+                let json = encode_host_event_bridge(&event);
+                let expected = match wants_popup {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "null",
+                };
+                assert!(
+                    json.contains(&format!("\"wantsPopup\":{expected}")),
+                    "{json}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn encodes_remaining_payload_shapes() {
         assert_eq!(
             encode_host_event_bridge(&HostEvent::NavigationRequested {
@@ -734,9 +788,10 @@ mod tests {
                 parent_url: Some("https://parent.test/".to_owned()),
                 target_url: None,
                 window_features: None,
+                wants_popup: None,
                 policy: PopupRequestPolicy::DefaultDeny,
             }),
-            r#"{"name":"popupRequested","payload":{"requestId":"request-1","parentWebViewId":"parent-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"default-deny"}}"#
+            r#"{"name":"popupRequested","payload":{"requestId":"request-1","parentWebViewId":"parent-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"wantsPopup":null,"policy":"default-deny"}}"#
         );
         assert_eq!(
             encode_host_event_bridge(&HostEvent::PopupCreated {
@@ -746,9 +801,10 @@ mod tests {
                 parent_url: Some("https://parent.test/".to_owned()),
                 target_url: None,
                 window_features: None,
+                wants_popup: None,
                 policy: PopupRequestPolicy::ManagedChild,
             }),
-            r#"{"name":"popupCreated","payload":{"requestId":"request-1","parentWebViewId":"parent-1","childWebViewId":"child-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"policy":"managed-child"}}"#
+            r#"{"name":"popupCreated","payload":{"requestId":"request-1","parentWebViewId":"parent-1","childWebViewId":"child-1","parentUrl":"https://parent.test/","targetUrl":null,"windowFeatures":null,"wantsPopup":null,"policy":"managed-child"}}"#
         );
         assert_eq!(
             encode_host_event_bridge(&HostEvent::PopupCreationFailed {

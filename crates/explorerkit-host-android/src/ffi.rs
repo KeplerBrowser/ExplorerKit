@@ -3270,6 +3270,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
             policy: PopupRequestPolicy::DefaultDeny,
         };
         handle.events.push_back(event.clone());
@@ -3291,6 +3292,7 @@ mod tests {
             parent_url: Some("https://parent.test/".to_owned()),
             target_url: None,
             window_features: None,
+            wants_popup: None,
             policy: PopupRequestPolicy::ManagedChild,
         };
         handle.events.push_back(event.clone());
