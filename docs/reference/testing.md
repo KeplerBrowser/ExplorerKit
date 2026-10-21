@@ -48,6 +48,19 @@ Servo can only start once per process, so real-Servo tests cannot use a fresh
 engine per test. That is why the last test runs on one thread and checks
 several lifetimes in sequence.
 
+When Servo crash callbacks, evaluation correlation or event routing change, run
+the conditional crash-settlement regression in `explorerkit-embedder`:
+
+```sh
+cargo test --manifest-path crates/Cargo.toml -p explorerkit-embedder \
+  --features servo observed_crash_settles_only_pending_reads_on_its_registered_view --locked
+```
+
+This checks existing crash/result ordering, finalized outcomes, late callbacks,
+reused IDs, sibling and registered-child isolation, destruction and native close
+through Runtime's event queue. It invokes the callback translation directly;
+it does not induce a native crash or prove renderer survival or recovery.
+
 ### Desktop C boundary (macOS and Windows)
 
 ```sh
