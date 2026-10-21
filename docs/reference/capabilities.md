@@ -66,6 +66,23 @@ native Rust, but its React Native wiring is incomplete and not supported.
 
 See [the macOS event and lifetime rules](macos-system-webview.md#favicons).
 
+### Stop loading
+
+- **Native Rust macOS system WebKit:** `Runtime::stop_loading` submits native
+  Stop; `Runtime::system_webview_is_loading` reads the current native loading
+  flag. Live detached views and registered children are supported. Both reject
+  an uninstantiated view. See [semantics and ordering](macos-system-webview.md#stop-loading).
+- **Servo, including native Rust and Android:** unavailable in published
+  Servo 0.6.0. Stop returns an explicit host/backend error before queueing;
+  querying system-WebView loading state also returns an error.
+- **iOS and React Native:** no public Stop/query integration. The portable
+  controller rejects the internal Stop command without a native effect.
+
+Native Rust apps know the backend selected at view creation; use that choice
+to select the control. Unsupported calls leave the page unchanged and report an
+error, rather than claiming that loading stopped. A WebKit false sample is not
+navigation success, cancellation attribution or complete network quiescence.
+
 ### Navigation policy
 
 The page asks before following a link or loading a frame (Servo's

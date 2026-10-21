@@ -80,6 +80,8 @@ pub enum NewWebViewDecision {
 pub enum WebViewCommand {
     LoadUrl(NavigationRequest),
     Reload,
+    /// Request the backend's native stop operation, where supported.
+    StopLoading,
     GoBack,
     GoForward,
     Focus,
@@ -452,9 +454,21 @@ pub trait Host {
     fn dispatch_webview_command(
         &mut self,
         _webview: WebViewHandle,
-        _command: &WebViewCommand,
+        command: &WebViewCommand,
     ) -> Result<Vec<HostEvent>, HostError> {
+        if matches!(command, WebViewCommand::StopLoading) {
+            return Err(HostError::new(
+                "native stop loading is unsupported by this host",
+            ));
+        }
         Ok(Vec::new())
+    }
+
+    /// Read current native system-WebView loading state; unavailable hosts return an error.
+    fn system_webview_is_loading(&mut self, _webview: WebViewHandle) -> Result<bool, HostError> {
+        Err(HostError::new(
+            "system-WebView loading state is unsupported by this host",
+        ))
     }
 
     fn resolve_navigation_request(
@@ -1358,6 +1372,29 @@ impl<H: Host> Runtime<H> {
         self.dispatch_webview_command(webview, WebViewCommand::Reload)
     }
 
+    /// Submit the native stop-loading operation for a live view.
+    ///
+    /// Currently supported by native macOS system WebViews. Success means submission,
+    /// not completed cancellation or successful navigation. Servo returns an error.
+    /// The native committed document, history and view identity are retained.
+    pub fn stop_loading(&mut self, webview: WebViewHandle) -> Result<(), RuntimeError> {
+        self.dispatch_webview_command(webview, WebViewCommand::StopLoading)
+    }
+
+    /// Sample the current native system-WebView content-loading flag.
+    ///
+    /// Currently maps to macOS `WKWebView::isLoading` on the owning thread. False
+    /// identifies neither a navigation outcome nor cancellation cause or network
+    /// quiescence. Query after processing commands/events; do not reuse a sample
+    /// across a later navigation. Unsupported or uninstantiated views return an error.
+    pub fn system_webview_is_loading(
+        &mut self,
+        webview: WebViewHandle,
+    ) -> Result<bool, RuntimeError> {
+        self.webview_state(webview, |_| ())?;
+        self.call_host(|host| host.system_webview_is_loading(webview))
+    }
+
     pub fn go_back(&mut self, webview: WebViewHandle) -> Result<(), RuntimeError> {
         self.dispatch_webview_command(webview, WebViewCommand::GoBack)
     }
@@ -1803,6 +1840,7 @@ fn dispatch_embedder_command(state: &mut WebViewState, command: WebViewCommand) 
                     .notify_load_status_changed(LoadStatusKind::Complete);
             }
         }
+        WebViewCommand::StopLoading => {}
         WebViewCommand::GoBack => {
             if let Some(current) = state.history_index.filter(|current| *current > 0) {
                 let target = current - 1;
@@ -3007,6 +3045,114 @@ mod tests {
         assert_eq!(runtime.host().observed_events(), expected_events.as_slice());
         assert_eq!(runtime.drain_events(), expected_events);
         assert!(runtime.drain_events().is_empty());
+    }
+
+    #[test]
+    fn stop_and_current_loading_validate_lifetimes_and_default_to_unsupported() {
+        struct DefaultHost;
+        impl Host for DefaultHost {
+            fn destroy_webview(&mut self, _: WebViewHandle) -> Result<(), HostError> {
+                Ok(())
+            }
+            fn create_webview(
+                &mut self,
+                _: SessionHandle,
+                _: WebViewHandle,
+            ) -> Result<(), HostError> {
+                Ok(())
+            }
+            fn observe_webview_events(
+                &mut self,
+                _: WebViewHandle,
+                _: &[HostEvent],
+            ) -> Result<(), HostError> {
+                Ok(())
+            }
+        }
+        let mut runtime = Runtime::new(DefaultHost);
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        assert!(runtime
+            .stop_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        assert!(runtime
+            .system_webview_is_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        assert!(runtime.drain_events().is_empty());
+        runtime.destroy_webview(view).unwrap();
+        assert_eq!(
+            runtime.stop_loading(view),
+            Err(RuntimeError::UnknownWebView(view))
+        );
+        assert_eq!(
+            runtime.system_webview_is_loading(view),
+            Err(RuntimeError::UnknownWebView(view))
+        );
+    }
+
+    #[test]
+    fn loading_query_reads_current_host_state_despite_queued_old_completion() {
+        #[derive(Default)]
+        struct LoadingHost {
+            loading: HashMap<WebViewHandle, bool>,
+        }
+        impl Host for LoadingHost {
+            fn observe_webview_events(
+                &mut self,
+                _: WebViewHandle,
+                _: &[HostEvent],
+            ) -> Result<(), HostError> {
+                Ok(())
+            }
+            fn create_webview(
+                &mut self,
+                _: SessionHandle,
+                view: WebViewHandle,
+            ) -> Result<(), HostError> {
+                self.loading.insert(view, true);
+                Ok(())
+            }
+            fn dispatch_webview_command(
+                &mut self,
+                view: WebViewHandle,
+                command: &WebViewCommand,
+            ) -> Result<Vec<HostEvent>, HostError> {
+                *self.loading.get_mut(&view).unwrap() =
+                    !matches!(command, WebViewCommand::StopLoading);
+                Ok(Vec::new())
+            }
+            fn system_webview_is_loading(
+                &mut self,
+                view: WebViewHandle,
+            ) -> Result<bool, HostError> {
+                Ok(self.loading[&view])
+            }
+        }
+        let mut runtime = Runtime::new(LoadingHost::default());
+        let session = runtime.create_session();
+        let stopped = runtime.create_webview(session).unwrap();
+        let sibling = runtime.create_webview(session).unwrap();
+        runtime.stop_loading(stopped).unwrap();
+        assert!(!runtime.system_webview_is_loading(stopped).unwrap());
+        assert!(runtime.system_webview_is_loading(sibling).unwrap());
+        assert!(runtime.drain_events().is_empty());
+        runtime
+            .record_events(
+                stopped,
+                vec![HostEvent::LoadStatusChanged {
+                    status: LoadStatusKind::Complete,
+                }],
+            )
+            .unwrap();
+        runtime.reload(stopped).unwrap();
+        runtime.drain_events();
+        assert!(runtime.system_webview_is_loading(stopped).unwrap());
+        runtime.stop_loading(stopped).unwrap();
+        assert!(!runtime.system_webview_is_loading(stopped).unwrap());
     }
 
     #[test]

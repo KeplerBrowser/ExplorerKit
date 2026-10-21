@@ -48,7 +48,7 @@ your window.
   [WRY](https://github.com/tauri-apps/wry). The `Runtime` still owns every
   view's lifetime. Your app still owns the window, the layout slot, the
   chrome, and which engine to pick.
-- **Commands and events.** Load, reload, back, forward, and focus work. The
+- **Commands and events.** Load, reload, stop, back, forward, and focus work. The
   view reports URL, load status, title, crash, and navigation-state events
   (whether it can go back or forward).
 - **Input.** AppKit delivers input straight to the view. ExplorerKit rejects
@@ -66,6 +66,42 @@ your window.
   alive. Reattaching can move the same container under a different live
   parent. Destroying a view, or dropping the host normally, removes system
   views before your parent view's services are released.
+
+## Stop loading
+
+`Runtime::stop_loading(view)` calls `WKWebView.stopLoading` through Wry's
+published native handle. Success means the native call returned; observe
+`Runtime::system_webview_is_loading(view)` on later owning-thread turns to
+read the current native content-loading flag. A false sample does not identify
+a navigation, cancellation cause or successful load, or prove that every page
+request, script or timer stopped. The query does not pump the event loop.
+
+```rust
+runtime.stop_loading(view)?;
+// After processing commands and events on a later owning-thread turn:
+let loading = runtime.system_webview_is_loading(view)?;
+```
+
+For a streamed page, Stop retains the committed partial document, native view
+and native history. A provisional or redirecting load can leave the previous
+committed page. ExplorerKit does not change history or recreate the view.
+Detached views with a retained native object work; an idle Stop is harmless.
+Both calls reject a view whose native object has not been created. Stop is
+never queued for later attachment and does not cancel a deferred initial URL.
+Registered children use their own handles and remain independent of siblings.
+
+Use the app's existing backend selection to discover support; see
+[Stop loading support](capabilities.md#stop-loading). The app owns the Reload/Stop control and user intent. Read native state
+after processing commands/events, and discard a sample after another command.
+Old uncorrelated load-complete events must not override that state or settle a
+new navigation waiter. A new load may not yet have entered native loading when
+sampled: false is only the current flag. Attributed navigation outcomes remain
+unavailable through these calls.
+
+Stop does not synthesize completion, failure or crash events, or cancel pending
+JavaScript evaluations. Actual commit, close and process-termination callbacks
+retain their existing behavior. Ordinary load failure can also make loading
+false; this is not an attributed cancellation-complete notification.
 
 ## Popups and new windows
 

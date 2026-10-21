@@ -1402,6 +1402,11 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         command: &WebViewCommand,
     ) -> Result<Vec<HostEvent>, HostError> {
         self.ensure_created_webview(webview)?;
+        if matches!(command, WebViewCommand::StopLoading) {
+            return Err(HostError::new(
+                "native stop loading is unsupported by Servo",
+            ));
+        }
 
         if !self.attached_surfaces.contains_key(&webview)
             && !self
@@ -2724,6 +2729,7 @@ mod tests {
                 WebViewCommand::GoForward => "go-forward".to_owned(),
                 WebViewCommand::Focus => "focus".to_owned(),
                 WebViewCommand::Blur => "blur".to_owned(),
+                WebViewCommand::StopLoading => "stop".to_owned(),
             };
             self.log.push(format!("command:{command}"));
             Ok(())
@@ -2841,6 +2847,34 @@ mod tests {
             Rc::new(FakeFactory { log, faults }),
         );
         Runtime::new(host)
+    }
+
+    #[test]
+    fn servo_stop_rejects_before_deferred_queue_and_after_native_creation() {
+        let log = SharedLog::default();
+        let mut runtime = fake_runtime(log.clone(), Rc::new(Cell::new(false)));
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        runtime.load_url(view, "initial.test").unwrap();
+        assert!(runtime
+            .stop_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        assert!(runtime.system_webview_is_loading(view).is_err());
+        runtime
+            .attach_surface(
+                view,
+                HostSurface::new("stop-slot"),
+                SurfaceSize::new(320, 240),
+            )
+            .unwrap();
+        assert!(runtime
+            .stop_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
+        assert!(!log.take().iter().any(|entry| entry == "command:stop"));
     }
 
     fn evaluation_ids(runtime: &mut FakeRuntime) -> Vec<String> {

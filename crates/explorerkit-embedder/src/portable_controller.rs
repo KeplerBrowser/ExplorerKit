@@ -261,6 +261,12 @@ impl PortableController {
                     .events
                     .push(HostEvent::SimpleDialogDismissed { dialog_id });
             }
+            ControllerCommand::StopLoading => {
+                return Err(PortableControllerError::invalid(
+                    "invalidCommand",
+                    "native stop loading is unsupported by the portable controller",
+                ));
+            }
             ControllerCommand::ResolveContextMenu { .. }
             | ControllerCommand::DismissContextMenu { .. } => {
                 return Err(PortableControllerError::invalid(
@@ -864,6 +870,23 @@ mod tests {
 
     fn request_id(result: &Value, effect: usize, key: &str) -> String {
         result["effects"][effect][key].as_str().unwrap().to_owned()
+    }
+
+    #[test]
+    fn stop_loading_is_explicitly_unsupported_without_effects_or_events() {
+        let mut controller = new_controller(1);
+        let error = controller
+            .dispatch_json(r#"{"version":1,"command":"stopLoading"}"#)
+            .unwrap_err();
+        let result: Value = serde_json::from_str(&error.to_result_json()).unwrap();
+        assert_eq!(result["error"]["code"], "invalidCommand");
+        assert!(result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("unsupported"));
+        assert_eq!(result["effects"], json!([]));
+        assert_eq!(result["events"], json!([]));
+        assert!(controller.pending.is_empty());
     }
 
     #[test]

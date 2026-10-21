@@ -188,6 +188,7 @@ impl<H: Host> Controller<H> {
                 .runtime
                 .dispatch_webview_command(self.webview, WebViewCommand::LoadUrl(request)),
             ControllerCommand::Reload => self.runtime.reload(self.webview),
+            ControllerCommand::StopLoading => self.runtime.stop_loading(self.webview),
             ControllerCommand::GoBack => self.runtime.go_back(self.webview),
             ControllerCommand::GoForward => self.runtime.go_forward(self.webview),
             ControllerCommand::Focus => self.runtime.focus(self.webview),
@@ -1356,6 +1357,16 @@ mod tests {
         events.iter().any(|event| {
             event.attachment_generation == generation && event.json.to_str().unwrap().contains(text)
         })
+    }
+
+    #[test]
+    fn controller_stop_reports_existing_runtime_error_when_host_is_unsupported() {
+        let mut controller = Controller::new(TestHost::default()).unwrap();
+        assert_eq!(
+            controller.dispatch_controller_command(r#"{"version":1,"command":"stopLoading"}"#),
+            Err(ExplorerKitDesktopPrivateStatus::RuntimeError)
+        );
+        assert!(controller.runtime.drain_events().is_empty());
     }
 
     #[test]

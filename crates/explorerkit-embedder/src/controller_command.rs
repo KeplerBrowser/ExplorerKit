@@ -13,6 +13,7 @@ use crate::{ContextMenuAction, NavigationRequest};
 pub enum ControllerCommand {
     LoadUrl(NavigationRequest),
     Reload,
+    StopLoading,
     GoBack,
     GoForward,
     Focus,
@@ -65,6 +66,7 @@ impl ControllerCommand {
                     .map_err(|error| ControllerCommandError::InvalidUrl(error.to_string()))?,
             )),
             "reload" => Ok(Self::Reload),
+            "stopLoading" => Ok(Self::StopLoading),
             "goBack" => Ok(Self::GoBack),
             "goForward" => Ok(Self::GoForward),
             "focus" => Ok(Self::Focus),
@@ -107,6 +109,7 @@ impl ControllerCommand {
         match self {
             Self::LoadUrl(_)
             | Self::Reload
+            | Self::StopLoading
             | Self::GoBack
             | Self::GoForward
             | Self::Focus
@@ -297,6 +300,18 @@ mod tests {
                 context_menu_id: "context-menu-1".to_owned(),
             })
         );
+    }
+
+    #[test]
+    fn stop_loading_uses_the_shared_parser_without_changing_extra_field_handling() {
+        for input in [
+            r#"{"version":1,"command":"stopLoading"}"#,
+            r#"{"version":1,"command":"stopLoading","extra":true}"#,
+        ] {
+            let command = ControllerCommand::from_json(input).unwrap();
+            assert_eq!(command, ControllerCommand::StopLoading);
+            command.validate().unwrap();
+        }
     }
 
     #[test]

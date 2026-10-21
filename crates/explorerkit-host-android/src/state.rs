@@ -398,11 +398,9 @@ impl Host for AndroidHost {
             return Ok(Vec::new());
         }
 
-        let backend_events = if state.native_window.is_some() && state.android_backend.is_some() {
-            let backend = state
-                .android_backend
-                .as_mut()
-                .expect("android backend is present");
+        let backend_events = if let (Some(_), Some(backend)) =
+            (state.native_window, state.android_backend.as_mut())
+        {
             backend.detach_surface().map_err(HostError::new)?
         } else {
             Vec::new()
@@ -422,7 +420,7 @@ impl Host for AndroidHost {
     ) -> Result<Vec<HostEvent>, HostError> {
         let state = self.state_mut();
         ensure_created_webview(state, webview)?;
-        Ok(dispatch_android_webview_command(state, command.clone()))
+        dispatch_android_webview_command(state, command.clone())
     }
 
     fn perform_updates(&mut self, webview: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
@@ -483,9 +481,14 @@ fn events_from_backend_result(
 fn dispatch_android_webview_command(
     state: &mut AndroidHostState,
     command: WebViewCommand,
-) -> Vec<HostEvent> {
-    match command {
+) -> Result<Vec<HostEvent>, HostError> {
+    Ok(match command {
         WebViewCommand::LoadUrl(request) => load_navigation_request_for_state(state, request),
+        WebViewCommand::StopLoading => {
+            return Err(HostError::new(
+                "native stop loading is unsupported by Servo",
+            ));
+        }
         WebViewCommand::Reload => {
             perform_android_navigation_command_for_state(state, |backend| backend.reload())
         }
@@ -501,7 +504,7 @@ fn dispatch_android_webview_command(
         WebViewCommand::Blur => {
             perform_android_navigation_command_for_state(state, |backend| backend.blur())
         }
-    }
+    })
 }
 
 fn load_navigation_request_for_state(
@@ -520,15 +523,13 @@ fn load_navigation_request_for_state(
 
     state.pending_url = Some(url.clone());
 
-    if state.surface.is_some() && state.native_window.is_some() && state.android_backend.is_some() {
+    if let (Some(_), Some(_), Some(backend)) = (
+        state.surface,
+        state.native_window,
+        state.android_backend.as_mut(),
+    ) {
         state.pending_url = None;
-        let result = {
-            let backend = state
-                .android_backend
-                .as_mut()
-                .expect("android backend is present");
-            backend.load_url(&url)
-        };
+        let result = backend.load_url(&url);
         return events_from_backend_result(result, Some(&url));
     }
 

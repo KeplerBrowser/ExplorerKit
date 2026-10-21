@@ -61,6 +61,30 @@ reused IDs, sibling and registered-child isolation, destruction and native close
 through Runtime's event queue. It invokes the callback translation directly;
 it does not induce a native crash or prove renderer survival or recovery.
 
+### Native Stop and current loading
+
+When command routing, native readiness/lifetime or the relevant dependencies
+change, rerun the Stop/query regressions in the portable crates, macOS facade,
+Android host and desktop boundary. They cover explicit unsupported errors before
+deferred queues, preserved pending loads and lifetimes, portable rejection, and
+current state independent of queued completion events.
+
+```sh
+cargo test --manifest-path crates/Cargo.toml -p explorerkit-embedder -p servokit-controller-ffi --locked
+cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-system-webview --lib --locked -- --test-threads=1
+cargo test --manifest-path crates/Cargo.toml -p explorerkit-host-android -p explorerkit-host-desktop --lib --locked
+```
+
+Native acceptance also uses a temporary local HTTP fixture with held headers,
+a redirect destination and a streamed committed page. Through public Runtime,
+observe loading before Stop and false while the response remains held, retained
+partial content/rendered pixels, native identity/history, subsequent navigation,
+Stop followed by a new load or same-URL reload, detached views, original
+children and sibling isolation. Do not infer cancellation completion from the
+method return or synthesize a load-complete event. Record the fixture revision,
+commands, timings, results and limits in the PR; remove the one-time machinery.
+This does not prove per-navigation outcome attribution or all-network quiescence.
+
 ### Desktop C boundary (macOS and Windows)
 
 ```sh

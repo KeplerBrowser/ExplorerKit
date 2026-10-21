@@ -101,12 +101,13 @@ accepted design decision first.
    restart. The host app decides when it shuts down. ExplorerKit never shuts it
    down on its own.
 
-9. **Servo-first APIs.** Design every public API for Servo first. No feature
-   may exist only in the compatibility layer; where the system web view can't
-   do something, it returns an explicit unsupported error instead of faking
-   it. Build on Servo's published crates.io release, use Servo's names for
-   Servo concepts, and follow servoshell's embedding patterns. Diverge only on
-   purpose, and say why.
+9. **Servo-first APIs.** Design every public API for Servo first and use each
+   engine's published native interfaces. A feature may ship on the engines
+   and platforms that support it, including the compatibility layer. Document
+   those limits and return an explicit unavailable error on unsupported paths
+   instead of faking success. Build on Servo's published crates.io release,
+   use Servo's names for Servo concepts, and follow servoshell's embedding
+   patterns. Diverge only on purpose, and say why.
 
 10. **Claim only what's proven.** A capability counts as supported only when
     there is evidence for it in [Testing and validation](docs/reference/testing.md).
