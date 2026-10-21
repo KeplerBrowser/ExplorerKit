@@ -27,7 +27,7 @@ use wry::{
     WebViewBuilderExtMacos, WebViewExtMacOS,
 };
 
-use crate::surface::{SurfaceFrame, SurfaceHost, SurfaceHostOptions};
+use crate::surface::{SurfaceEventLoopWaker, SurfaceFrame, SurfaceHost, SurfaceHostOptions};
 
 mod favicon;
 mod javascript;
@@ -159,9 +159,18 @@ pub trait AppKitViewDelegate: SurfaceDelegate {
 
 type CallbackTarget = (u64, u64);
 
-#[derive(Default)]
 struct SystemCallbacks {
     views: HashMap<CallbackTarget, SystemCallbackState>,
+    wake: SurfaceEventLoopWaker,
+}
+
+impl SystemCallbacks {
+    fn new(wake: SurfaceEventLoopWaker) -> Self {
+        Self {
+            views: HashMap::new(),
+            wake,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -211,16 +220,33 @@ impl SystemCallbackSink {
         Self { target, callbacks }
     }
 
-    fn push(&self, event: HostEvent) {
-        let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(state) = callbacks.views.get_mut(&self.target) {
-            state.events.push_back(event);
+    fn wake(&self) {
+        let wake = self.callbacks.borrow().wake.clone();
+        wake();
+    }
+
+    fn publish(&self, update: impl FnOnce(&mut SystemCallbackState) -> bool) {
+        {
+            let mut callbacks = self.callbacks.borrow_mut();
+            let Some(state) = callbacks.views.get_mut(&self.target) else {
+                return;
+            };
+            if !update(state) {
+                return;
+            }
         }
+        self.wake();
+    }
+
+    fn push(&self, event: HostEvent) {
+        self.publish(|state| {
+            state.events.push_back(event);
+            true
+        });
     }
 
     fn document_committed(&self) {
-        let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(state) = callbacks.views.get_mut(&self.target) {
+        self.publish(|state| {
             state.document_ready = true;
             state.document_navigation_pending = false;
             state.favicon_request = state.favicon_request.wrapping_add(1);
@@ -236,12 +262,12 @@ impl SystemCallbackSink {
             // Completion linearizes when it enters this queue. Already finalized
             // results stay before Started, including across a same-URL reload.
             state.retire_evaluations(JavaScriptEvaluationErrorKind::DocumentNotFound);
-        }
+            true
+        });
     }
 
     fn process_terminated(&self) {
-        let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(state) = callbacks.views.get_mut(&self.target) {
+        self.publish(|state| {
             state.document_ready = false;
             if let Some(favicons) = &mut state.favicons {
                 favicons.clear();
@@ -253,7 +279,8 @@ impl SystemCallbackSink {
                 backtrace: None,
             });
             state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
-        }
+            true
+        });
     }
 
     fn begin_evaluation(&self, id: &str) -> Result<Option<u64>, HostError> {
@@ -275,6 +302,8 @@ impl SystemCallbackSink {
                 id,
                 Err(JavaScriptEvaluationErrorKind::WebViewNotReady),
             ));
+            drop(callbacks);
+            self.wake();
             return Ok(None);
         }
         state.next_request = state
@@ -292,37 +321,37 @@ impl SystemCallbackSink {
         token: u64,
         result: Result<String, NativeEvaluationError>,
     ) {
-        let mut callbacks = self.callbacks.borrow_mut();
-        let Some(state) = callbacks.views.get_mut(&self.target) else {
-            return;
-        };
-        // Commit/process retirement removes every old token. Check before any
-        // state change: even an old process error must not invalidate a new read.
-        if state.pending.get(id) != Some(&token) {
-            return;
-        }
-        match result {
-            Err(
-                NativeEvaluationError::ProcessTerminated | NativeEvaluationError::ViewInvalidated,
-            ) => {
-                state.document_ready = false;
-                if let Some(favicons) = &mut state.favicons {
-                    favicons.clear();
+        self.publish(|state| {
+            // Commit/process retirement removes every old token. Check before any
+            // state change: even an old process error must not invalidate a new read.
+            if state.pending.get(id) != Some(&token) {
+                return false;
+            }
+            match result {
+                Err(
+                    NativeEvaluationError::ProcessTerminated
+                    | NativeEvaluationError::ViewInvalidated,
+                ) => {
+                    state.document_ready = false;
+                    if let Some(favicons) = &mut state.favicons {
+                        favicons.clear();
+                    }
+                    state.favicon_request = state.favicon_request.wrapping_add(1);
+                    state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
                 }
-                state.favicon_request = state.favicon_request.wrapping_add(1);
-                state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
+                result => {
+                    state.pending.remove(id);
+                    state.events.push_back(evaluation_event(
+                        id,
+                        result.map_err(|error| match error {
+                            NativeEvaluationError::Result(error) => error,
+                            _ => unreachable!("lifetime errors handled above"),
+                        }),
+                    ));
+                }
             }
-            result => {
-                state.pending.remove(id);
-                state.events.push_back(evaluation_event(
-                    id,
-                    result.map_err(|error| match error {
-                        NativeEvaluationError::Result(error) => error,
-                        _ => unreachable!("lifetime errors handled above"),
-                    }),
-                ));
-            }
-        }
+            true
+        });
     }
 
     fn navigation_requested(&self) {
@@ -356,8 +385,7 @@ impl SystemCallbackSink {
         image: explorerkit_embedder::FaviconImage,
         bytes: Vec<u8>,
     ) {
-        let mut callbacks = self.callbacks.borrow_mut();
-        if let Some(state) = callbacks.views.get_mut(&self.target) {
+        self.publish(|state| {
             if state.document_ready && state.favicon_request == token {
                 if let Some(favicons) = &mut state.favicons {
                     favicons.retain(bytes, !state.document_navigation_pending);
@@ -365,8 +393,10 @@ impl SystemCallbackSink {
                 state.events.push_back(HostEvent::FaviconChanged {
                     favicon: Some(image),
                 });
+                return true;
             }
-        }
+            false
+        });
     }
 
     fn begin_favicon(&self) -> Option<u64> {
@@ -533,6 +563,7 @@ impl SystemNewWebView {
                 registrar.record_event(self.source, event);
             }
             registrar.retire_webview(self.source);
+            self.sink.wake();
         }
     }
 
@@ -610,6 +641,7 @@ impl SystemNewWebView {
         debug_assert!(previous.is_none(), "reserved child handles are unique");
         drop(previous);
         registration.commit_with_surface(created, destination.surface, destination.viewport);
+        self.sink.wake();
         Ok(native_view)
     }
 }
@@ -685,13 +717,14 @@ pub struct MacOsViewHost<S> {
 impl<S> MacOsViewHost<S> {
     /// Creates the macOS host with existing Servo surface services and one WebKit store.
     pub fn new(services: S, options: MacOsViewHostOptions) -> Self {
+        let wake = options.surface_host.event_loop_waker().clone();
         let mut servo = SurfaceHost::new(services, options.surface_host);
         servo.set_navigation_state_events();
         Self {
             servo,
             webkit_data_store_identifier: options.webkit_data_store_identifier,
             views: HashMap::new(),
-            callbacks: Rc::new(RefCell::new(SystemCallbacks::default())),
+            callbacks: Rc::new(RefCell::new(SystemCallbacks::new(wake))),
             registrar: None,
             next_generation: 0,
             pending_children: Rc::default(),
@@ -1934,6 +1967,186 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn native_result_writers_publish_before_waking_and_reject_stale_callbacks() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        thread_local! {
+            static CALLBACKS: RefCell<Weak<RefCell<SystemCallbacks>>> = const { RefCell::new(Weak::new()) };
+        }
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed = wakes.clone();
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(Arc::new(move || {
+            CALLBACKS.with(|slot| {
+                let callbacks = slot.borrow().upgrade().unwrap();
+                let state = callbacks
+                    .try_borrow_mut()
+                    .expect("wake runs outside callback borrows");
+                assert!(
+                    state.views.values().any(|view| !view.events.is_empty()),
+                    "publish before wake"
+                );
+            });
+            observed.fetch_add(1, Ordering::Relaxed);
+        }))));
+        CALLBACKS.with(|slot| *slot.borrow_mut() = Rc::downgrade(&callbacks));
+        let sink = SystemCallbackSink::register_raw(callbacks.clone(), 1, 1);
+        let wakes = &*wakes;
+        let published = || {
+            let before = wakes.load(Ordering::Relaxed);
+            move || assert!(wakes.load(Ordering::Relaxed) > before)
+        };
+
+        let check = published();
+        assert_eq!(sink.begin_evaluation("unready").unwrap(), None);
+        check();
+        sink.drain();
+        let check = published();
+        sink.push(HostEvent::PageTitleChanged {
+            title: Some("title".into()),
+        });
+        check();
+        sink.drain();
+        let check = published();
+        sink.document_committed();
+        check();
+        sink.drain();
+        let token = sink.begin_evaluation("ok").unwrap().unwrap();
+        let check = published();
+        sink.complete_evaluation("ok", token, Ok("null".into()));
+        check();
+        sink.drain();
+        for error in [
+            NativeEvaluationError::ProcessTerminated,
+            NativeEvaluationError::ViewInvalidated,
+            NativeEvaluationError::Result(JavaScriptEvaluationErrorKind::EvaluationFailure),
+        ] {
+            sink.document_committed();
+            sink.drain();
+            let token = sink.begin_evaluation("error").unwrap().unwrap();
+            let check = published();
+            sink.complete_evaluation("error", token, Err(error));
+            check();
+            assert!(!sink.drain().is_empty());
+        }
+        sink.document_committed();
+        sink.drain();
+        sink.begin_evaluation("navigation").unwrap();
+        let check = published();
+        sink.document_committed();
+        check();
+        assert_eq!(
+            sink.drain().len(),
+            2,
+            "commit and retired read share a notification"
+        );
+        sink.begin_evaluation("crash").unwrap();
+        let check = published();
+        sink.process_terminated();
+        check();
+        assert_eq!(
+            sink.drain().len(),
+            2,
+            "crash and retired read share a notification"
+        );
+        sink.document_committed();
+        sink.drain();
+        let icon = sink.begin_favicon().unwrap();
+        let check = published();
+        sink.complete_favicon(icon, favicon(1));
+        check();
+        sink.drain();
+
+        let old_read = sink.begin_evaluation("stale").unwrap().unwrap();
+        sink.document_committed();
+        sink.drain();
+        let before = wakes.load(Ordering::Relaxed);
+        sink.complete_evaluation("stale", old_read, Ok("null".into()));
+        sink.complete_favicon(icon, favicon(2));
+        assert_eq!(wakes.load(Ordering::Relaxed), before);
+        sink.invalidate();
+        let replacement = SystemCallbackSink::register_raw(callbacks, 1, 2);
+        sink.push(HostEvent::Closed);
+        sink.document_committed();
+        sink.process_terminated();
+        sink.complete_evaluation(
+            "stale",
+            old_read,
+            Err(NativeEvaluationError::ProcessTerminated),
+        );
+        sink.complete_favicon(icon, favicon(3));
+        assert_eq!(wakes.load(Ordering::Relaxed), before);
+        assert!(replacement.drain().is_empty());
+        let check = published();
+        replacement.push(HostEvent::PageTitleChanged {
+            title: Some("replacement".into()),
+        });
+        check();
+        CALLBACKS.with(|slot| *slot.borrow_mut() = Weak::new());
+    }
+
+    #[test]
+    fn native_wake_hints_coalesce_and_keep_independent_hosts_separate() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
+        let first = Arc::new(AtomicBool::new(false));
+        let second = Arc::new(AtomicBool::new(false));
+        let make_host = |pending: Arc<AtomicBool>, store| {
+            MacOsViewHost::new(
+                NoopDelegate,
+                MacOsViewHostOptions::new(
+                    SurfaceHostOptions::new(
+                        Arc::new(move || {
+                            pending.store(true, Ordering::Release);
+                        }),
+                        Rc::new(crate::surface::MemoryClipboard::default()),
+                    ),
+                    WebKitDataStoreIdentifier([store; 16]),
+                ),
+            )
+        };
+        let first_host = Rc::new(RefCell::new(make_host(first.clone(), 1)));
+        let mut first_runtime = Runtime::new(StagedHost(first_host.clone()));
+        let first_session = first_runtime.create_session();
+        let first_view = first_runtime.create_webview(first_session).unwrap();
+        let second_host = Rc::new(RefCell::new(make_host(second.clone(), 2)));
+        let mut second_runtime = Runtime::new(StagedHost(second_host.clone()));
+        let second_session = second_runtime.create_session();
+        let second_view = second_runtime.create_webview(second_session).unwrap();
+        let first_sink = first_host.borrow().system_sink(first_view, 1);
+        let second_sink = second_host.borrow().system_sink(second_view, 1);
+        first_sink.push(HostEvent::PageTitleChanged {
+            title: Some("first".into()),
+        });
+        first_sink.document_committed();
+        assert!(first.swap(false, Ordering::AcqRel));
+        assert!(!second.load(Ordering::Acquire));
+        first_runtime.perform_all_updates().unwrap();
+        assert_eq!(first_runtime.drain_events().len(), 2);
+        second_sink.push(HostEvent::PageTitleChanged {
+            title: Some("second".into()),
+        });
+        assert!(second.swap(false, Ordering::AcqRel));
+        assert!(!first.load(Ordering::Acquire));
+        second_runtime.perform_all_updates().unwrap();
+        assert_eq!(second_runtime.drain_events().len(), 1);
+        first_runtime.destroy_webview(first_view).unwrap();
+        first_sink.push(HostEvent::Closed);
+        assert!(!first.load(Ordering::Acquire));
+        second_sink.push(HostEvent::PageTitleChanged {
+            title: Some("survivor".into()),
+        });
+        assert!(second.swap(false, Ordering::AcqRel));
+        second_runtime.perform_all_updates().unwrap();
+        assert_eq!(second_runtime.drain_events().len(), 1);
+    }
+
     struct StagedHost(Rc<RefCell<MacOsViewHost<NoopDelegate>>>);
 
     impl Host for StagedHost {
@@ -2108,6 +2321,11 @@ mod tests {
 
     #[test]
     fn native_close_retires_staged_and_adopted_children_once_before_cleanup() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+
         for adopted in [false, true] {
             let (mut runtime, host) = staging_runtime();
             let session = runtime.create_session();
@@ -2116,6 +2334,11 @@ mod tests {
             if adopted {
                 runtime.reload(child).unwrap();
             }
+            let pending = Arc::new(AtomicBool::new(false));
+            let scheduled = pending.clone();
+            host.borrow().callbacks.borrow_mut().wake = Arc::new(move || {
+                scheduled.store(true, Ordering::Release);
+            });
             let callbacks = {
                 let host = host.borrow();
                 SystemNewWebView {
@@ -2131,11 +2354,20 @@ mod tests {
             callbacks.sink.push(HostEvent::PageTitleChanged {
                 title: Some("before-close".into()),
             });
+            assert!(pending.swap(false, Ordering::AcqRel));
             callbacks.closed();
+            assert!(
+                pending.swap(false, Ordering::AcqRel),
+                "native close schedules its journal drain"
+            );
             callbacks.closed();
             callbacks.sink.push(HostEvent::PageTitleChanged {
                 title: Some("stale".into()),
             });
+            assert!(
+                !pending.load(Ordering::Acquire),
+                "retired callbacks do not schedule new results"
+            );
             assert_eq!(
                 runtime.reload(child),
                 Err(ExplorerKitError::UnknownWebView(child))
@@ -2342,7 +2574,9 @@ mod tests {
 
     #[test]
     fn system_webview_discards_callbacks_after_destroy_and_replacement() {
-        let callbacks = Rc::new(RefCell::new(SystemCallbacks::default()));
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(std::sync::Arc::new(
+            || {},
+        ))));
         let first = SystemCallbackSink::register_raw(callbacks.clone(), 1, 1);
         first.push(HostEvent::FocusChanged { is_focused: true });
         assert_eq!(first.drain().len(), 1);
@@ -2670,7 +2904,9 @@ mod tests {
 
     #[test]
     fn favicon_url_and_load_completion_events_do_not_retire_the_document_request() {
-        let callbacks = Rc::new(RefCell::new(SystemCallbacks::default()));
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(std::sync::Arc::new(
+            || {},
+        ))));
         let sink = SystemCallbackSink::register_raw(callbacks, 1, 1);
         sink.document_committed();
         sink.drain();

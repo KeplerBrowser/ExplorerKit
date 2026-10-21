@@ -360,7 +360,11 @@ impl SurfaceClipboard for MemoryClipboard {
     }
 }
 
-/// Thread-safe callback used to wake the host event loop for Servo work.
+/// Thread-safe callback used to wake the host event loop for Servo work or queued native results.
+///
+/// Schedule a later update on the owning thread; do not synchronously reenter the Runtime.
+/// Wake hints may be coalesced or spurious. They do not replace animation pacing or native
+/// URL/history sampling.
 pub type SurfaceEventLoopWaker = Arc<dyn Fn() + Send + Sync + 'static>;
 
 /// Event-loop, clipboard, and process-engine options supplied to [`SurfaceHost`].
@@ -393,7 +397,7 @@ impl SurfaceHostOptions {
         self
     }
 
-    /// Borrows the event-loop wake callback.
+    /// Borrows the event-loop wake callback for Servo work and macOS system-view results.
     pub fn event_loop_waker(&self) -> &SurfaceEventLoopWaker {
         &self.event_loop_waker
     }
