@@ -247,6 +247,15 @@ overlapping navigation, so submitting a navigation command alone does not
 retire an evaluation. The SDK does not cancel native script execution or
 promise which document a script submitted during navigation will run in.
 
+If Servo delivers `WebViewDelegate::notify_crashed`, ExplorerKit queues the
+existing `Crashed` event, then finishes that view's still-pending evaluations
+with `InternalError`. Results already finalized keep their original order and
+value. Late native completions cannot produce a second result or consume a
+reused ID; siblings and registered children keep their own pending work.
+This only applies when Servo delivers the callback while the view is live.
+It does not cancel script execution or establish that the engine remains usable;
+see [failure and recovery](runtime.md#failure-and-recovery).
+
 Destroying a view discards its queued results; retire your own waiters when
 you destroy it. Native closure reports `Closed`. Closing a source does not
 cancel evaluations on its live children.

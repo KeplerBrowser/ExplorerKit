@@ -168,6 +168,36 @@ view's lifetime, and your app still owns the window, layout, and selection.
 Servo and WebKit do not share cookies, storage, or credentials. Details:
 [macOS system web view](../reference/macos-system-webview.md).
 
+## Failure and recovery
+
+A failed navigation, a JavaScript error or an app deadline does not establish
+that a renderer or the shared engine has failed. `Crashed` reports an observed
+native failure for the event's view: a pipeline panic on Servo, or content-process
+termination on macOS system views. It does not invalidate the view handle or
+identify every view sharing the affected native process. Keep draining events
+even when an update returns an error, and assess each view independently.
+
+ExplorerKit retains Servo's in-process, hard-fail defaults. Some failures
+terminate the app before any callback or evaluation result can arrive. There
+is no general containment or engine restart guarantee. Creating another
+`Runtime` can reuse a healthy retained engine; it cannot rebuild a failed one.
+Do not call `shutdown()` to recover: shutdown permanently prevents Servo
+initialization in that process.
+
+While the host remains responsive, your app can use the existing `reload` or
+destroy/create methods with the same backend and storage selection. This is
+an attempt, not a recovery guarantee. Cancel your own waiters before destroying
+a view, retain native parents and complete outstanding GPU work through
+successful teardown, and track replacements with a new app generation and
+handle. Keep ownership of a newly created handle if attaching or loading it
+fails. Registered children have independent lifetimes and must be managed
+individually. A new document does not restore its previous DOM, history or
+generated content; those restoration decisions belong to your app.
+
+The [evaluation contract](controller.md#javascript-evaluation-results) describes
+pending-result settlement and destruction. Platform notification support is
+listed in [capabilities](../reference/capabilities.md#fullscreen-cursor-crash-and-errors).
+
 ## Related
 
 - [Surfaces](surfaces.md): drawing, attaching, multiple views, and shutdown.

@@ -420,17 +420,10 @@ impl ServoWebViewAdapter {
         let evaluation_id = evaluation_id.to_owned();
         native.evaluate_javascript(script, move |result| {
             let Some(owner) = owner.upgrade() else { return };
-            let mut manager = owner.manager.borrow_mut();
-            let Some(view) = manager.views.get_mut(&key) else {
-                return;
-            };
-            if !view.evaluations.complete(&evaluation_id, token) {
-                return;
-            }
-            manager.emit(
-                &key,
-                host_event_from_javascript_evaluation_result(evaluation_id, result),
-            );
+            owner
+                .manager
+                .borrow_mut()
+                .complete_evaluation(&key, evaluation_id, token, result);
         });
         Ok(())
     }
@@ -1176,6 +1169,35 @@ impl WebViewManager {
         result
     }
 
+    fn complete_evaluation(
+        &mut self,
+        key: &str,
+        id: String,
+        token: (u64, u64),
+        result: Result<servo::JSValue, servo::JavaScriptEvaluationError>,
+    ) {
+        let Some(view) = self.views.get_mut(key) else {
+            return;
+        };
+        if view.evaluations.complete(&id, token) {
+            self.emit(
+                key,
+                host_event_from_javascript_evaluation_result(id, result),
+            );
+        }
+    }
+
+    fn notify_crashed(
+        &mut self,
+        key: &str,
+        url: Option<&str>,
+        reason: String,
+        backtrace: Option<String>,
+    ) {
+        self.update_state_for_webview(key, |state| state.notify_crashed(url, reason, backtrace));
+        self.retire_evaluations(key, servo::JavaScriptEvaluationError::InternalError);
+    }
+
     fn retire_evaluations(&mut self, key: &str, error: servo::JavaScriptEvaluationError) {
         let Some(view) = self.views.get_mut(key) else {
             return;
@@ -1497,12 +1519,12 @@ impl servo::WebViewDelegate for ServoWebViewDelegate {
         };
         let webview_id = self.key.clone();
         let webview_url = webview.url().map(|url| url.to_string());
-        shared
-            .manager
-            .borrow_mut()
-            .update_state_for_webview(&webview_id, |state| {
-                state.notify_crashed(webview_url.as_deref(), reason, backtrace)
-            });
+        shared.manager.borrow_mut().notify_crashed(
+            &webview_id,
+            webview_url.as_deref(),
+            reason,
+            backtrace,
+        );
     }
 
     fn request_navigation(&self, webview: WebView, request: servo::NavigationRequest) {
@@ -2146,6 +2168,10 @@ mod tests {
             Ok(())
         }
 
+        fn destroy_webview(&mut self, _: WebViewHandle) -> Result<(), HostError> {
+            Ok(())
+        }
+
         fn observe_webview_events(
             &mut self,
             _: WebViewHandle,
@@ -2311,6 +2337,175 @@ mod tests {
         assert!(first.complete("same", current));
         assert!(!first.complete("same", current));
         assert!(sibling.complete("same", sibling_token));
+    }
+
+    #[test]
+    fn observed_crash_settles_only_pending_reads_on_its_registered_view() {
+        for crash_child in [false, true] {
+            let root = test_adapter();
+            let mut runtime = register(&root);
+            let binding = root.shared.manager.borrow().views[&root.key]
+                .registration
+                .clone()
+                .unwrap();
+            root.shared
+                .manager
+                .borrow_mut()
+                .views
+                .get_mut(&root.key)
+                .unwrap()
+                .native_id = "root".into();
+            let reservation = binding
+                .registrar
+                .reserve_child(binding.webview, "child".into())
+                .unwrap();
+            let child_handle = reservation.webview();
+            let child_key = root
+                .shared
+                .manager
+                .borrow_mut()
+                .reserve_child("root")
+                .unwrap();
+            let child = ServoWebViewAdapter {
+                shared: root.shared.clone(),
+                key: child_key,
+            };
+            child.bind_runtime(child_handle, binding.registrar.clone(), false);
+            reservation.commit(PopupCreated {
+                request_id: "child".into(),
+                parent_webview_id: "root".into(),
+                child_webview_id: "child".into(),
+                parent_url: None,
+                target_url: None,
+                window_features: None,
+                wants_popup: None,
+            });
+            let sibling = test_adapter();
+            let sibling_session = runtime.create_session();
+            let sibling_handle = runtime.create_webview(sibling_session).unwrap();
+            sibling.bind_runtime(sibling_handle, binding.registrar.clone(), false);
+            runtime.drain_events();
+            let (failed, survivor, failed_handle, survivor_handle) = if crash_child {
+                (&child, &root, child_handle, binding.webview)
+            } else {
+                (&root, &child, binding.webview, child_handle)
+            };
+            let submit = |adapter: &ServoWebViewAdapter, id: &str| {
+                adapter
+                    .shared
+                    .manager
+                    .borrow_mut()
+                    .view_mut(&adapter.key)
+                    .unwrap()
+                    .evaluations
+                    .submit(id)
+                    .unwrap()
+            };
+            let complete = |adapter: &ServoWebViewAdapter, id: &str, token| {
+                adapter.shared.manager.borrow_mut().complete_evaluation(
+                    &adapter.key,
+                    id.into(),
+                    token,
+                    Ok(servo::JSValue::Null),
+                );
+            };
+            let finalized = submit(failed, "finalized");
+            complete(failed, "finalized", finalized);
+            let late = submit(failed, "same");
+            let second_late = submit(failed, "second");
+            let live = submit(survivor, "same");
+            let independent = submit(&sibling, "same");
+            failed.shared.manager.borrow_mut().notify_crashed(
+                &failed.key,
+                Some("https://crash.example/"),
+                "pipeline failed".into(),
+                Some("trace".into()),
+            );
+            let events = runtime.drain_events();
+            assert_eq!(events.len(), 4);
+            assert!(events.iter().all(|event| event.webview == failed_handle));
+            assert!(
+                matches!(&events[0].event, HostEvent::JavaScriptEvaluationResult {
+                evaluation_id, ok: true, ..
+            } if evaluation_id == "finalized")
+            );
+            assert_eq!(
+                events[1].event,
+                HostEvent::Crashed {
+                    url: Some("https://crash.example/".into()),
+                    reason: "pipeline failed".into(),
+                    backtrace: Some("trace".into()),
+                }
+            );
+            assert_eq!(
+                events[2].event,
+                host_event_from_javascript_evaluation_result(
+                    "same",
+                    Err(servo::JavaScriptEvaluationError::InternalError),
+                )
+            );
+            assert_eq!(
+                events[3].event,
+                host_event_from_javascript_evaluation_result(
+                    "second",
+                    Err(servo::JavaScriptEvaluationError::InternalError),
+                )
+            );
+            failed.shared.manager.borrow_mut().notify_crashed(
+                &failed.key,
+                None,
+                "again".into(),
+                None,
+            );
+            assert_eq!(runtime.drain_events().len(), 1);
+            let reused = submit(failed, "same");
+            complete(failed, "same", late);
+            complete(failed, "second", second_late);
+            assert!(runtime.drain_events().is_empty());
+            complete(failed, "same", reused);
+            complete(failed, "same", reused);
+            complete(survivor, "same", live);
+            complete(&sibling, "same", independent);
+            let events = runtime.drain_events();
+            assert_eq!(
+                events.iter().map(|event| event.webview).collect::<Vec<_>>(),
+                vec![failed_handle, survivor_handle, sibling_handle]
+            );
+            assert!(events.iter().all(|event| matches!(&event.event,
+                HostEvent::JavaScriptEvaluationResult { evaluation_id, ok: true, .. } if evaluation_id == "same")));
+
+            // App destruction drops queued results; late work must not target a new handle.
+            let late = submit(failed, "destroyed");
+            failed.shared.manager.borrow_mut().notify_crashed(
+                &failed.key,
+                None,
+                "before destroy".into(),
+                None,
+            );
+            runtime.destroy_webview(failed_handle).unwrap();
+            failed.close();
+            complete(failed, "destroyed", late);
+            failed.shared.manager.borrow_mut().notify_crashed(
+                &failed.key,
+                None,
+                "after destroy".into(),
+                None,
+            );
+            let session = runtime.create_session();
+            let replacement = runtime.create_webview(session).unwrap();
+            assert_ne!(replacement, failed_handle);
+            assert!(runtime.drain_events().is_empty());
+            assert!(survivor.is_live());
+            assert!(sibling.is_live());
+            let closed_read = submit(survivor, "closed");
+            survivor.shared.notify_closed(&survivor.key);
+            complete(survivor, "closed", closed_read);
+            let events = runtime.drain_events();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].webview, survivor_handle);
+            assert_eq!(events[0].event, HostEvent::Closed);
+            assert!(sibling.is_live());
+        }
     }
 
     #[test]
