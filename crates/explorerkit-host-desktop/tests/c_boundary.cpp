@@ -182,6 +182,15 @@ int main() {
     return EXIT_FAILURE;
   }
 
+  constexpr char stop_command[] = "{\"version\":1,\"command\":\"stopLoading\"}";
+  status = explorerkit_desktop_private_dispatch_controller_command(
+      host, token, reinterpret_cast<const std::uint8_t *>(stop_command),
+      sizeof(stop_command) - 1);
+  if (!expect_status("unsupported Stop rejects before the detached queue", status,
+                     EXPLORERKIT_DESKTOP_PRIVATE_RUNTIME_ERROR)) {
+    return EXIT_FAILURE;
+  }
+
   constexpr char command_with_trailing_bytes[] =
       "{\"version\":1,\"command\":\"reload\"}not part of the command";
   status = explorerkit_desktop_private_dispatch_controller_command(

@@ -12,6 +12,7 @@ fn into_control_command(command: ControllerCommand) -> ControlCommand {
             ControlCommand::WebView(WebViewCommand::LoadUrl(request))
         }
         ControllerCommand::Reload => ControlCommand::WebView(WebViewCommand::Reload),
+        ControllerCommand::StopLoading => ControlCommand::WebView(WebViewCommand::StopLoading),
         ControllerCommand::GoBack => ControlCommand::WebView(WebViewCommand::GoBack),
         ControllerCommand::GoForward => ControlCommand::WebView(WebViewCommand::GoForward),
         ControllerCommand::Focus => ControlCommand::WebView(WebViewCommand::Focus),
@@ -89,10 +90,15 @@ pub fn servo_host_send_controller_command_with_token(
     command.validate()?;
 
     with_token_host_mut(token, |handle| {
+        if matches!(command, ControllerCommand::StopLoading) {
+            return Err(ControllerCommandError::Backend(
+                "native stop loading is unsupported by Servo".into(),
+            ));
+        }
         queue_control_command(handle, into_control_command(command));
+        Ok(())
     })
-    .map_err(controller_error_from_token_message)?;
-    Ok(())
+    .map_err(controller_error_from_token_message)?
 }
 
 pub fn servo_host_send_controller_command_json_with_token(
@@ -522,9 +528,11 @@ mod tests {
     use std::ffi::CString;
     use std::sync::{Arc, Mutex};
 
+    type DialogCalls = Arc<Mutex<Vec<(String, bool, Option<String>)>>>;
+
     struct ControlResponseBackend {
         navigation_calls: Arc<Mutex<Vec<(String, bool)>>>,
-        dialog_calls: Arc<Mutex<Vec<(String, bool, Option<String>)>>>,
+        dialog_calls: DialogCalls,
     }
 
     impl AndroidRenderBackend for ControlResponseBackend {
@@ -617,6 +625,44 @@ mod tests {
 
     fn cstring(value: &str) -> CString {
         CString::new(value).expect("test strings should not contain interior NULs")
+    }
+
+    #[test]
+    fn stop_loading_rejects_before_queueing_and_preserves_token_errors() {
+        let host = servo_host_new(0);
+        let token = servo_host_controller_handle_token(host).unwrap();
+        let stop = || ControllerCommand::StopLoading;
+        assert_eq!(
+            servo_host_send_controller_command_with_token("bad", stop()),
+            Err(ControllerCommandError::InvalidControllerHandle)
+        );
+        let error = servo_host_send_controller_command_with_token(&token, stop()).unwrap_err();
+        assert!(matches!(error, ControllerCommandError::Backend(_)));
+        assert_eq!(controller_error_status(&error), ServoStatus::BackendError);
+        with_token_host_mut(&token, |handle| {
+            assert!(handle.pending_commands.is_empty());
+            assert!(handle
+                .dispatch_webview_command_runtime(WebViewCommand::StopLoading)
+                .is_err());
+            assert!(handle.pending_commands.is_empty());
+        })
+        .unwrap();
+        let token_c = cstring(&token);
+        let command_c = cstring(r#"{"version":1,"command":"stopLoading"}"#);
+        assert_eq!(
+            unsafe {
+                servo_host_send_controller_command_with_token_ffi(
+                    token_c.as_ptr(),
+                    command_c.as_ptr(),
+                )
+            },
+            ServoStatus::BackendError
+        );
+        unsafe { servo_host_free(host) };
+        assert_eq!(
+            servo_host_send_controller_command_with_token(&token, stop()),
+            Err(ControllerCommandError::ExpiredControllerHandle)
+        );
     }
 
     #[test]

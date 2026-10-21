@@ -284,6 +284,9 @@ impl ServoWebView {
         match command {
             WebViewCommand::LoadUrl(request) => self.load_url_request(request),
             WebViewCommand::Reload => self.reload(),
+            WebViewCommand::StopLoading => {
+                Err("native stop loading is unsupported by Servo".into())
+            }
             WebViewCommand::GoBack => self.go_back(),
             WebViewCommand::GoForward => self.go_forward(),
             WebViewCommand::Focus => self.focus(),

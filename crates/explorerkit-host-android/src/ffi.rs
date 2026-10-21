@@ -906,6 +906,11 @@ mod tests {
     use std::mem;
     use std::sync::{Arc, Mutex};
 
+    type TouchEvents = Arc<Mutex<Vec<(TouchEventKind, i32, f32, f32)>>>;
+    type SelectCalls = Arc<Mutex<Vec<(String, Vec<usize>)>>>;
+    type DialogCalls = Arc<Mutex<Vec<(String, bool, Option<String>)>>>;
+    type FileCalls = Arc<Mutex<Vec<(String, Vec<String>)>>>;
+
     fn cstring(value: &str) -> CString {
         CString::new(value).unwrap()
     }
@@ -976,7 +981,7 @@ mod tests {
         );
 
         let len = unsafe { servo_host_last_error_message_len(host) };
-        let mut buffer = vec![0u8; len as usize + 1];
+        let mut buffer = vec![0u8; len + 1];
         let written = unsafe {
             servo_host_last_error_message_copy(host, buffer.as_mut_ptr().cast(), buffer.len())
         };
@@ -1336,9 +1341,9 @@ mod tests {
     struct FakeAndroidBackend {
         attach_error: Option<String>,
         detach_error: Option<String>,
-        touch_events: Arc<Mutex<Vec<(TouchEventKind, i32, f32, f32)>>>,
+        touch_events: TouchEvents,
         context_menu_points: Arc<Mutex<Vec<(f32, f32)>>>,
-        select_element_resolutions: Arc<Mutex<Vec<(String, Vec<usize>)>>>,
+        select_element_resolutions: SelectCalls,
         update_events: Vec<HostEvent>,
     }
 
@@ -2236,7 +2241,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<(String, bool, Option<String>)>::new()));
 
         struct DialogBackend {
-            calls: Arc<Mutex<Vec<(String, bool, Option<String>)>>>,
+            calls: DialogCalls,
         }
 
         impl AndroidRenderBackend for DialogBackend {
@@ -2671,7 +2676,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<(String, bool, Option<String>)>::new()));
 
         struct DialogBackend {
-            calls: Arc<Mutex<Vec<(String, bool, Option<String>)>>>,
+            calls: DialogCalls,
         }
 
         impl AndroidRenderBackend for DialogBackend {
@@ -3004,7 +3009,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Vec::<(String, Vec<String>)>::new()));
 
         struct FilePickerBackend {
-            calls: Arc<Mutex<Vec<(String, Vec<String>)>>>,
+            calls: FileCalls,
         }
 
         impl AndroidRenderBackend for FilePickerBackend {

@@ -1227,6 +1227,23 @@ where
         dispatch_system_command(&mut self.views, &self.callbacks, webview, command)
     }
 
+    fn system_webview_is_loading(&mut self, webview: WebViewHandle) -> Result<bool, HostError> {
+        if self.view_is_servo(webview)? {
+            return Err(HostError::new(
+                "system-WebView loading state is unsupported by Servo",
+            ));
+        }
+        let native = system_state_mut(&mut self.views, webview)?
+            .webview
+            .as_ref()
+            .ok_or_else(|| HostError::new("system WebView has no native view yet"))?;
+        MainThreadMarker::new().ok_or_else(|| {
+            HostError::new("system WebView must be queried on the AppKit main thread")
+        })?;
+        // SAFETY: the retained WRY view is accessed on its AppKit owning thread.
+        Ok(unsafe { native.webview().isLoading() })
+    }
+
     fn resolve_navigation_request(
         &mut self,
         webview: WebViewHandle,
@@ -1605,6 +1622,9 @@ fn dispatch_system_command(
     command: &WebViewCommand,
 ) -> Result<Vec<HostEvent>, HostError> {
     let state = system_state_mut(views, webview)?;
+    if matches!(command, WebViewCommand::StopLoading) && state.webview.is_none() {
+        return Err(HostError::new("system WebView has no native view yet"));
+    }
     if should_queue_system_command(state.webview.is_some(), state.viewport.is_some(), command) {
         state.pending_commands.push_back(command.clone());
         return Ok(Vec::new());
@@ -1654,6 +1674,14 @@ fn apply_system_command(
         }
         WebViewCommand::Reload => {
             native.reload().map_err(wry_error)?;
+            None
+        }
+        WebViewCommand::StopLoading => {
+            MainThreadMarker::new().ok_or_else(|| {
+                HostError::new("system WebView must stop on the AppKit main thread")
+            })?;
+            // SAFETY: WRY retains this WKWebView and its delegates on the AppKit thread.
+            unsafe { native.webview().stopLoading() };
             None
         }
         WebViewCommand::GoBack => {
@@ -2176,6 +2204,9 @@ mod tests {
                 .borrow_mut()
                 .dispatch_webview_command(webview, command)
         }
+        fn system_webview_is_loading(&mut self, view: WebViewHandle) -> Result<bool, HostError> {
+            self.0.borrow_mut().system_webview_is_loading(view)
+        }
         fn observe_webview_events(
             &mut self,
             webview: WebViewHandle,
@@ -2591,6 +2622,43 @@ mod tests {
             replacement.drain(),
             vec![HostEvent::FocusChanged { is_focused: true }]
         );
+    }
+
+    #[test]
+    fn uninstantiated_system_stop_preserves_pending_load_and_callback_state() {
+        let (mut runtime, host) = staging_runtime();
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        runtime.load_url(view, "pending.test").unwrap();
+        runtime.drain_events();
+        let generation = system_state_mut(&mut host.borrow_mut().views, view)
+            .unwrap()
+            .generation;
+        assert!(runtime
+            .stop_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("no native view"));
+        assert!(runtime
+            .system_webview_is_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("no native view"));
+        let mut host = host.borrow_mut();
+        let state = system_state_mut(&mut host.views, view).unwrap();
+        assert_eq!(state.generation, generation);
+        assert_eq!(state.pending_commands.len(), 1);
+        assert!(matches!(
+            state.pending_commands.front(),
+            Some(WebViewCommand::LoadUrl(_))
+        ));
+        assert!(state.webview.is_none());
+        assert!(runtime.drain_events().is_empty());
+        assert!(!should_queue_system_command(
+            true,
+            false,
+            &WebViewCommand::StopLoading
+        ));
     }
 
     #[test]

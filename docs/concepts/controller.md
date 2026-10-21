@@ -63,11 +63,17 @@ duplicated.
 | --- | --- | --- |
 | `loadUrl` | `url` | Checks and normalizes the URL with `NavigationRequest::new`, then loads it |
 | `reload` | none | Reloads the page |
+| `stopLoading` | none | Submits native Stop where supported; unsupported adapters return an error |
 | `goBack` | none | Goes back in history |
 | `goForward` | none | Goes forward in history |
 | `focus` | none | Focuses the view |
 | `blur` | none | Removes focus |
 | `evaluateJavaScript` | `evaluationId`, `script` | Runs the script and sends a matching result event later |
+
+`stopLoading` is an ExplorerKit-owned command, not a Servo API mapping. It
+returns submission status, not cancellation completion. See
+[Stop loading](../reference/macos-system-webview.md#stop-loading) for its native
+semantics and [platform support](../reference/capabilities.md#stop-loading).
 
 ### Prompt answers
 
