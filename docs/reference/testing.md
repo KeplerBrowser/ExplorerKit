@@ -174,7 +174,8 @@ macOS session.
 ### System web view on macOS
 
 Rerun these when you change `MacOsViewHost`, system JavaScript evaluation,
-or system favicon decoding, history retention, child callbacks and native lifetimes.
+or system favicon decoding, history retention, callback scheduling, child callbacks
+and native lifetimes.
 
 Automatic regressions (macOS):
 
@@ -184,13 +185,23 @@ cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-sys
 
 These cover callback and runtime queue ordering, retiring pending requests on a
 same-URL commit, evaluation ID reuse, closing and replacing sibling views, and
-both orderings of process-termination and evaluation errors. Favicon regressions
+both orderings of process-termination and evaluation errors. Native-result wake
+regressions check publication before notification, released callback borrows,
+coalesced deferred drains, independent host wakers and stale-result suppression.
+Favicon regressions
 also check decoded first-frame pixels, malformed and oversized data, missing
 private-selector handling, per-view retirement at commit, process termination
 and destruction, retained history identity and reload invalidation, shared
 same-document data, byte and entry limits, eviction and orphan cleanup.
 
 Manual check in an interactive AppKit app:
+
+For callback scheduling changes, also use an otherwise idle native host whose
+waker schedules owning-thread updates and event drains. Check delayed title,
+load, evaluation and favicon results, original child creation and native close,
+source/child independence, and a separate native runtime's waker. Do not supply
+periodic SDK updates to rescue a missing notification. This check covers native
+result delivery; it does not remove URL/history sampling or Servo animation pacing.
 
 1. In one app-owned slot, create and destroy both `Servo` and `SystemWebView`
    views while a sibling Servo view keeps responding.

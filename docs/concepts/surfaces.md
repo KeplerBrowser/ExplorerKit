@@ -138,7 +138,12 @@ Your event loop drives ExplorerKit:
 3. Call `Runtime::drain_events()` and update your UI from the events.
 
 The waker you pass in `SurfaceHostOptions` is called when Servo needs another
-update, so your loop can sleep until then.
+update or a macOS system web view queues a native result, including child
+creation and closure. Schedule a later update on the owning thread, then drain
+events; do not call back into the runtime synchronously from the waker. A single
+wake can cover several results, and an extra wake can have no remaining work.
+Keep the host's animation cadence and URL/history sampling: these notifications
+do not make the update loop fully timerless.
 
 Input works the same way. Your app hit-tests its own layout, then sends
 pointer, wheel, keyboard, IME, and focus events that belong to the page as
