@@ -205,7 +205,12 @@ Automatic regressions (macOS):
 
 ```sh
 cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-system-webview --lib --locked
+cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-system-webview --test macos-system-configuration --locked
 ```
+
+The configuration regression runs on the process main thread with an ephemeral
+store. It checks that configurations share only their native pool and store,
+while configurations, preferences and content controllers stay independent.
 
 These cover callback and runtime queue ordering, retiring pending requests on a
 same-URL commit, evaluation ID reuse, closing and replacing sibling views, and
