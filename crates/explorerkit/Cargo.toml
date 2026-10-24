@@ -4,6 +4,12 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
+[[test]]
+name = "macos-system-configuration"
+path = "tests/macos_system_configuration.rs"
+required-features = ["macos-system-webview"]
+harness = false
+
 [[example]]
 name = "multiple-native-views"
 path = "examples/multiple-native-views/main.rs"
@@ -63,7 +69,7 @@ objc2-core-foundation = { workspace = true, optional = true }
 objc2-app-kit = { workspace = true, optional = true }
 objc2 = { workspace = true, optional = true }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSJSONSerialization", "NSNull", "NSData", "NSString", "NSValue", "NSURL", "NSURLRequest"], optional = true }
-objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKUIDelegate", "WKNavigationAction", "WKWindowFeatures", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKUIDelegate", "WKNavigationAction", "WKWindowFeatures", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
 serde_json = { version = "1", optional = true }
 surfman = { workspace = true, optional = true }
 wry = { workspace = true, optional = true }

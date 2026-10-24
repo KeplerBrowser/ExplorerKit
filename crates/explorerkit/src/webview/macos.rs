@@ -29,10 +29,12 @@ use wry::{
 
 use crate::surface::{SurfaceEventLoopWaker, SurfaceFrame, SurfaceHost, SurfaceHostOptions};
 
+mod configuration;
 mod favicon;
 mod javascript;
 mod native_callbacks;
 
+use configuration::SystemWebViewContext;
 use native_callbacks::SystemUiDelegateRegistration;
 use objc2_web_kit::{WKNavigationAction, WKWebView, WKWebViewConfiguration, WKWindowFeatures};
 
@@ -716,6 +718,7 @@ pub struct MacOsViewHost<S> {
     servo: SurfaceHost<S>,
     webkit_data_store_identifier: WebKitDataStoreIdentifier,
     views: HashMap<WebViewHandle, MacOsView>,
+    system_context: Option<SystemWebViewContext>,
     callbacks: Rc<RefCell<SystemCallbacks>>,
     registrar: Option<WebViewRegistrar>,
     next_generation: u64,
@@ -733,6 +736,7 @@ impl<S> MacOsViewHost<S> {
             servo,
             webkit_data_store_identifier: options.webkit_data_store_identifier,
             views: HashMap::new(),
+            system_context: None,
             callbacks: Rc::new(RefCell::new(SystemCallbacks::new(wake))),
             registrar: None,
             next_generation: 0,
@@ -1542,7 +1546,13 @@ where
         matches!(pending_commands.first(), Some(WebViewCommand::LoadUrl(_)));
 
     let container = AppKitContainer::new(&parent)?;
-    let built = { build_system_webview(&container, viewport, data_store_identifier, sink.clone()) };
+    let built = build_system_webview(
+        &container,
+        viewport,
+        data_store_identifier,
+        sink.clone(),
+        &mut host.system_context,
+    );
 
     let native = match built {
         Ok(native) => native,
@@ -1603,12 +1613,21 @@ fn build_system_webview(
     viewport: SurfaceViewport,
     data_store_identifier: WebKitDataStoreIdentifier,
     sink: SystemCallbackSink,
+    context: &mut Option<SystemWebViewContext>,
 ) -> Result<WebView, HostError> {
-    system_webview_builder(sink)
+    let mut builder = system_webview_builder(sink)
         .with_bounds(wry_rect(viewport))
-        .with_data_store_identifier(data_store_identifier.0)
-        .build_as_child(parent)
-        .map_err(wry_error)
+        .with_data_store_identifier(data_store_identifier.0);
+    if let Some(context) = context {
+        builder = builder.with_webview_configuration(context.configuration());
+    }
+    let native = builder.build_as_child(parent).map_err(wry_error)?;
+    if context.is_none() {
+        // SAFETY: WRY constructed this native view on AppKit's thread.
+        let configuration = unsafe { native.webview().configuration() };
+        *context = Some(SystemWebViewContext::from_configuration(&configuration));
+    }
+    Ok(native)
 }
 
 fn system_webview_builder(sink: SystemCallbackSink) -> WebViewBuilder<'static> {
