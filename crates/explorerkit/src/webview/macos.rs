@@ -162,6 +162,8 @@ type CallbackTarget = (u64, u64);
 struct SystemCallbacks {
     views: HashMap<CallbackTarget, SystemCallbackState>,
     wake: SurfaceEventLoopWaker,
+    #[cfg(test)]
+    liveness_checks: Cell<usize>,
 }
 
 impl SystemCallbacks {
@@ -169,6 +171,8 @@ impl SystemCallbacks {
         Self {
             views: HashMap::new(),
             wake,
+            #[cfg(test)]
+            liveness_checks: Cell::new(0),
         }
     }
 }
@@ -443,7 +447,12 @@ impl SystemCallbackSink {
     }
 
     fn is_live(&self) -> bool {
-        self.callbacks.borrow().views.contains_key(&self.target)
+        let callbacks = self.callbacks.borrow();
+        #[cfg(test)]
+        callbacks
+            .liveness_checks
+            .set(callbacks.liveness_checks.get() + 1);
+        callbacks.views.contains_key(&self.target)
     }
 }
 
@@ -1228,7 +1237,23 @@ where
     }
 
     fn system_webview_is_loading(&mut self, webview: WebViewHandle) -> Result<bool, HostError> {
-        if self.view_is_servo(webview)? {
+        // Reconcile only this target; full update/shutdown paths collect unrelated
+        // owners. A newly registered native child is queryable before any pump.
+        let child = self.pending_children.borrow_mut().remove(&webview);
+        if let Some(state) = child {
+            self.views.insert(webview, MacOsView::System(state));
+        }
+        if let Some(MacOsView::System(state)) = self.views.get(&webview) {
+            if !self.system_sink(webview, state.generation).is_live()
+                && !state
+                    .ui_registration
+                    .as_ref()
+                    .is_some_and(|ui| ui.is_active())
+            {
+                self.views.remove(&webview);
+                return Err(unknown_webview(webview));
+            }
+        } else if self.view_is_servo(webview)? {
             return Err(HostError::new(
                 "system-WebView loading state is unsupported by Servo",
             ));
@@ -2277,6 +2302,108 @@ mod tests {
             SurfaceViewport::new(SurfaceSize::new(120, 90), 1.0),
         );
         child
+    }
+
+    #[test]
+    fn loading_queries_validate_one_system_lifetime_per_call_without_a_pump() {
+        for count in [4, 24, 62] {
+            for staged in [false, true] {
+                let (mut runtime, host) = staging_runtime();
+                let session = runtime.create_session();
+                let source = runtime.create_webview(session).unwrap();
+                let views: Vec<_> = (0..count)
+                    .map(|_| {
+                        if staged {
+                            staged_child(&host.borrow(), source)
+                        } else {
+                            runtime.create_webview(session).unwrap()
+                        }
+                    })
+                    .collect();
+                host.borrow().callbacks.borrow().liveness_checks.set(0);
+                for (index, &view) in views.iter().enumerate() {
+                    assert!(runtime
+                        .system_webview_is_loading(view)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("no native view"));
+                    assert_eq!(
+                        host.borrow().pending_children.borrow().len(),
+                        if staged { count - index - 1 } else { 0 },
+                        "a query adopts only its own original child"
+                    );
+                }
+                assert_eq!(
+                    host.borrow().callbacks.borrow().liveness_checks.get(),
+                    count,
+                    "query bookkeeping must not walk sibling views"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn loading_query_adopts_nested_children_and_rejects_retired_targets() {
+        let (mut runtime, host) = staging_runtime();
+        let session = runtime.create_session();
+        let source = runtime.create_webview(session).unwrap();
+        let child = staged_child(&host.borrow(), source);
+        let nested = staged_child(&host.borrow(), child);
+        assert!(runtime
+            .system_webview_is_loading(nested)
+            .unwrap_err()
+            .to_string()
+            .contains("no native view"));
+        assert!(host.borrow().views.contains_key(&nested));
+        assert!(host.borrow().pending_children.borrow().contains_key(&child));
+
+        runtime.destroy_webview(source).unwrap();
+        assert!(runtime
+            .system_webview_is_loading(nested)
+            .unwrap_err()
+            .to_string()
+            .contains("no native view"));
+        host.borrow().system_sink(nested, 1).invalidate();
+        assert!(host
+            .borrow_mut()
+            .system_webview_is_loading(nested)
+            .unwrap_err()
+            .to_string()
+            .contains("not registered"));
+        assert!(!host.borrow().views.contains_key(&nested));
+        assert!(host.borrow().views.contains_key(&child));
+
+        host.borrow()
+            .registrar
+            .as_ref()
+            .unwrap()
+            .retire_webview(nested);
+        assert_eq!(
+            runtime.system_webview_is_loading(nested),
+            Err(ExplorerKitError::UnknownWebView(nested))
+        );
+        runtime.destroy_webview(child).unwrap();
+        assert_eq!(
+            runtime.system_webview_is_loading(child),
+            Err(ExplorerKitError::UnknownWebView(child))
+        );
+    }
+
+    #[test]
+    fn loading_query_preserves_servo_and_unknown_handle_errors() {
+        let mut runtime = runtime();
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        assert!(runtime
+            .system_webview_is_loading(view)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported by Servo"));
+        runtime.destroy_webview(view).unwrap();
+        assert_eq!(
+            runtime.system_webview_is_loading(view),
+            Err(ExplorerKitError::UnknownWebView(view))
+        );
     }
 
     #[test]
