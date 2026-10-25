@@ -58,10 +58,15 @@ native Rust, but its React Native wiring is incomplete and not supported.
   WebKit API and work only when that API is available. Post-load changes to an
   icon link are not reported; changing its `href` or inserting another icon
   link does not trigger native discovery on the tested WebKit version.
-  PNG and ICO pixels are validated; SVG decoding is not supported by this
-  adapter. Malformed, oversized or undecodable images supply no replacement
-  image. Committed documents restore retained native history icons or report
-  `None` so the app can show its fallback; see the retention limits below.
+  PNG, ICO and guarded native SVG-to-PNG pixels are validated. SVG requires an
+  available public AppKit reader that exclusively identifies SVG. Ordered
+  selection requires public client-world evaluation and a matchable one-shot
+  DOM snapshot; unavailable or unmatched metadata uses the documented
+  compatibility behavior. Malformed,
+  oversized or undecodable images supply no replacement image. Committed
+  documents restore retained native history icons or report `None` so the app
+  can show its fallback; see the decoding and retention limits in the macOS
+  rules below.
 - **Android and iOS adapters:** no supported public favicon callback.
 
 See [the macOS event and lifetime rules](macos-system-webview.md#favicons).

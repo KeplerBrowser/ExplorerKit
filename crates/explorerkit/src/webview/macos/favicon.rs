@@ -15,11 +15,21 @@ use objc2::{
     runtime::AnyObject,
     sel, DefinedClass, MainThreadOnly,
 };
-use objc2_foundation::{NSData, NSObject, NSObjectProtocol};
-use objc2_web_kit::{WKBackForwardListItem, WKWebView};
+use objc2_foundation::{
+    NSData, NSDictionary, NSError, NSObject, NSObjectProtocol, NSString, NSURL,
+};
+use objc2_web_kit::{WKBackForwardListItem, WKContentWorld, WKWebView};
 use wry::{WebView, WebViewExtMacOS};
 
-use super::SystemCallbackSink;
+use super::{
+    javascript::{native_error, NativeEvaluationError},
+    SystemCallbackSink,
+};
+
+mod selection;
+mod svg;
+pub(super) use selection::{decline, Candidate, Selection};
+use selection::{Key, Pending};
 
 type DataCompletion = Block<dyn Fn(*mut NSData)>;
 type LoadDecision = Block<dyn Fn(*mut DataCompletion)>;
@@ -35,31 +45,172 @@ define_class!(
     impl IconDelegate {
         #[unsafe(method(webView:shouldLoadIconWithParameters:completionHandler:))]
         fn should_load_icon(&self, _view: &WKWebView, parameters: &AnyObject, decision: &LoadDecision) {
-            // SAFETY: _WKLinkIconParameters declares iconType as NSInteger;
-            // WKLinkIconTypeFavicon is zero. WebKit owns candidate discovery.
+            // SAFETY: WebKit's iconType is NSInteger; standard favicons are zero.
             let icon_type: isize = unsafe { msg_send![parameters, iconType] };
             let sink = self.ivars().clone();
-            let token = (icon_type == 0).then(|| sink.begin_favicon()).flatten();
-            let Some(token) = token else {
+            let Some(token) = (icon_type == 0).then(|| sink.begin_favicon()).flatten() else {
                 decision.call((std::ptr::null_mut(),));
                 return;
             };
-            let completion = RcBlock::new(move |data: *mut NSData| {
-                if !sink.favicon_is_current(token) { return; }
-                // SAFETY: WebKit lends NSData for this main-thread callback.
-                // Decoding copies pixels; no borrowed bytes escape.
-                if let Some(data) = unsafe { data.as_ref() }.filter(|data| data.len() <= MAX_ENCODED_BYTES) {
-                    let bytes = data.to_vec();
-                    if let Some(icon) = decode_bytes(&bytes) {
-                        sink.complete_native_favicon(token, icon, bytes);
-                    }
-                }
-            });
-            // WebKit copies this data completion before returning its decision.
-            decision.call((RcBlock::as_ptr(&completion),));
+            let pending = Pending { key: native_key(parameters), decision: decision.copy() };
+            let action = {
+                let mut callbacks = sink.callbacks.borrow_mut();
+                let Some(state) = callbacks.views.get_mut(&sink.target) else {
+                    drop(callbacks);
+                    decline(vec![pending]);
+                    return;
+                };
+                state.favicon_selection.hold(pending)
+            };
+            match action {
+                Ok(true) => collect(_view, sink, token),
+                Ok(false) => {},
+                Err(pending) => release(&sink, token, pending),
+            }
         }
     }
 );
+
+// WHATWG HTML rel=icon: snapshot DOM order/media once; WebKit still owns all loads.
+const SNAPSHOT: &str = r#"JSON.stringify([...document.querySelectorAll('link')].filter(e =>
+ e instanceof HTMLLinkElement && [...e.relList].some(t => t.toLowerCase() === 'icon')).map(e => ({
+ url:e.href, attributes:Object.fromEntries([...e.attributes].map(a => [a.localName,a.value])),
+ media:!e.media || matchMedia(e.media).matches, sizes:[...e.sizes]
+})))"#;
+
+fn native_key(parameters: &AnyObject) -> Option<Key> {
+    if !unsafe { msg_send![parameters, respondsToSelector: sel!(attributes)] } {
+        return None;
+    }
+    // SAFETY: _WKLinkIconParameters's declared native properties are copied here.
+    unsafe {
+        let url: Option<Retained<NSURL>> = msg_send![parameters, url];
+        let attributes: Option<Retained<NSDictionary<NSString, NSString>>> =
+            msg_send![parameters, attributes];
+        let (names, values) = attributes?.to_vecs();
+        Some(Key {
+            url: url?.absoluteString()?.to_string(),
+            attributes: names
+                .iter()
+                .zip(&values)
+                .map(|(name, value)| (name.to_string(), value.to_string()))
+                .collect(),
+        })
+    }
+}
+
+fn collect(view: &WKWebView, sink: SystemCallbackSink, token: u64) {
+    let selector = sel!(evaluateJavaScript:inFrame:inContentWorld:completionHandler:);
+    if !view.respondsToSelector(selector) {
+        finish_collection(&sink, token, None);
+        return;
+    }
+    let completion = RcBlock::new(move |value: *mut AnyObject, error: *mut NSError| {
+        if !sink.favicon_is_current(token) {
+            return;
+        }
+        // SAFETY: WebKit lends these objects for this main-thread completion.
+        unsafe {
+            if let Some(error) = error.as_ref() {
+                if matches!(
+                    native_error(error),
+                    NativeEvaluationError::ProcessTerminated
+                        | NativeEvaluationError::ViewInvalidated
+                ) {
+                    sink.favicon_lifetime_error(token);
+                    return;
+                }
+            }
+            let json = error
+                .is_null()
+                .then(|| {
+                    value
+                        .as_ref()?
+                        .downcast_ref::<NSString>()
+                        .map(|s| s.to_string())
+                })
+                .flatten();
+            finish_collection(&sink, token, json.as_deref());
+        }
+    });
+    // SAFETY: selector availability also establishes WKContentWorld (macOS11); no view is captured.
+    unsafe {
+        view.evaluateJavaScript_inFrame_inContentWorld_completionHandler(
+            &NSString::from_str(SNAPSHOT),
+            None,
+            &WKContentWorld::defaultClientWorld(view.mtm()),
+            Some(&completion),
+        );
+    }
+}
+
+fn finish_collection(sink: &SystemCallbackSink, token: u64, json: Option<&str>) {
+    let pending = {
+        let mut callbacks = sink.callbacks.borrow_mut();
+        let Some(state) = callbacks.views.get_mut(&sink.target) else {
+            return;
+        };
+        if !state.document_ready || state.favicon_request != token {
+            return;
+        }
+        state.favicon_selection.settle(json)
+    };
+    if let Some(pending) = pending {
+        for request in pending {
+            release(sink, token, request);
+        }
+    }
+}
+
+fn release(sink: &SystemCallbackSink, token: u64, pending: Pending) {
+    if !sink.favicon_is_current(token) {
+        decline(vec![pending]);
+        return;
+    }
+    let svg = svg::available();
+    let candidate = {
+        let callbacks = sink.callbacks.borrow();
+        callbacks
+            .views
+            .get(&sink.target)
+            .map(|state| state.favicon_selection.classify(pending.key.as_ref(), svg))
+            .unwrap_or(Candidate::Rejected)
+    };
+    if candidate == Candidate::Rejected {
+        decline(vec![pending]);
+        return;
+    }
+    let completion_sink = sink.clone();
+    let completion = RcBlock::new(move |data: *mut NSData| {
+        if !completion_sink.favicon_is_current(token) {
+            return;
+        }
+        // SAFETY: WebKit lends NSData on the main thread. All output bytes are owned.
+        if let Some(data) = unsafe { data.as_ref() }.filter(|data| data.len() <= MAX_ENCODED_BYTES)
+        {
+            let bytes = data.to_vec();
+            if let Some((image, bytes)) = decode_native(bytes) {
+                completion_sink.complete_native_favicon(token, image, bytes, candidate);
+            }
+        }
+    });
+    if sink.favicon_is_current(token) {
+        pending.decision.call((RcBlock::as_ptr(&completion),));
+    } else {
+        decline(vec![pending]);
+    }
+}
+
+fn decode_native(bytes: Vec<u8>) -> Option<(FaviconImage, Vec<u8>)> {
+    if bytes.is_empty() || bytes.len() > MAX_ENCODED_BYTES {
+        return None;
+    }
+    if image::guess_format(&bytes).is_ok() {
+        return decode_bytes(&bytes).map(|image| (image, bytes));
+    }
+    let png = svg::normalize(&bytes)?;
+    decode_bytes(&png).map(|image| (image, png))
+}
 
 pub(super) struct IconRegistration {
     view: Retained<WKWebView>,
@@ -365,6 +516,100 @@ mod tests {
             .write_to(&mut encoded, format)
             .unwrap();
         encoded.into_inner()
+    }
+
+    #[test]
+    fn old_metadata_cannot_release_or_retire_a_new_document_queue() {
+        use super::super::SystemCallbacks;
+        use std::cell::Cell;
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(std::sync::Arc::new(
+            || {},
+        ))));
+        let sink = SystemCallbackSink::register_raw(callbacks.clone(), 1, 1);
+        sink.document_committed();
+        let old = sink.begin_favicon().unwrap();
+        sink.document_committed();
+        let current = sink.begin_favicon().unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let count = calls.clone();
+        let decision = RcBlock::new(move |data: *mut DataCompletion| {
+            assert!(data.is_null());
+            count.set(count.get() + 1);
+        });
+        callbacks
+            .borrow_mut()
+            .views
+            .get_mut(&sink.target)
+            .unwrap()
+            .favicon_selection
+            .hold(Pending {
+                key: None,
+                decision,
+            })
+            .ok()
+            .unwrap();
+        finish_collection(&sink, old, Some("[]"));
+        sink.favicon_lifetime_error(old);
+        assert_eq!(calls.get(), 0);
+        assert!(sink.favicon_is_current(current));
+        sink.document_committed();
+        assert_eq!(calls.get(), 1);
+        finish_collection(&sink, current, None);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn retirement_consumes_held_decisions_once_without_callback_borrows() {
+        use super::super::{NativeEvaluationError, SystemCallbacks};
+        use std::cell::Cell;
+        for reason in ["commit", "process", "evaluation", "metadata", "destroy"] {
+            let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(std::sync::Arc::new(
+                || {},
+            ))));
+            let sink = SystemCallbackSink::register_raw(callbacks.clone(), 1, 1);
+            sink.document_committed();
+            sink.drain();
+            let epoch = sink.begin_favicon().unwrap();
+            let calls = Rc::new(Cell::new(0));
+            let count = calls.clone();
+            let reentrant = callbacks.clone();
+            let decision = RcBlock::new(move |data: *mut DataCompletion| {
+                assert!(data.is_null());
+                let _borrow = reentrant.borrow_mut();
+                count.set(count.get() + 1);
+            });
+            callbacks
+                .borrow_mut()
+                .views
+                .get_mut(&sink.target)
+                .unwrap()
+                .favicon_selection
+                .hold(Pending {
+                    key: None,
+                    decision,
+                })
+                .ok()
+                .unwrap();
+            match reason {
+                "commit" => sink.document_committed(),
+                "process" => sink.process_terminated(),
+                "evaluation" => {
+                    let token = sink.begin_evaluation("native").unwrap().unwrap();
+                    sink.complete_evaluation(
+                        "native",
+                        token,
+                        Err(NativeEvaluationError::ViewInvalidated),
+                    );
+                }
+                "metadata" => sink.favicon_lifetime_error(epoch),
+                "destroy" => sink.invalidate(),
+                _ => unreachable!(),
+            }
+            assert_eq!(calls.get(), 1, "{reason}");
+            finish_collection(&sink, epoch, Some("[]"));
+            sink.favicon_lifetime_error(epoch);
+            assert_eq!(calls.get(), 1);
+        }
     }
 
     #[test]

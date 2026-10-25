@@ -259,7 +259,19 @@ result delivery; it does not remove URL/history sampling or Servo animation paci
    history, stale completions and pruning. Confirm `Started` precedes the commit
    favicon event and missing data reports `None`. Confirm cookie-gated
    icons use the view's WebKit data store and a separate store stays isolated.
-   Post-load DOM icon changes are outside this native capability; see
+   Use truthful 16/32-pixel declarations and vary success/failure completion
+   order. Check equal-size DOM ties, native media matching, declared MIME hints,
+   duplicate declarations, unavailable and unmatched metadata, and that a
+   failed candidate cannot suppress a valid one. Confirm the private metadata
+   query settles held native decisions once without delaying document completion
+   indefinitely or emitting app evaluation results. Exercise metadata/data
+   retirement at commit, process/view invalidation and close.
+   For SVG, check public format qualification, native inferred/fractional sizes,
+   exact straight-alpha pixels, native object/byte lifetime, original and
+   normalized encoded limits, output pixels and normalized history retention.
+   Include external-resource/profile controls and record synchronous conversion
+   costs without calling measurements worst-case bounds. Post-load DOM or theme
+   changes are outside this native capability; see
    [favicon limits](capabilities.md#favicons).
 
 7. For accepted children, install an attached AppKit destination provider and
