@@ -114,6 +114,29 @@ accepted design decision first.
     [What works where](docs/reference/capabilities.md) is the single source of
     truth for support claims.
 
+11. **Prefer standards over custom browser behavior.** For web-facing behavior,
+    start with the applicable normative specification and reuse the engine's
+    implementation through its native interface. Use WHATWG's
+    [HTML](https://html.spec.whatwg.org/), [DOM](https://dom.spec.whatwg.org/),
+    [URL](https://url.spec.whatwg.org/) and [Fetch](https://fetch.spec.whatwg.org/)
+    standards; the relevant [W3C specification](https://www.w3.org/TR/), including
+    CSS and SVG; [ECMAScript](https://tc39.es/ecma262/) for JavaScript; and the
+    applicable [IETF standard](https://www.rfc-editor.org/standards) for protocols.
+    Follow the specification's references and distinguish normative requirements,
+    optional behavior and draft proposals. Native embedding, ownership and
+    threading follow the library or platform's documented API contract.
+
+    Cite the exact relevant section in design decisions and derive acceptance
+    checks from it; use relevant [Web Platform Tests](https://web-platform-tests.org/)
+    as conformance evidence where available. Browser observations and engine
+    source explain implementation and compatibility, but do not silently replace
+    the standard. If an engine or its embedding API cannot provide the behavior,
+    record the concrete gap and propose the smallest supported solution. Keep
+    unsupported paths explicit under principle 9. Deliberate deviations need the
+    existing design approval process; do not recreate engine machinery or add
+    a new approval gate for ordinary standards-aligned work. Product choices
+    left open by the specification remain with the host app.
+
 ## Paths through the code
 
 ```text

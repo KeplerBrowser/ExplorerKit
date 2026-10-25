@@ -44,6 +44,10 @@ that area.
 ## Rules for changes
 
 - Keep diffs scoped to the approved ticket.
+- For web-facing behavior, follow the standards policy in
+  [Architecture principle 11](ARCHITECTURE.md#principles): identify and cite the
+  applicable normative section before choosing behavior, reuse the engine's
+  native implementation, and make acceptance checks cover that requirement.
 - Do not turn UBRN, Nitro, TurboModules, handwritten JSI, popup policy, or
   distribution mechanics into the architecture unless the ticket explicitly
   asks for it.
