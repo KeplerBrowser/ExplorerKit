@@ -187,6 +187,7 @@ struct SystemCallbackState {
     next_request: u64,
     pending: HashMap<String, u64>,
     favicon_request: u64,
+    favicon_selection: favicon::Selection,
     favicons: Option<favicon::IconState>,
 }
 
@@ -252,10 +253,12 @@ impl SystemCallbackSink {
     }
 
     fn document_committed(&self) {
+        let mut pending = Vec::new();
         self.publish(|state| {
             state.document_ready = true;
             state.document_navigation_pending = false;
             state.favicon_request = state.favicon_request.wrapping_add(1);
+            pending = state.favicon_selection.retire();
             state.events.push_back(HostEvent::LoadStatusChanged {
                 status: LoadStatusKind::Started,
             });
@@ -270,15 +273,18 @@ impl SystemCallbackSink {
             state.retire_evaluations(JavaScriptEvaluationErrorKind::DocumentNotFound);
             true
         });
+        favicon::decline(pending);
     }
 
     fn process_terminated(&self) {
+        let mut pending = Vec::new();
         self.publish(|state| {
             state.document_ready = false;
             if let Some(favicons) = &mut state.favicons {
                 favicons.clear();
             }
             state.favicon_request = state.favicon_request.wrapping_add(1);
+            pending = state.favicon_selection.retire();
             state.events.push_back(HostEvent::Crashed {
                 url: None,
                 reason: "WebKit web content process terminated".to_owned(),
@@ -287,6 +293,7 @@ impl SystemCallbackSink {
             state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
             true
         });
+        favicon::decline(pending);
     }
 
     fn begin_evaluation(&self, id: &str) -> Result<Option<u64>, HostError> {
@@ -327,6 +334,7 @@ impl SystemCallbackSink {
         token: u64,
         result: Result<String, NativeEvaluationError>,
     ) {
+        let mut pending = Vec::new();
         self.publish(|state| {
             // Commit/process retirement removes every old token. Check before any
             // state change: even an old process error must not invalidate a new read.
@@ -343,6 +351,7 @@ impl SystemCallbackSink {
                         favicons.clear();
                     }
                     state.favicon_request = state.favicon_request.wrapping_add(1);
+                    pending = state.favicon_selection.retire();
                     state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
                 }
                 result => {
@@ -358,6 +367,7 @@ impl SystemCallbackSink {
             }
             true
         });
+        favicon::decline(pending);
     }
 
     fn navigation_requested(&self) {
@@ -390,9 +400,15 @@ impl SystemCallbackSink {
         token: u64,
         image: explorerkit_embedder::FaviconImage,
         bytes: Vec<u8>,
+        candidate: favicon::Candidate,
     ) {
         self.publish(|state| {
-            if state.document_ready && state.favicon_request == token {
+            if state.document_ready
+                && state.favicon_request == token
+                && state
+                    .favicon_selection
+                    .accept(candidate, image.width, image.height)
+            {
                 if let Some(favicons) = &mut state.favicons {
                     favicons.retain(bytes, !state.document_navigation_pending);
                 }
@@ -406,13 +422,27 @@ impl SystemCallbackSink {
     }
 
     fn begin_favicon(&self) -> Option<u64> {
-        let mut callbacks = self.callbacks.borrow_mut();
-        let state = callbacks.views.get_mut(&self.target)?;
-        if !state.document_ready {
-            return None;
-        }
-        state.favicon_request = state.favicon_request.wrapping_add(1);
-        Some(state.favicon_request)
+        let callbacks = self.callbacks.borrow();
+        let state = callbacks.views.get(&self.target)?;
+        state.document_ready.then_some(state.favicon_request)
+    }
+
+    fn favicon_lifetime_error(&self, token: u64) {
+        let mut pending = Vec::new();
+        self.publish(|state| {
+            if !state.document_ready || state.favicon_request != token {
+                return false;
+            }
+            state.document_ready = false;
+            state.favicon_request = state.favicon_request.wrapping_add(1);
+            pending = state.favicon_selection.retire();
+            if let Some(favicons) = &mut state.favicons {
+                favicons.clear();
+            }
+            state.retire_evaluations(JavaScriptEvaluationErrorKind::InternalError);
+            true
+        });
+        favicon::decline(pending);
     }
 
     fn favicon_is_current(&self, token: u64) -> bool {
@@ -425,7 +455,7 @@ impl SystemCallbackSink {
 
     #[cfg(test)]
     fn complete_favicon(&self, token: u64, image: explorerkit_embedder::FaviconImage) {
-        self.complete_native_favicon(token, image, Vec::new());
+        self.complete_native_favicon(token, image, Vec::new(), favicon::Candidate::Compatibility);
     }
 
     fn drain(&self) -> Vec<HostEvent> {
@@ -445,7 +475,9 @@ impl SystemCallbackSink {
 
     fn invalidate(&self) {
         let previous = self.callbacks.borrow_mut().views.remove(&self.target);
-        drop(previous);
+        if let Some(mut previous) = previous {
+            favicon::decline(previous.favicon_selection.retire());
+        }
     }
 
     fn is_live(&self) -> bool {
@@ -2998,7 +3030,7 @@ mod tests {
     }
 
     #[test]
-    fn favicons_route_only_the_latest_request_to_its_runtime_view() {
+    fn current_document_favicon_successes_route_only_to_their_runtime_view() {
         let mut test = EvaluationRuntime::new();
         let (a, first) = test.view();
         let (b, second) = test.view();
@@ -3006,13 +3038,13 @@ mod tests {
         first.document_committed();
         second.document_committed();
         test.events();
-        let superseded = first.begin_favicon().unwrap();
+        let earlier = first.begin_favicon().unwrap();
         let latest = first.begin_favicon().unwrap();
         let sibling = second.begin_favicon().unwrap();
-        first.complete_favicon(superseded, favicon(1));
+        first.complete_favicon(earlier, favicon(1));
         second.complete_favicon(sibling, favicon(2));
         first.complete_favicon(latest, favicon(3));
-        first.complete_favicon(superseded, favicon(4));
+        first.complete_favicon(earlier, favicon(4));
         let events = test.events();
         assert_eq!(
             events
@@ -3020,12 +3052,15 @@ mod tests {
                 .filter(|(v, _)| *v == a)
                 .cloned()
                 .collect::<Vec<_>>(),
-            vec![(
-                a,
-                HostEvent::FaviconChanged {
-                    favicon: Some(favicon(3))
-                }
-            )]
+            vec![1, 3, 4]
+                .into_iter()
+                .map(|marker| (
+                    a,
+                    HostEvent::FaviconChanged {
+                        favicon: Some(favicon(marker))
+                    }
+                ))
+                .collect::<Vec<_>>()
         );
         assert_eq!(
             events

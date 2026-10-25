@@ -49,7 +49,7 @@ pub(super) fn evaluate(
     }
 }
 
-fn native_error(error: &NSError) -> NativeEvaluationError {
+pub(super) fn native_error(error: &NSError) -> NativeEvaluationError {
     use JavaScriptEvaluationErrorKind as Kind;
     // SAFETY: WKErrorDomain is WebKit's immutable framework constant.
     if &*error.domain() != unsafe { WKErrorDomain } {

@@ -1904,6 +1904,7 @@ dependencies = [
  "glow",
  "image",
  "io-surface",
+ "mime",
  "objc2",
  "objc2-app-kit",
  "objc2-core-foundation",

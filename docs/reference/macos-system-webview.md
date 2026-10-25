@@ -156,22 +156,54 @@ delegate and keeps the same behavior below.
 ## Favicons
 
 WebKit supplies standard favicon candidates and loads their image data in the
-view's own browser context. ExplorerKit decodes the first image into owned
-straight RGBA8 pixels and sends `HostEvent::FaviconChanged` through the existing
-runtime event stream. Match the event's view handle to the view whose icon you
-are displaying. Touch icons are ignored; ExplorerKit adds no downloader,
-resizing, animation playback, or app icon cache.
+view's own browser context. ExplorerKit sends owned first-image straight RGBA8
+pixels through `HostEvent::FaviconChanged`. Match the event's view handle to the
+view whose icon you display. Touch icons are ignored; ExplorerKit adds no
+downloader, animation playback, public candidate list, or app icon cache.
 
 The adapter uses WebKit's private icon-loading delegate alongside WRY's own
 navigation and UI delegates. If the private selector is unavailable, the view
 continues working and emits no favicon events. See
 [capability limits](capabilities.md#favicons) before depending on this behavior.
 
+For each committed document, the first standard icon decision starts one
+internal query in WebKit's public client content world for DOM order, type,
+media and sizes. Icon loading waits for that query. For candidates matching the snapshot, media must match the captured
+environment. A valid unsupported declared MIME type is declined; missing,
+empty or invalid hints are tried. The decoder checks the actual data, so a supported hint cannot make malformed data usable.
+
+Among matching candidates, prefer the highest usable short-edge bitmap
+resolution, capped by the largest usable finite declared size unless `any` is
+present. Missing or invalid sizes use the decoded dimensions. `any` uses the
+actual rasterized dimensions, not an infinite preference. Equal preferences use
+the last declaration in the collected DOM order, following
+[HTML's icon selection rule](https://html.spec.whatwg.org/multipage/links.html#rel-icon).
+The resolution score is ExplorerKit's choice for a generic pixel payload; the
+app still chooses its display size. Identical declarations share the last
+matching position; a better-resolution duplicate can improve the result.
+
+A usable lower preference can arrive while a better one is pending. Failure
+leaves that image alone, and a late lower preference cannot overwrite a better
+success. If the query is unavailable or fails, successful current-document
+images arrive in completion order. With a snapshot, unmatched native candidates
+can supply an image until a matched candidate succeeds. These compatibility
+paths preserve useful icons but do not promise DOM-order, media, type-hint or
+size selection. The snapshot is one-shot; later DOM or theme changes do not
+cause new discovery or selection.
+
 A new document commit retires unfinished icon work, including a reload of the
-same URL. A newer candidate supersedes unfinished work for the preceding
-candidate. Destroying the view ends its stream, while detaching its surface
+same URL. Destroying the view ends its stream, while detaching its surface
 keeps the native view and icon delegate alive. Already queued events stay in
 order; receiving an image does not prove its document is still current.
+
+SVG uses the registered public AppKit SVG reader when it can exclusively
+identify that format. It rasterizes at the finite positive native size at 1x,
+rounding fractional dimensions up, then normalizes to PNG for the existing
+pixel decoder and history store. Native size can be inferred even without
+authored dimensions. Other raster formats keep their existing decoder path.
+Original encoded inputs and normalized PNGs are limited to 16 MiB, and output
+to 4,194,304 pixels. AppKit parsing, drawing and encoding are synchronous;
+these checks do not cap AppKit's internal allocations or execution time.
 
 When the icon delegate is attached, each document commit queues
 the `Started` load status, then a favicon event. Back and Forward restore
@@ -187,9 +219,10 @@ native history-entry records, including the current entry. Known same-document
 entries share retained bytes. Entries removed from native history are pruned
 first, then least recently used records or data are evicted until both limits
 hold. An image larger than the retention budget can be delivered initially but
-cannot be restored from this store. Unknown native entries safely produce
-`None`; URLs are not used to guess document identity. Detaching preserves this
-state, and destroying the view releases it. The limits cover retained history
+cannot be restored from this store. SVG retention counts the normalized PNG,
+which can exceed the budget even when its source is small. Unknown native
+entries safely produce `None`; URLs are not used to guess document identity.
+Detaching preserves this state, and destroying the view releases it. The limits cover retained history
 data; transient decoding allocations and queued events are separate.
 
 ## Evaluating JavaScript
