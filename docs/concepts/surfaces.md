@@ -138,12 +138,21 @@ Your event loop drives ExplorerKit:
 3. Call `Runtime::drain_events()` and update your UI from the events.
 
 The waker you pass in `SurfaceHostOptions` is called when Servo needs another
-update or a macOS system web view queues a native result, including child
-creation and closure. Schedule a later update on the owning thread, then drain
+update or a macOS system web view changes native state or queues a result,
+including child creation and closure. Schedule a later update on the owning thread, then drain
 events; do not call back into the runtime synchronously from the waker. A single
 wake can cover several results, and an extra wake can have no remaining work.
-Keep the host's animation cadence and URL/history sampling: these notifications
-do not make the update loop fully timerless.
+System URL, navigation availability and favicon history no longer need periodic
+collection. Loading-only changes also wake the runtime, but may produce no tagged
+event. Before applying a loading-dependent UI batch, sample
+`Runtime::system_webview_is_loading` for each live system view whose loading UI
+the app tracks. The waker identifies the runtime, not the changed view. Discard
+those samples after submitting a new navigation command; an old Complete event
+must not override the current native loading flag.
+
+Keep servicing explicit commands, attachment/layout, the AppKit loop and the
+app's own input, presentation and animation work. These notifications do not
+make the whole update loop timerless or change Servo's animation pacing.
 
 Input works the same way. Your app hit-tests its own layout, then sends
 pointer, wheel, keyboard, IME, and focus events that belong to the page as

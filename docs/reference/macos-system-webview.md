@@ -215,7 +215,7 @@ shared same-document entries, before lookup. Decode failure supplies no replacem
 their existing engine behavior.
 
 Each system view retains at most 8 MiB of unique encoded icon bytes and 128
-native history-entry records, including the current entry. Known same-document
+image-history records, including the current entry. Known same-document
 entries share retained bytes. Entries removed from native history are pruned
 first, then least recently used records or data are evicted until both limits
 hold. An image larger than the retention budget can be delivered initially but
@@ -223,7 +223,20 @@ cannot be restored from this store. SVG retention counts the normalized PNG,
 which can exceed the budget even when its source is small. Unknown native
 entries safely produce `None`; URLs are not used to guess document identity.
 Detaching preserves this state, and destroying the view releases it. The limits cover retained history
-data; transient decoding allocations and queued events are separate.
+image data; transient decoding allocations and queued events are separate.
+
+Native URL, loading and back/forward availability notifications reconcile
+history at the callback boundary, including before a navigation policy decision.
+There is no history scan during Runtime event collection and no periodic SDK
+update is needed to preserve silent same-document entries. Separately from the
+image limits, each view keeps one retained native identity per item in the last
+observed native history list. This O(n) membership metadata distinguishes new
+aliases from old entries whose images were evicted; it has no additional entry
+cap or image payload. A pointer slot is about eight bytes on 64-bit systems,
+plus vector storage, and retaining an item can extend its native metadata
+lifetime. This is not a total memory or callback-time bound. Removed items are
+pruned at the next native boundary; normal commits preserve membership, detach
+keeps it, and process invalidation or destruction releases it.
 
 ## Evaluating JavaScript
 

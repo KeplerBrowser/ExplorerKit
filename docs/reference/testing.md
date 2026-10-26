@@ -221,7 +221,12 @@ Favicon regressions
 also check decoded first-frame pixels, malformed and oversized data, missing
 private-selector handling, per-view retirement at commit, process termination
 and destruction, retained history identity and reload invalidation, shared
-same-document data, byte and entry limits, eviction and orphan cleanup.
+same-document data, byte and entry limits, eviction and orphan cleanup. Native
+membership regressions distinguish new silent aliases from preexisting evicted
+entries, prune during guarded navigation before retention, and keep native
+membership independent of the image-record budget. Cached-state regressions
+cover initial values, burst coalescing, result-before-state ordering and stale
+generations without a native view.
 
 Manual check in an interactive AppKit app:
 
@@ -229,8 +234,18 @@ For callback scheduling changes, also use an otherwise idle native host whose
 waker schedules owning-thread updates and event drains. Check delayed title,
 load, evaluation and favicon results, original child creation and native close,
 source/child independence, and a separate native runtime's waker. Do not supply
-periodic SDK updates to rescue a missing notification. This check covers native
-result delivery; it does not remove URL/history sampling or Servo animation pacing.
+periodic SDK updates to rescue a missing notification. Also cover delayed URL
+changes, silent same-URL aliases followed by Back to current and older aliases,
+reload, image eviction and foreign JavaScript traversal without refetch rescue,
+Stop/failure/replacement/redirect, detach/reattach, construction failure and
+same-handle native replacement. Verify initial observations before SDK root
+navigation and before returning original children, one registration per native
+lifetime, removal before native release, stale-generation suppression and child
+survival after source destruction. Explicit idle collections must perform no
+native state/history reads. Audit new native symbols and build/link against the
+packaged macOS 14.0 deployment target. Record the actual runtime OS; a minimum
+deployment-target build is not an older-OS runtime test. This check preserves
+Servo animation pacing and does not remove the host's own AppKit/input work.
 
 1. In one app-owned slot, create and destroy both `Servo` and `SystemWebView`
    views while a sibling Servo view keeps responding.
