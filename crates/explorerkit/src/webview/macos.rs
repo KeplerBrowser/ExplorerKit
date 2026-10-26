@@ -33,6 +33,7 @@ mod configuration;
 mod favicon;
 mod javascript;
 mod native_callbacks;
+mod observation;
 
 use configuration::SystemWebViewContext;
 use native_callbacks::SystemUiDelegateRegistration;
@@ -181,6 +182,8 @@ impl SystemCallbacks {
 
 #[derive(Default)]
 struct SystemCallbackState {
+    observed_url: Option<String>,
+    observed_navigation_state: Option<(bool, bool)>,
     events: VecDeque<HostEvent>,
     document_ready: bool,
     document_navigation_pending: bool,
@@ -371,6 +374,8 @@ impl SystemCallbackSink {
     }
 
     fn navigation_requested(&self) {
+        // Capture silent same-document aliases before policy guards the departing page.
+        self.observe_favicon_history();
         if let Some(state) = self.callbacks.borrow_mut().views.get_mut(&self.target) {
             // Do not infer same-document lineage from a list change between
             // navigation policy and commit. A failed provisional navigation can
@@ -393,6 +398,18 @@ impl SystemCallbackSink {
                 }
             }
         }
+    }
+
+    fn native_state_observed(&self, url: Option<String>, navigation: (bool, bool)) {
+        self.observe_favicon_history();
+        self.publish(|state| {
+            // A nil URL after process termination must not hide queued results.
+            if let Some(url) = url {
+                state.observed_url = Some(url);
+            }
+            state.observed_navigation_state = Some(navigation);
+            true
+        });
     }
 
     fn complete_native_favicon(
@@ -499,6 +516,7 @@ struct SystemWebViewState {
     generation: u64,
     ui_registration: Option<SystemUiDelegateRegistration>,
     icon_registration: Option<favicon::IconRegistration>,
+    observation: Option<observation::Registration>,
     webview: Option<WebView>,
     container: Option<AppKitContainer>,
     destination_parent: Option<Rc<dyn HasWindowHandle>>,
@@ -515,6 +533,7 @@ impl SystemWebViewState {
             generation,
             ui_registration: None,
             icon_registration: None,
+            observation: None,
             webview: None,
             container: None,
             destination_parent: None,
@@ -674,7 +693,8 @@ impl SystemNewWebView {
             wants_popup: request.wants_popup,
         };
         state.ui_registration = Some(ui);
-        state.icon_registration = favicon::IconRegistration::attach(&native, sink);
+        state.icon_registration = favicon::IconRegistration::attach(&native, sink.clone());
+        state.observation = Some(observation::Registration::attach(&native, sink));
         state.webview = Some(native);
         state.container = Some(container);
         state.destination_parent = Some(destination.parent);
@@ -1606,6 +1626,7 @@ where
     let state = system_state_mut(&mut host.views, webview)?;
     state.ui_registration = Some(ui);
     state.icon_registration = favicon::IconRegistration::attach(&native, sink.clone());
+    state.observation = Some(observation::Registration::attach(&native, sink.clone()));
     state.webview = Some(native);
     state.container = Some(container);
     let mut events = Vec::new();
@@ -1623,10 +1644,11 @@ where
     if let Err(error) = result {
         let ui = state.ui_registration.take();
         let icon = state.icon_registration.take();
+        let observation = state.observation.take();
         let native = state.webview.take();
         let container = state.container.take();
         sink.invalidate();
-        drop((ui, icon, native, container));
+        drop((ui, icon, observation, native, container));
         host.reset_system_generation(webview);
         return Err(error);
     }
@@ -1816,37 +1838,31 @@ fn collect_system_updates(
         target: (webview.raw(), generation),
         callbacks: callbacks.clone(),
     };
-    sink.observe_favicon_history();
     let mut events = sink.drain();
+    let (url, navigation_state) = callbacks
+        .borrow()
+        .views
+        .get(&sink.target)
+        .map(|state| (state.observed_url.clone(), state.observed_navigation_state))
+        .unwrap_or_default();
     let state = system_state_mut(views, webview)?;
-    let Some(native) = state.webview.as_ref() else {
-        return Ok(events);
-    };
-
-    // WebKit can clear URL after process termination. WRY's URL convenience
-    // method unwraps it; use the native optional value so queued crash/evaluation
-    // events still reach Runtime, without inventing a replacement URL.
-    // SAFETY: the retained WRY view is accessed on its AppKit owning thread.
-    if let Some(url) = unsafe { native.webview().URL() }
-        .and_then(|url| url.absoluteString())
-        .map(|url| url.to_string())
-    {
+    // Diff the latest native observation at drain time, preserving burst coalescing
+    // and queued-result order without state or history reads from WebKit.
+    if let Some(url) = url {
         if state.last_url.as_deref() != Some(url.as_str()) {
             state.last_url = Some(url.clone());
             events.push(HostEvent::UrlChanged { url });
         }
     }
 
-    let navigation_state = (
-        native.can_go_back().map_err(wry_error)?,
-        native.can_go_forward().map_err(wry_error)?,
-    );
-    if state.last_navigation_state != Some(navigation_state) {
-        state.last_navigation_state = Some(navigation_state);
-        events.push(HostEvent::NavigationStateChanged {
-            can_go_back: navigation_state.0,
-            can_go_forward: navigation_state.1,
-        });
+    if let Some(navigation_state) = navigation_state {
+        if state.last_navigation_state != Some(navigation_state) {
+            state.last_navigation_state = Some(navigation_state);
+            events.push(HostEvent::NavigationStateChanged {
+                can_go_back: navigation_state.0,
+                can_go_forward: navigation_state.1,
+            });
+        }
     }
     Ok(events)
 }
@@ -2069,6 +2085,81 @@ mod tests {
                 WebKitDataStoreIdentifier([0x34; 16]),
             ),
         ))
+    }
+
+    #[test]
+    fn native_state_wakes_after_publication_even_without_a_queued_event() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        thread_local! {
+            static CALLBACKS: RefCell<Weak<RefCell<SystemCallbacks>>> = const { RefCell::new(Weak::new()) };
+        }
+        let wakes = Arc::new(AtomicUsize::new(0));
+        let observed = wakes.clone();
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(Arc::new(move || {
+            CALLBACKS.with(|slot| {
+                let callbacks = slot.borrow().upgrade().unwrap();
+                let callbacks = callbacks
+                    .try_borrow_mut()
+                    .expect("wake outside state borrow");
+                let state = callbacks.views.get(&(1, 1)).unwrap();
+                assert_eq!(state.observed_navigation_state, Some((false, false)));
+                assert!(state.events.is_empty());
+            });
+            observed.fetch_add(1, Ordering::Relaxed);
+        }))));
+        CALLBACKS.with(|slot| *slot.borrow_mut() = Rc::downgrade(&callbacks));
+        let sink = SystemCallbackSink::register_raw(callbacks, 1, 1);
+        sink.native_state_observed(None, (false, false));
+        sink.native_state_observed(None, (false, false)); // e.g. loading changed twice
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+        sink.invalidate();
+        sink.native_state_observed(Some("stale".into()), (true, true));
+        assert_eq!(wakes.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn native_state_drains_coalesce_after_results_without_a_native_view() {
+        let (mut runtime, host) = staging_runtime();
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        let sink = host.borrow().system_sink(view, 1);
+        sink.push(HostEvent::PageTitleChanged {
+            title: Some("queued".into()),
+        });
+        sink.native_state_observed(Some("https://example.test/a".into()), (false, false));
+        sink.native_state_observed(Some("https://example.test/b".into()), (true, false));
+        let mut host = host.borrow_mut();
+        let callbacks = host.callbacks.clone();
+        assert_eq!(
+            collect_system_updates(&mut host.views, &callbacks, view).unwrap(),
+            vec![
+                HostEvent::PageTitleChanged {
+                    title: Some("queued".into())
+                },
+                HostEvent::UrlChanged {
+                    url: "https://example.test/b".into()
+                },
+                HostEvent::NavigationStateChanged {
+                    can_go_back: true,
+                    can_go_forward: false
+                },
+            ]
+        );
+        sink.native_state_observed(None, (true, false));
+        assert!(collect_system_updates(&mut host.views, &callbacks, view)
+            .unwrap()
+            .is_empty());
+        sink.invalidate();
+        let replacement = SystemCallbackSink::register(callbacks.clone(), view, 2);
+        system_state_mut(&mut host.views, view).unwrap().generation = 2;
+        sink.native_state_observed(Some("stale".into()), (false, true));
+        assert!(replacement.drain().is_empty());
+        assert!(collect_system_updates(&mut host.views, &callbacks, view)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

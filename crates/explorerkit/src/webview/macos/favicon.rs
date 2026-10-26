@@ -305,6 +305,9 @@ struct Record<K> {
 
 struct History<K> {
     records: VecDeque<Record<K>>,
+    // Native membership survives image eviction, so an old unknown target cannot
+    // be mistaken for a newly added same-document alias. No image bytes here.
+    last_live: Vec<K>,
     current: Option<K>,
     // Preserve known lineage across filtered native snapshots without keeping
     // orphaned image bytes alive after their last retained record disappears.
@@ -315,6 +318,7 @@ impl<K> Default for History<K> {
     fn default() -> Self {
         Self {
             records: VecDeque::new(),
+            last_live: Vec::new(),
             current: None,
             current_document: std::rc::Weak::new(),
         }
@@ -322,6 +326,45 @@ impl<K> Default for History<K> {
 }
 
 impl<K: Clone + Eq> History<K> {
+    fn reconcile(
+        &mut self,
+        current: Option<K>,
+        live: Vec<K>,
+        committed: bool,
+        allow_activation: bool,
+    ) -> Option<Rc<[u8]>> {
+        if !committed && !allow_activation {
+            self.prune(&live);
+            self.last_live.retain(|key| live.contains(key));
+            return None;
+        }
+        if !committed {
+            // Several silent pushState entries can precede the next native
+            // notification. Preserve every new alias, not only the current one.
+            let added: Vec<_> = live
+                .iter()
+                .filter(|key| !self.last_live.contains(key))
+                .cloned()
+                .collect();
+            for key in added {
+                self.observe(Some(key), &live, false);
+            }
+        }
+        let unknown_existing = !committed
+            && current.as_ref().is_some_and(|key| {
+                self.last_live.contains(key)
+                    && !self.records.iter().any(|record| &record.key == key)
+            });
+        let retained = if unknown_existing {
+            self.prune(&live);
+            None
+        } else {
+            self.observe(current, &live, committed)
+        };
+        self.last_live = live;
+        retained
+    }
+
     fn prune(&mut self, live: &[K]) {
         self.records.retain(|record| live.contains(&record.key));
         if self.current.as_ref().is_some_and(|key| !live.contains(key)) {
@@ -466,7 +509,7 @@ impl IconState {
         allow_activation: bool,
     ) -> Option<FaviconImage> {
         let view = self.view.load()?;
-        // SAFETY: callbacks and collection run on this WKWebView's main thread.
+        // SAFETY: native callbacks run on this WKWebView's main thread.
         let (current, live) = unsafe {
             let list = view.backForwardList();
             let current = list.currentItem().map(NativeItem);
@@ -483,11 +526,12 @@ impl IconState {
         // Membership is authoritative even when activation is guarded. Always
         // prune before a late result can trigger byte-budget eviction.
         // SAFETY: this is the retained owning-thread WKWebView.
-        if !committed && (!allow_activation || unsafe { view.isLoading() }) {
-            self.history.prune(&live);
-            return None;
-        }
-        let retained = self.history.observe(current, &live, committed);
+        let retained = self.history.reconcile(
+            current,
+            live,
+            committed,
+            allow_activation && !unsafe { view.isLoading() },
+        );
         if committed {
             retained.and_then(|bytes| decode_bytes(&bytes))
         } else {
@@ -509,6 +553,85 @@ impl IconState {
 mod tests {
     use super::*;
     use image::{DynamicImage, ImageFormat, RgbaImage};
+
+    #[test]
+    fn native_boundaries_preserve_all_silent_aliases_and_reload_invalidates_them() {
+        let mut history = History::default();
+        history.reconcile(Some(1), vec![1], true, true);
+        history.retain(vec![7]);
+        history.reconcile(Some(3), vec![1, 2, 3], false, true);
+        assert_eq!(history.retained_bytes(), 1);
+        history.reconcile(Some(4), vec![1, 2, 3, 4], true, true);
+        assert_eq!(
+            &*history
+                .reconcile(Some(2), vec![1, 2, 3, 4], true, true)
+                .unwrap(),
+            &[7]
+        );
+        assert_eq!(
+            history.reconcile(Some(2), vec![1, 2, 3, 4], true, true),
+            None
+        );
+        assert_eq!(
+            history.reconcile(Some(3), vec![1, 2, 3, 4], true, true),
+            None
+        );
+    }
+
+    #[test]
+    fn evicted_native_identity_is_not_a_new_alias_before_foreign_commit() {
+        let mut history = History::default();
+        for key in 1..=3 {
+            history.reconcile(Some(key), (1..=key).collect(), true, true);
+            history.retain(vec![key as u8; HISTORY_BYTES / 2]);
+        }
+        assert!(history.records.iter().all(|record| record.key != 1));
+        assert_eq!(history.reconcile(Some(1), vec![1, 2, 3], false, true), None);
+        assert_eq!(history.current, Some(3));
+        assert_eq!(history.reconcile(Some(1), vec![1, 2, 3], true, true), None);
+        assert_eq!(
+            &*history
+                .reconcile(Some(3), vec![1, 2, 3], true, true)
+                .unwrap(),
+            &[3; HISTORY_BYTES / 2]
+        );
+    }
+
+    #[test]
+    fn guarded_observation_prunes_membership_and_images_before_retention() {
+        let mut history = History::default();
+        for key in 1..=3 {
+            history.reconcile(Some(key), (1..=key).collect(), true, true);
+            history.retain(vec![key as u8; HISTORY_BYTES / 4]);
+        }
+        history.reconcile(Some(2), vec![1, 2, 3], true, true);
+        history.reconcile(Some(4), vec![1, 2, 4], false, false);
+        assert_eq!(history.last_live, vec![1, 2]);
+        assert!(history
+            .records
+            .iter()
+            .all(|record| record.key != 3 && record.key != 4));
+        history.retain(vec![5; HISTORY_BYTES / 2]);
+        assert!(history.records.iter().any(|record| record.key == 1));
+        history.reconcile(Some(4), vec![1, 2, 4], true, true);
+        assert_eq!(history.last_live, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn native_membership_is_separate_from_image_record_budget_and_releases_on_reset() {
+        let mut history = History::default();
+        history.reconcile(Some(0), vec![0], true, true);
+        history.retain(vec![1]);
+        let live: Vec<_> = (0..HISTORY_ENTRIES + 9).collect();
+        history.reconcile(Some(HISTORY_ENTRIES + 8), live.clone(), false, true);
+        assert_eq!(history.last_live, live);
+        assert_eq!(history.records.len(), HISTORY_ENTRIES);
+        assert_eq!(history.retained_bytes(), 1);
+        history.reconcile(None, vec![], false, false);
+        assert!(history.last_live.is_empty());
+        assert!(history.records.is_empty());
+        assert_eq!(history.retained_bytes(), 0);
+    }
 
     fn encode(width: u32, height: u32, bytes: Vec<u8>, format: ImageFormat) -> Vec<u8> {
         let mut encoded = Cursor::new(Vec::new());
