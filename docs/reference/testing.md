@@ -25,6 +25,50 @@ These run in a few minutes on any OS and do not compile Servo.
 > Two of the React Native unit tests exercise macOS build scripts. They fail
 > on Linux and Windows.
 
+## macOS WebKit automation
+
+The durable native test exercises the public Rust API and standard driver
+commands together. It owns the adapter's existing-view lifetime, session-local
+mapping, native creation/error retirement, shared dialog and teardown guarantees.
+Rerun it when the macOS adapter, WRY, installed WebKit, minidriver pin/patches, or
+view/prompt ownership changes. It needs an interactive macOS desktop, Bun and a
+compatible local helper; it never downloads or builds that helper.
+
+Reuse the app's existing Cargo target across worktrees. For the desktop example:
+
+```sh
+export CARGO_TARGET_DIR="$PWD/examples/desktop-winit/target"
+cargo test --manifest-path crates/Cargo.toml -p explorerkit-embedder --locked
+cargo test --manifest-path crates/Cargo.toml -p explorerkit \
+  --no-default-features --features macos-webkit-automation --lib --locked -- --test-threads=1
+EXPLORERKIT_MINIDRIVER=/absolute/path/to/minidriver \
+  cargo test --manifest-path crates/Cargo.toml -p explorerkit \
+  --no-default-features --features macos-webkit-automation \
+  --test macos-webkit-automation --locked
+```
+
+Without `EXPLORERKIT_MINIDRIVER`, the native test reports a skip; a successful
+Cargo exit alone is not native acceptance evidence. Set
+`EXPLORERKIT_AUTOMATION_EVIDENCE` to a fresh output directory to retain the client
+result and protocol transcript. The harness runs both Runtime drop and explicit
+shutdown, retaining their evidence in separate subdirectories. Repeat with `EXPLORERKIT_SELECTION_HOOK=1` when
+changing the optional presentation callback.
+
+`EXPLORERKIT_RETIREMENT_PROOF=1` selects the focused back-to-back creation
+retirement proof plus pending-work teardown. It uses the same batch assertions
+as the full client and records its mode in the result. It does not replace full
+native acceptance; keep unrelated full-suite failures visible when using it.
+
+The client compares standard window handles and BiDi trees with live SDK views,
+checks document state through standard script execution, and verifies helper
+reaping. Terminal process-loss callback tests exercise captured native blocks;
+they do not kill a real WebContent process. Known native protocol defects remain
+listed in [capabilities](capabilities.md#native-automation).
+
+Changes to helper packaging also need a signed-copy launch, inherited-FD
+handshake and teardown check against system frameworks. Ad-hoc signing proves
+local launch only; it does not prove notarization or release distribution.
+
 ## Rust with Servo
 
 These compile Servo, so run them on a prepared machine with Servo's build

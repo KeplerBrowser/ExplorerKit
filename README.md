@@ -42,7 +42,9 @@ to Servo as it matures.
   system web view where Servo isn't ready yet, behind the same API.
 - **Browser logic is written once.** Navigation rules, dialogs, and other page
   requests are handled in Rust, not rewritten per platform. This covers Servo
-  views and iOS; macOS system web views still use WebKit's defaults.
+  views and iOS. macOS system views opted into
+  [automation](docs/reference/macos-webkit-automation.md) share the simple-dialog
+  flow; other system-view prompts use WebKit's defaults.
 - **Platform code stays thin.** Each platform adapter does only what the
   platform requires: views, input, and threads.
 - **One API across platforms.** React Native apps get one `<ExplorerView>`. Rust

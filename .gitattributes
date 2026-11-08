@@ -1,3 +1,5 @@
 *.pbxproj -text
 # specific for windows script files
 *.bat text eol=crlf
+# Preserve the pinned patch bytes, including blank context-line prefixes.
+patches/minidriver/*.patch -text -whitespace

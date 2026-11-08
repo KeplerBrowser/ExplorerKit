@@ -10,13 +10,25 @@ path = "tests/macos_system_configuration.rs"
 required-features = ["macos-webkit"]
 harness = false
 
+[[test]]
+name = "macos-webkit-automation"
+path = "tests/macos_webkit_automation.rs"
+required-features = ["macos-webkit-automation"]
+harness = false
+
 [[example]]
 name = "multiple-native-views"
 path = "examples/multiple-native-views/main.rs"
 required-features = ["servo"]
 
+[[example]]
+name = "webkit-automation"
+path = "examples/webkit-automation/main.rs"
+required-features = ["macos-webkit-automation"]
+
 [features]
 default = []
+macos-webkit-automation = ["macos-webkit"]
 macos-system-webview = ["servo", "macos-webkit"]
 macos-webkit = [
     "dep:objc2-core-foundation",

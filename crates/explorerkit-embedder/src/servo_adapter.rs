@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use crate::{
     ContextMenuElementInformation, ContextMenuItem, FaviconImage, HostEvent, InputMethodKind,
@@ -108,6 +108,12 @@ pub enum HiddenEmbedderControl {
     Unknown,
 }
 
+#[derive(Debug, Clone)]
+struct PendingSimpleDialog {
+    request: SimpleDialogRequest,
+    current_value: Option<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ServoAdapterState {
     current_url: Option<String>,
@@ -115,7 +121,7 @@ pub struct ServoAdapterState {
     needs_paint: bool,
     next_navigation_request_id: u64,
     pending_navigation_requests: HashSet<String>,
-    pending_simple_dialogs: HashSet<String>,
+    pending_simple_dialogs: HashMap<String, PendingSimpleDialog>,
     pending_select_elements: HashSet<String>,
     pending_context_menus: HashSet<String>,
     pending_file_pickers: HashSet<String>,
@@ -394,8 +400,13 @@ impl ServoAdapterState {
     }
 
     pub fn show_simple_dialog(&mut self, request: SimpleDialogRequest) {
-        self.pending_simple_dialogs
-            .insert(request.dialog_id.clone());
+        self.pending_simple_dialogs.insert(
+            request.dialog_id.clone(),
+            PendingSimpleDialog {
+                current_value: request.default_value.clone(),
+                request: request.clone(),
+            },
+        );
         self.events.push_back(HostEvent::SimpleDialogRequested {
             dialog_id: request.dialog_id,
             kind: request.kind,
@@ -405,7 +416,71 @@ impl ServoAdapterState {
     }
 
     pub fn resolve_simple_dialog(&mut self, dialog_id: &str) -> Result<(), String> {
-        remove_pending(&mut self.pending_simple_dialogs, dialog_id, "simple dialog")
+        self.pending_simple_dialogs
+            .remove(dialog_id)
+            .map(|_| ())
+            .ok_or_else(|| format!("simple dialog {dialog_id} is no longer pending"))
+    }
+
+    /// Inspects the same pending dialog used by host/controller resolution.
+    pub fn pending_simple_dialog(&self, dialog_id: &str) -> Option<&SimpleDialogRequest> {
+        self.pending_simple_dialogs
+            .get(dialog_id)
+            .map(|dialog| &dialog.request)
+    }
+
+    /// Reads the current prompt text without consuming the pending dialog.
+    pub fn simple_dialog_value(&self, dialog_id: &str) -> Option<&str> {
+        self.pending_simple_dialogs
+            .get(dialog_id)?
+            .current_value
+            .as_deref()
+    }
+
+    /// Updates current prompt text in the same entry used by either answer owner.
+    pub fn set_simple_dialog_value(
+        &mut self,
+        dialog_id: &str,
+        value: String,
+    ) -> Result<(), String> {
+        let dialog = self
+            .pending_simple_dialogs
+            .get_mut(dialog_id)
+            .ok_or_else(|| format!("simple dialog {dialog_id} is no longer pending"))?;
+        if dialog.request.kind != SimpleDialogKind::Prompt {
+            return Err("text is only valid for prompt dialogs".into());
+        }
+        dialog.current_value = Some(value);
+        Ok(())
+    }
+
+    /// Validates a native adapter answer before consuming the shared pending entry.
+    /// Returns the effective prompt text. A rejected answer leaves it pending.
+    pub fn answer_simple_dialog(
+        &mut self,
+        dialog_id: &str,
+        confirmed: bool,
+        prompt_value: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let dialog = self
+            .pending_simple_dialogs
+            .get(dialog_id)
+            .ok_or_else(|| format!("simple dialog {dialog_id} is no longer pending"))?;
+        let request = &dialog.request;
+        if request.kind != SimpleDialogKind::Prompt && prompt_value.is_some() {
+            return Err("promptValue is only valid for prompt dialogs".into());
+        }
+        let value = (request.kind == SimpleDialogKind::Prompt && confirmed).then(|| {
+            prompt_value
+                .map(str::to_owned)
+                .or_else(|| dialog.current_value.clone())
+                .unwrap_or_default()
+        });
+        self.pending_simple_dialogs.remove(dialog_id);
+        self.events.push_back(HostEvent::SimpleDialogDismissed {
+            dialog_id: dialog_id.to_owned(),
+        });
+        Ok(value)
     }
 
     pub fn hide_embedder_control(&mut self, control_id: &str) -> HiddenEmbedderControl {
@@ -437,7 +512,7 @@ impl ServoAdapterState {
             return HiddenEmbedderControl::ContextMenu;
         }
 
-        if self.pending_simple_dialogs.remove(control_id) {
+        if self.pending_simple_dialogs.remove(control_id).is_some() {
             self.events.push_back(HostEvent::SimpleDialogDismissed {
                 dialog_id: control_id.to_owned(),
             });
@@ -458,6 +533,85 @@ fn remove_pending(pending: &mut HashSet<String>, id: &str, label: &str) -> Resul
         .remove(id)
         .then_some(())
         .ok_or_else(|| format!("{label} {id} is no longer pending"))
+}
+
+#[cfg(test)]
+mod dialog_answer_tests {
+    use super::*;
+    #[test]
+    fn invalid_answer_preserves_pending_and_second_valid_answer_is_stale() {
+        let mut state = ServoAdapterState::default();
+        state.show_simple_dialog(SimpleDialogRequest {
+            dialog_id: "id".into(),
+            kind: SimpleDialogKind::Confirm,
+            message: "message".into(),
+            default_value: None,
+        });
+        assert!(state
+            .answer_simple_dialog("id", true, Some("not a prompt"))
+            .is_err());
+        assert!(state.pending_simple_dialog("id").is_some());
+        assert_eq!(state.answer_simple_dialog("id", false, None), Ok(None));
+        assert!(state.answer_simple_dialog("id", true, None).is_err());
+        assert_eq!(
+            state
+                .drain_events()
+                .iter()
+                .filter(|event| matches!(event, HostEvent::SimpleDialogDismissed { .. }))
+                .count(),
+            1
+        );
+    }
+    #[test]
+    fn native_input_and_host_answer_share_current_prompt_value() {
+        let mut state = ServoAdapterState::default();
+        state.show_simple_dialog(SimpleDialogRequest {
+            dialog_id: "id".into(),
+            kind: SimpleDialogKind::Prompt,
+            message: "message".into(),
+            default_value: Some("original".into()),
+        });
+        state
+            .set_simple_dialog_value("id", "edited by native client".into())
+            .unwrap();
+        assert_eq!(
+            state
+                .pending_simple_dialog("id")
+                .unwrap()
+                .default_value
+                .as_deref(),
+            Some("original")
+        );
+        assert_eq!(
+            state.answer_simple_dialog("id", true, None),
+            Ok(Some("edited by native client".into()))
+        );
+        assert!(state.set_simple_dialog_value("id", "late".into()).is_err());
+    }
+
+    #[test]
+    fn prompt_default_and_terminal_retirement_use_the_same_entry() {
+        let mut state = ServoAdapterState::default();
+        let request = SimpleDialogRequest {
+            dialog_id: "id".into(),
+            kind: SimpleDialogKind::Prompt,
+            message: "message".into(),
+            default_value: Some("default".into()),
+        };
+        state.show_simple_dialog(request.clone());
+        assert_eq!(
+            state.answer_simple_dialog("id", true, None),
+            Ok(Some("default".into()))
+        );
+        state.show_simple_dialog(request);
+        assert_eq!(
+            state.hide_embedder_control("id"),
+            HiddenEmbedderControl::SimpleDialog
+        );
+        assert!(state
+            .answer_simple_dialog("id", true, Some("late"))
+            .is_err());
+    }
 }
 
 #[cfg(test)]

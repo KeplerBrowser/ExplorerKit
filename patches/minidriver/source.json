@@ -1,0 +1,19 @@
+{
+  "repository": "https://github.com/WebKit/WebKit.git",
+  "revision": "db2d79f4413193cbfa65b50ebddcec39eaba5809",
+  "patches": [
+    {
+      "file": "0001-attach-existing-views.patch",
+      "sha256": "5ed6f774daaf41a98868b966c39db653fb96a06c4993fb1ab49e33335687af29"
+    },
+    {
+      "file": "0002-system-webkit-input.patch",
+      "sha256": "6cb8dc86e7e2a51ac7815bde1caabadcc6d4f4d53c414ce42fc288adfdb5252c"
+    }
+  ],
+  "validated_helper_sha256": "aed04a9238e353a02b76d0032b92c32dbc117bc92ea1c7f862ae6039fbeaa100",
+  "validated_architecture": "arm64",
+  "validated_helper_minimum_macos": "27.0",
+  "validated_helper_sdk": "27.2",
+  "validated_xcode": "27.2 (27B52)"
+}

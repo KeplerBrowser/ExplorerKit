@@ -1,0 +1,159 @@
+--- a/Source/WebDriver/Session.cpp
++++ b/Source/WebDriver/Session.cpp
+@@ -2670,6 +2670,19 @@
+ 
+ void Session::performMouseInteraction(int x, int y, MouseButton button, MouseInteraction interaction, Function<void(CommandResult&&)>&& completionHandler)
+ {
++#if PLATFORM(COCOA)
++    // The attached system backend may predate the native SingleClick up-event fix.
++    if (m_host->isRemoteBrowser() && interaction == MouseInteraction::SingleClick) {
++        performMouseInteraction(x, y, button, MouseInteraction::Down, [this, protectedThis = Ref { *this }, x, y, button, completionHandler = WTF::move(completionHandler)](CommandResult&& result) mutable {
++            if (result.isError()) {
++                completionHandler(WTF::move(result));
++                return;
++            }
++            performMouseInteraction(x, y, button, MouseInteraction::Up, WTF::move(completionHandler));
++        });
++        return;
++    }
++#endif
+     auto parameters = JSON::Object::create();
+     parameters->setString("handle"_s, uncheckedTopLevelBrowsingContext());
+     auto position = JSON::Object::create();
+@@ -3012,7 +3025,11 @@
+         return;
+     }
+ 
+-    handleUserPrompts([this, protectedThis = Ref { *this }, actionsByTick = WTF::move(actionsByTick), completionHandler = WTF::move(completionHandler)](CommandResult&& result) mutable {
++    bool attachedCocoaBackend = false;
++#if PLATFORM(COCOA)
++    attachedCocoaBackend = m_host->isRemoteBrowser();
++#endif
++    handleUserPrompts([this, protectedThis = Ref { *this }, attachedCocoaBackend, actionsByTick = WTF::move(actionsByTick), completionHandler = WTF::move(completionHandler)](CommandResult&& result) mutable {
+         if (result.isError()) {
+             completionHandler(WTF::move(result));
+             return;
+@@ -3036,6 +3053,7 @@
+         auto steps = JSON::Array::create();
+         for (const auto& tick : actionsByTick) {
+             auto states = JSON::Array::create();
++            auto releasedStates = JSON::Array::create();
+             for (const auto& action : tick) {
+                 inputSourcesSet.add(action.id);
+                 auto state = JSON::Object::create();
+@@ -3047,12 +3065,25 @@
+                         state->setDouble("duration"_s, action.duration.value());
+                     break;
+                 case Action::Type::Pointer: {
++                    bool compatibleMouse = attachedCocoaBackend && m_activeInputSources.get(action.id).pointerType.value_or(PointerType::Mouse) == PointerType::Mouse;
++                    std::optional<MouseButton> releasedButton;
+                     switch (action.subtype) {
+                     case Action::Subtype::PointerUp:
++                        if (compatibleMouse) {
++                            if (currentState.pressedButton != action.button) {
++                                currentState.mouseInteraction = std::nullopt;
++                                break;
++                            }
++                            releasedButton = currentState.pressedButton;
++                        }
+                         currentState.pressedButton = std::nullopt;
+                         currentState.mouseInteraction = MouseInteraction::Up;
+                         break;
+                     case Action::Subtype::PointerDown:
++                        if (compatibleMouse && currentState.pressedButton == action.button) {
++                            currentState.mouseInteraction = std::nullopt;
++                            break;
++                        }
+                         currentState.pressedButton = action.button.value();
+                         currentState.mouseInteraction = MouseInteraction::Down;
+                         break;
+@@ -3085,6 +3116,16 @@
+                         state->setString("pressedButton"_s, mouseButtonForAutomation(currentState.pressedButton.value()));
+                     if (currentState.mouseInteraction)
+                         state->setString("mouseInteraction"_s, mouseInteractionForAutomation(currentState.mouseInteraction.value()));
++                    if (releasedButton) {
++                        // Older native dispatchers need the release button explicitly. Follow
++                        // the Up with a source-only state: no input, same resolved position,
++                        // and no pressed button retained by the native input source.
++                        state->setString("pressedButton"_s, mouseButtonForAutomation(*releasedButton));
++                        auto releasedState = JSON::Object::create();
++                        releasedState->setString("sourceId"_s, action.id);
++                        releasedStates->pushObject(WTF::move(releasedState));
++                        currentState.mouseInteraction = std::nullopt;
++                    }
+                     break;
+                 }
+                 case Action::Type::Key:
+@@ -3176,6 +3217,11 @@
+             auto stepStates = JSON::Object::create();
+             stepStates->setArray("states"_s, WTF::move(states));
+             steps->pushObject(WTF::move(stepStates));
++            if (releasedStates->length()) {
++                auto releasedStep = JSON::Object::create();
++                releasedStep->setArray("states"_s, WTF::move(releasedStates));
++                steps->pushObject(WTF::move(releasedStep));
++            }
+         }
+ 
+         parameters->setArray("steps"_s, WTF::move(steps));
+@@ -3207,18 +3253,48 @@
+         return;
+     }
+ 
+-    m_activeInputSources.clear();
+-    m_inputStateTable.clear();
+-
+-    auto parameters = JSON::Object::create();
+-    parameters->setString("handle"_s, uncheckedTopLevelBrowsingContext());
+-    m_host->sendCommandToBackend("cancelInteractionSequence"_s, WTF::move(parameters), [protectedThis = Ref { *this }, completionHandler = WTF::move(completionHandler)](SessionHost::CommandResponse&& response) {
+-        if (response.isError) {
+-            completionHandler(CommandResult::fail(WTF::move(response.responseObject)));
+-            return;
+-        }
+-        completionHandler(CommandResult::success());
+-    });
++    auto cancelNativeState = [this, protectedThis = Ref { *this }, completionHandler = WTF::move(completionHandler)](CommandResult&& releaseResult) mutable {
++        m_activeInputSources.clear();
++        m_inputStateTable.clear();
++
++        auto parameters = JSON::Object::create();
++        parameters->setString("handle"_s, uncheckedTopLevelBrowsingContext());
++        // Native cancellation remains responsible for held keys and native state,
++        // including when an explicit mouse release reported an error.
++        m_host->sendCommandToBackend("cancelInteractionSequence"_s, WTF::move(parameters), [protectedThis, releaseResult = WTF::move(releaseResult), completionHandler = WTF::move(completionHandler)](SessionHost::CommandResponse&& response) mutable {
++            if (releaseResult.isError()) {
++                completionHandler(WTF::move(releaseResult));
++                return;
++            }
++            if (response.isError) {
++                completionHandler(CommandResult::fail(WTF::move(response.responseObject)));
++                return;
++            }
++            completionHandler(CommandResult::success());
++        });
++    };
++#if PLATFORM(COCOA)
++    if (m_host->isRemoteBrowser()) {
++        Vector<Action> releases;
++        for (const auto& entry : m_inputStateTable) {
++            const auto& source = m_activeInputSources.get(entry.key);
++            if (source.type != InputSource::Type::Pointer || source.pointerType.value_or(PointerType::Mouse) != PointerType::Mouse || !entry.value.pressedButton)
++                continue;
++            Action release(entry.key, Action::Type::Pointer, Action::Subtype::PointerUp);
++            release.button = entry.value.pressedButton;
++            releases.append(WTF::move(release));
++        }
++        if (!releases.isEmpty()) {
++            // A native reset keyframe contains no mouseInteraction, so explicitly
++            // release held mouse buttons through the existing Actions implementation.
++            Vector<Vector<Action>> ticks;
++            ticks.append(WTF::move(releases));
++            performActions(WTF::move(ticks), WTF::move(cancelNativeState));
++            return;
++        }
++    }
++#endif
++    cancelNativeState(CommandResult::success());
+ }
+ 
+ void Session::dismissAlert(Function<void(CommandResult&&)>&& completionHandler)

@@ -1,0 +1,224 @@
+diff --git a/Source/WebDriver/Session.cpp b/Source/WebDriver/Session.cpp
+index 4eb2710c..0a87d8be 100644
+--- a/Source/WebDriver/Session.cpp
++++ b/Source/WebDriver/Session.cpp
+@@ -252,6 +252,39 @@ std::optional<String> Session::pageLoadStrategyString() const
+ void Session::createTopLevelBrowsingContext(Function<void(CommandResult&&)>&& completionHandler)
+ {
+     ASSERT(!m_toplevelBrowsingContext);
++#if PLATFORM(COCOA)
++    if (m_host->isRemoteBrowser()) {
++        m_host->sendCommandToBackend("getBrowsingContexts"_s, JSON::Object::create(), [this, protectedThis = Ref { *this }, completionHandler = WTF::move(completionHandler)](SessionHost::CommandResponse&& response) mutable {
++            if (response.isError || !response.responseObject) {
++                completionHandler(CommandResult::fail(WTF::move(response.responseObject)));
++                return;
++            }
++            auto contexts = response.responseObject->getArray("contexts"_s);
++            if (!contexts || !contexts->length()) {
++                completionHandler(CommandResult::fail(CommandResult::ErrorCode::SessionNotCreated, "No existing automation browsing context"_s));
++                return;
++            }
++            String selectedHandle;
++            for (unsigned i = 0; i < contexts->length(); ++i) {
++                auto context = contexts->get(i)->asObject();
++                auto handle = context ? context->getString("handle"_s) : String();
++                auto active = context ? context->getBoolean("active"_s) : std::nullopt;
++                if (handle.isEmpty() || !active) {
++                    completionHandler(CommandResult::fail(CommandResult::ErrorCode::UnknownError, "Invalid existing browsing context"_s));
++                    return;
++                }
++                if (selectedHandle.isEmpty() || *active)
++                    selectedHandle = handle;
++                if (*active)
++                    break;
++            }
++            // This bounded host keeps every eligible view visible. The native
++            // active flag supplies focus preference; enumeration order is not identity.
++            switchToWindow(selectedHandle, WTF::move(completionHandler));
++        });
++        return;
++    }
++#endif
+     m_host->sendCommandToBackend("createBrowsingContext"_s, nullptr, [this, protectedThis = Ref { *this }, completionHandler = WTF::move(completionHandler)](SessionHost::CommandResponse&& response) mutable {
+         if (response.isError || !response.responseObject) {
+             completionHandler(CommandResult::fail(WTF::move(response.responseObject)));
+diff --git a/Source/WebDriver/SessionHost.h b/Source/WebDriver/SessionHost.h
+index 62e33f3e..b529e981 100644
+--- a/Source/WebDriver/SessionHost.h
++++ b/Source/WebDriver/SessionHost.h
+@@ -87,6 +87,9 @@ public:
+ #endif
+ 
+     void setHostAddress(const String& ip, uint16_t port) { m_targetIp = ip; m_targetPort = port; }
++#if PLATFORM(COCOA)
++    void setAttachFileDescriptor(int descriptor) { m_attachFileDescriptor = descriptor; }
++#endif
+     bool isConnected() const;
+ 
+     const String& sessionID() const LIFETIME_BOUND { return m_sessionID; }
+@@ -198,6 +201,7 @@ private:
+ #endif
+ #elif PLATFORM(COCOA)
+     Function<void(bool, std::optional<String>)> m_startSessionCompletionHandler;
++    int m_attachFileDescriptor { -1 };
+     bool m_browserMatchesCapabilities { true };
+     pid_t m_browserProcessID { 0 };
+     OSObjectPtr<dispatch_io_t> m_channel;
+diff --git a/Source/WebDriver/WebDriverService.cpp b/Source/WebDriver/WebDriverService.cpp
+index 27b12af9..1671d3ca 100644
+--- a/Source/WebDriver/WebDriverService.cpp
++++ b/Source/WebDriver/WebDriverService.cpp
+@@ -43,6 +43,11 @@
+ #include <wtf/text/StringToIntegerConversion.h>
+ #include <wtf/text/WTFString.h>
+ 
++#if PLATFORM(COCOA)
++#include <fcntl.h>
++#include <unistd.h>
++#endif
++
+ #if ENABLE(WEBDRIVER_BIDI)
+ #include "HTTPServer.h"
+ #include "WebSocketServer.h"
+@@ -80,6 +85,10 @@ WebDriverService::WebDriverService()
+ 
+ WebDriverService::~WebDriverService()
+ {
++#if PLATFORM(COCOA)
++    if (m_attachFileDescriptor >= 0)
++        close(m_attachFileDescriptor);
++#endif
+ #if ENABLE(WEBDRIVER_BIDI)
+     SessionHost::removeBrowserTerminatedObserver(m_browserTerminatedObserver);
+ #endif
+@@ -97,6 +106,9 @@ static void printUsageStatement(const char* programName)
+     SAFE_PRINTF("  -h,          --help             Prints this help message\n");
+     SAFE_PRINTF("  -p <port>,   --port=<port>      Port number the driver will use\n");
+     SAFE_PRINTF("               --host=<host>      Host IP the driver will use, or either 'local' or 'all' (default: 'local')\n");
++#if PLATFORM(COCOA)
++    SAFE_PRINTF("               --attach-fd=<n>    Adopt connected host descriptor (one session attempt)\n");
++#endif
+ #if !PLATFORM(COCOA)
+     SAFE_PRINTF("               --allow-hosts=<host>[,<host>...]       Additional hostnames, without port, to accept in the Host header (localhost and IP addresses are always accepted)\n");
+     SAFE_PRINTF("               --allow-origins=<origin>[,<origin>...] Origins, as <scheme>://<host>[:<port>], to accept in the Origin header (requests with any other Origin are rejected)\n");
+@@ -154,6 +166,24 @@ int WebDriverService::run(int argc, char** argv)
+             continue;
+         }
+ 
++#if PLATFORM(COCOA)
++        static constexpr auto attachArgument = "--attach-fd="_span;
++        if (spanHasPrefix(arg, attachArgument)) {
++            auto value = arg.subspan(attachArgument.size());
++            bool digitsOnly = !value.empty();
++            for (auto character : value)
++                digitsOnly &= character >= '0' && character <= '9';
++            auto descriptor = parseInteger<int>(String::fromLatin1(value));
++            if (m_attachRequested || !digitsOnly || !descriptor || *descriptor < 3 || fcntl(*descriptor, F_GETFD) < 0) {
++                SAFE_FPRINTF(stderr, "Invalid or duplicate --attach-fd; expected an open descriptor >= 3\n");
++                return EXIT_FAILURE;
++            }
++            m_attachRequested = true;
++            m_attachFileDescriptor = *descriptor;
++            continue;
++        }
++#endif
++
+ #if !PLATFORM(COCOA)
+         static constexpr auto allowHostsArgument = "--allow-hosts="_span;
+         if (spanHasPrefix(arg, allowHostsArgument)) {
+@@ -211,6 +241,13 @@ int WebDriverService::run(int argc, char** argv)
+         return EXIT_FAILURE;
+     }
+ 
++#if PLATFORM(COCOA)
++    if (m_attachRequested && (!targetString.isNull() || m_replaceOnNewSession)) {
++        SAFE_FPRINTF(stderr, "--attach-fd cannot be combined with a target or --replace-on-new-session\n");
++        return EXIT_FAILURE;
++    }
++#endif
++
+     if (!targetString.isEmpty()) {
+         auto position = targetString.reverseFind(':');
+         if (position != notFound) {
+@@ -1229,6 +1266,15 @@ void WebDriverService::connectToBrowser(Vector<Capabilities>&& capabilitiesList,
+     }
+ 
+     auto sessionHost = SessionHost::create(capabilitiesList.takeLast());
++#if PLATFORM(COCOA)
++    if (m_attachRequested) {
++        if (m_attachFileDescriptor < 0) {
++            completionHandler(CommandResult::fail(CommandResult::ErrorCode::SessionNotCreated, "Attachment descriptor already consumed; start a fresh driver"_s));
++            return;
++        }
++        sessionHost->setAttachFileDescriptor(std::exchange(m_attachFileDescriptor, -1));
++    }
++#endif
+     sessionHost->setHostAddress(m_targetAddress, m_targetPort);
+     auto protectedSessionHost = Ref<SessionHost>(sessionHost);
+     protectedSessionHost->connectToBrowser([this, capabilitiesList = WTF::move(capabilitiesList), sessionHost = WTF::move(sessionHost), completionHandler = WTF::move(completionHandler)](std::optional<String> error) mutable {
+@@ -1378,6 +1424,12 @@ void WebDriverService::status(RefPtr<JSON::Object>&&, Function<void (CommandResu
+     auto body = JSON::Object::create();
+     body->setBoolean("ready"_s, !m_session);
+     body->setString("message"_s, m_session ? "A session already exists"_s : "No sessions"_s);
++#if PLATFORM(COCOA)
++    if (m_attachRequested && m_attachFileDescriptor < 0) {
++        body->setBoolean("ready"_s, false);
++        body->setString("message"_s, "Attachment descriptor consumed; start a fresh driver"_s);
++    }
++#endif
+     completionHandler(CommandResult::success(WTF::move(body)));
+ }
+ 
+diff --git a/Source/WebDriver/WebDriverService.h b/Source/WebDriver/WebDriverService.h
+index 62898cc3..f24856c6 100644
+--- a/Source/WebDriver/WebDriverService.h
++++ b/Source/WebDriver/WebDriverService.h
+@@ -197,6 +197,10 @@ private:
+     uint16_t m_targetPort { 0 };
+ 
+     bool m_replaceOnNewSession { false };
++#if PLATFORM(COCOA)
++    bool m_attachRequested { false };
++    int m_attachFileDescriptor { -1 };
++#endif
+ };
+ 
+ } // namespace WebDriver
+diff --git a/Source/WebDriver/cocoa/SessionHostCocoa.cpp b/Source/WebDriver/cocoa/SessionHostCocoa.cpp
+index b0f54d63..01777d7d 100644
+--- a/Source/WebDriver/cocoa/SessionHostCocoa.cpp
++++ b/Source/WebDriver/cocoa/SessionHostCocoa.cpp
+@@ -117,6 +117,8 @@ static void terminateProcess(pid_t processID)
+ 
+ SessionHost::~SessionHost()
+ {
++    if (m_attachFileDescriptor >= 0)
++        close(m_attachFileDescriptor);
+     if (m_channel)
+         dispatch_io_close(m_channel.get(), DISPATCH_IO_STOP);
+     terminateBrowser();
+@@ -139,6 +141,24 @@ void SessionHost::connectToBrowser(Function<void(std::optional<String> error)>&&
+         return;
+     }
+ 
++    if (m_attachFileDescriptor >= 0) {
++        int descriptor = std::exchange(m_attachFileDescriptor, -1);
++        int noSigPipe = 1;
++        if (fcntl(descriptor, F_SETFD, FD_CLOEXEC) < 0 || setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, sizeof(noSigPipe)) < 0) {
++            close(descriptor);
++            completionHandler("Failed to configure attachment descriptor"_s);
++            return;
++        }
++        m_isRemoteBrowser = true;
++        m_channel = adoptOSObject(dispatch_io_create(DISPATCH_IO_STREAM, descriptor, mainDispatchQueueSingleton(), ^(int) {
++            close(descriptor);
++        }));
++        dispatch_io_set_low_water(m_channel.get(), 1);
++        startReading();
++        completionHandler(std::nullopt);
++        return;
++    }
++
+     if (auto error = launchBrowser()) {
+         completionHandler(WTF::move(error));
+         return;

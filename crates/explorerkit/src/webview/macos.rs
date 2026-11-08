@@ -57,6 +57,9 @@ mod native_callbacks;
 #[cfg(feature = "macos-webkit")]
 mod observation;
 
+#[cfg(feature = "macos-webkit-automation")]
+pub mod automation;
+
 #[cfg(feature = "macos-webkit")]
 use configuration::SystemWebViewContext;
 #[cfg(feature = "macos-webkit")]
@@ -106,12 +109,24 @@ pub fn compiled_engines() -> &'static [MacOsWebViewKind] {
 pub struct MacOsWebViewOptions {
     /// Selects the concrete engine view for this handle.
     pub kind: MacOsWebViewKind,
+    /// Opts this system view into the macOS native automation and prompt paths.
+    /// Requires `macos-webkit-automation`; unsupported for Servo views.
+    pub webkit_automation: bool,
 }
 
 impl MacOsWebViewOptions {
     /// Creates options for one concrete macOS engine view.
     pub fn new(kind: MacOsWebViewKind) -> Self {
-        Self { kind }
+        Self {
+            kind,
+            webkit_automation: false,
+        }
+    }
+
+    /// Chooses native WebKit automation eligibility before native allocation.
+    pub fn with_webkit_automation(mut self, enabled: bool) -> Self {
+        self.webkit_automation = enabled;
+        self
     }
 }
 
@@ -120,6 +135,8 @@ pub struct MacOsViewHostOptions {
     surface_host: SurfaceHostOptions,
     webkit_data_store_identifier: WebKitDataStoreIdentifier,
     new_webview_destination_handler: Option<Rc<NewWebViewDestinationHandler>>,
+    #[cfg(feature = "macos-webkit-automation")]
+    automation_selection: Option<Rc<dyn Fn(WebViewHandle)>>,
 }
 
 type NewWebViewDestinationHandler =
@@ -166,6 +183,8 @@ impl MacOsViewHostOptions {
             surface_host,
             webkit_data_store_identifier,
             new_webview_destination_handler: None,
+            #[cfg(feature = "macos-webkit-automation")]
+            automation_selection: None,
         }
     }
 
@@ -213,6 +232,8 @@ type CallbackTarget = (u64, u64);
 struct SystemCallbacks {
     views: HashMap<CallbackTarget, SystemCallbackState>,
     wake: SurfaceEventLoopWaker,
+    #[cfg(feature = "macos-webkit-automation")]
+    lifetime_sequence: u64,
     #[cfg(test)]
     liveness_checks: Cell<usize>,
 }
@@ -223,6 +244,8 @@ impl SystemCallbacks {
         Self {
             views: HashMap::new(),
             wake,
+            #[cfg(feature = "macos-webkit-automation")]
+            lifetime_sequence: 0,
             #[cfg(test)]
             liveness_checks: Cell::new(0),
         }
@@ -232,6 +255,8 @@ impl SystemCallbacks {
 #[derive(Default)]
 #[cfg(feature = "macos-webkit")]
 struct SystemCallbackState {
+    #[cfg(feature = "macos-webkit-automation")]
+    automation: automation::ViewState,
     observed_url: Option<String>,
     observed_navigation_state: Option<(bool, bool)>,
     events: VecDeque<HostEvent>,
@@ -268,7 +293,19 @@ impl SystemCallbackSink {
         generation: u64,
     ) -> Self {
         let target = (webview.raw(), generation);
-        callbacks.borrow_mut().views.entry(target).or_default();
+        {
+            let mut registry = callbacks.borrow_mut();
+            #[cfg(feature = "macos-webkit-automation")]
+            {
+                registry.lifetime_sequence += 1;
+                let born = registry.lifetime_sequence;
+                let state = &mut registry.views.entry(target).or_default().automation;
+                state.born = born;
+                state.handle = Some(webview);
+            }
+            #[cfg(not(feature = "macos-webkit-automation"))]
+            registry.views.entry(target).or_default();
+        }
         Self { target, callbacks }
     }
 
@@ -333,6 +370,8 @@ impl SystemCallbackSink {
     }
 
     fn process_terminated(&self) {
+        #[cfg(feature = "macos-webkit-automation")]
+        automation::dialogs::retire(self);
         let mut pending = Vec::new();
         self.publish(|state| {
             state.document_ready = false;
@@ -544,6 +583,8 @@ impl SystemCallbackSink {
     }
 
     fn invalidate(&self) {
+        #[cfg(feature = "macos-webkit-automation")]
+        automation::dialogs::retire(self);
         let previous = self.callbacks.borrow_mut().views.remove(&self.target);
         if let Some(mut previous) = previous {
             favicon::decline(previous.favicon_selection.retire());
@@ -571,6 +612,8 @@ enum MacOsView {
 struct SystemWebViewState {
     generation: u64,
     ui_registration: Option<SystemUiDelegateRegistration>,
+    #[cfg(test)]
+    test_callback_depth: Cell<usize>,
     icon_registration: Option<favicon::IconRegistration>,
     observation: Option<observation::Registration>,
     webview: Option<WebView>,
@@ -585,10 +628,22 @@ struct SystemWebViewState {
 
 #[cfg(feature = "macos-webkit")]
 impl SystemWebViewState {
+    fn ui_callback_is_active(&self) -> bool {
+        #[cfg(test)]
+        if self.test_callback_depth.get() != 0 {
+            return true;
+        }
+        self.ui_registration
+            .as_ref()
+            .is_some_and(|ui| ui.is_active())
+    }
+
     fn new(generation: u64) -> Self {
         Self {
             generation,
             ui_registration: None,
+            #[cfg(test)]
+            test_callback_depth: Cell::new(0),
             icon_registration: None,
             observation: None,
             webview: None,
@@ -677,6 +732,8 @@ impl SystemNewWebView {
         if !self.sink.is_live() {
             return;
         }
+        #[cfg(feature = "macos-webkit-automation")]
+        automation::dialogs::retire(&self.sink);
         let events = self.sink.drain();
         self.sink.invalidate();
         if let Some(registrar) = &self.registrar {
@@ -712,6 +769,23 @@ impl SystemNewWebView {
         validate_destination(&destination)?;
         let child = registration.webview();
         let sink = SystemCallbackSink::register(self.sink.callbacks.clone(), child, 1);
+        #[cfg(feature = "macos-webkit-automation")]
+        let automation = self
+            .sink
+            .callbacks
+            .borrow()
+            .views
+            .get(&self.sink.target)
+            .map(|state| (state.automation.owner.clone(), state.automation.eligible));
+        #[cfg(feature = "macos-webkit-automation")]
+        if let Some((owner, enabled)) = &automation {
+            if let Some(owner) = owner.upgrade() {
+                owner.initialize_view(&sink, *enabled);
+            }
+            if *enabled {
+                automation::native::configure(configuration, true);
+            }
+        }
         let mut state = Box::new(SystemWebViewState::new(1));
         *state.handler.borrow_mut() = Some(handler);
         let callbacks = Self {
@@ -742,6 +816,12 @@ impl SystemNewWebView {
             }
         };
         let native_view = native.webview().into_super();
+        #[cfg(feature = "macos-webkit-automation")]
+        if let Some((owner, _)) = automation {
+            if let Some(owner) = owner.upgrade() {
+                owner.attached(&sink, child, &native_view);
+            }
+        }
         let created = PopupCreated {
             request_id: request.request_id.clone(),
             parent_webview_id: format!("{:p}", opener as *const WKWebView),
@@ -849,6 +929,8 @@ pub struct MacOsViewHost<S> {
     pending_children: Rc<SystemChildViews>,
     #[cfg(feature = "macos-webkit")]
     new_webview_destination_handler: Option<Rc<NewWebViewDestinationHandler>>,
+    #[cfg(feature = "macos-webkit-automation")]
+    automation: Rc<automation::State>,
 }
 
 impl<S> MacOsViewHost<S> {
@@ -867,7 +949,13 @@ impl<S> MacOsViewHost<S> {
             options.webkit_data_store_identifier,
             options.new_webview_destination_handler,
         );
+        #[cfg(feature = "macos-webkit")]
+        let callbacks = Rc::new(RefCell::new(SystemCallbacks::new(wake)));
+        #[cfg(feature = "macos-webkit-automation")]
+        let automation = automation::State::new(callbacks.clone(), options.automation_selection);
         Self {
+            #[cfg(feature = "macos-webkit-automation")]
+            automation,
             #[cfg(feature = "servo")]
             servo,
             #[cfg(not(feature = "servo"))]
@@ -878,7 +966,7 @@ impl<S> MacOsViewHost<S> {
             #[cfg(feature = "macos-webkit")]
             system_context: None,
             #[cfg(feature = "macos-webkit")]
-            callbacks: Rc::new(RefCell::new(SystemCallbacks::new(wake))),
+            callbacks,
             #[cfg(feature = "macos-webkit")]
             registrar: None,
             #[cfg(feature = "macos-webkit")]
@@ -953,10 +1041,7 @@ impl<S> MacOsViewHost<S> {
             let children = std::mem::take(&mut *self.pending_children.borrow_mut());
             for (handle, state) in children {
                 if self.system_sink(handle, state.generation).is_live()
-                    || state
-                        .ui_registration
-                        .as_ref()
-                        .is_some_and(|ui| ui.is_active())
+                    || state.ui_callback_is_active()
                 {
                     self.views.insert(handle, MacOsView::System(state));
                 }
@@ -967,10 +1052,7 @@ impl<S> MacOsViewHost<S> {
                 .filter_map(|(&handle, view)| match view {
                     MacOsView::System(state)
                         if !self.system_sink(handle, state.generation).is_live()
-                            && !state
-                                .ui_registration
-                                .as_ref()
-                                .is_some_and(|ui| ui.is_active()) =>
+                            && !state.ui_callback_is_active() =>
                     {
                         Some(handle)
                     }
@@ -982,6 +1064,32 @@ impl<S> MacOsViewHost<S> {
                 .filter_map(|handle| self.views.remove(&handle))
                 .collect();
             drop(retired);
+            #[cfg(feature = "macos-webkit-automation")]
+            if self.automation.retirement_pending.get() {
+                // Destruction above can itself stage callbacks. Do not release
+                // the barrier while any retired owner or UI callback survives.
+                let blocked = self
+                    .pending_children
+                    .borrow()
+                    .iter()
+                    .any(|(&handle, state)| {
+                        !self.system_sink(handle, state.generation).is_live()
+                            || state.ui_callback_is_active()
+                    })
+                    || self.views.iter().any(|(&handle, view)| match view {
+                        MacOsView::System(state) => {
+                            !self.system_sink(handle, state.generation).is_live()
+                                || state.ui_callback_is_active()
+                        }
+                        #[cfg(feature = "servo")]
+                        MacOsView::Servo => false,
+                    });
+                if !blocked {
+                    self.automation.retirement_pending.set(false);
+                    // Re-arm queued work after the ownership boundary, once.
+                    self.automation.wake();
+                }
+            }
         }
         #[cfg(feature = "servo")]
         {
@@ -1019,9 +1127,28 @@ impl<S> MacOsViewHost<S> {
             Some(MacOsView::System(state)) => state.generation,
             _ => return,
         };
+        #[cfg(feature = "macos-webkit-automation")]
+        let saved_automation = self
+            .callbacks
+            .borrow_mut()
+            .views
+            .get_mut(&(webview.raw(), old_generation))
+            .map(|state| std::mem::take(&mut state.automation));
         self.system_sink(webview, old_generation).invalidate();
         let generation = self.next_generation();
         SystemCallbackSink::register(self.callbacks.clone(), webview, generation);
+        #[cfg(feature = "macos-webkit-automation")]
+        if let Some(mut saved) = saved_automation {
+            saved.native = None;
+            saved.attached = false;
+            saved.context = None;
+            self.callbacks
+                .borrow_mut()
+                .views
+                .get_mut(&(webview.raw(), generation))
+                .unwrap()
+                .automation = saved;
+        }
         if let Some(MacOsView::System(state)) = self.views.get_mut(&webview) {
             state.generation = generation;
             state.last_url = None;
@@ -1032,6 +1159,8 @@ impl<S> MacOsViewHost<S> {
 
 impl<S> Drop for MacOsViewHost<S> {
     fn drop(&mut self) {
+        #[cfg(feature = "macos-webkit-automation")]
+        self.automation.disconnect(None);
         #[cfg(feature = "macos-webkit")]
         {
             let pending = std::mem::take(&mut *self.pending_children.borrow_mut());
@@ -1064,6 +1193,17 @@ where
         webview: WebViewHandle,
         options: Self::WebViewOptions,
     ) -> Result<(), HostError> {
+        if options.webkit_automation {
+            if options.kind != MacOsWebViewKind::SystemWebView {
+                return Err(HostError::new(
+                    "WebKit automation is unavailable for Servo views",
+                ));
+            }
+            #[cfg(not(feature = "macos-webkit-automation"))]
+            return Err(HostError::new("macos-webkit-automation is not compiled"));
+            #[cfg(feature = "macos-webkit-automation")]
+            automation::native::check_available()?;
+        }
         match options.kind {
             MacOsWebViewKind::Servo => self.create_webview(session, webview),
             MacOsWebViewKind::SystemWebView => {
@@ -1077,7 +1217,13 @@ where
                         return Err(duplicate_webview(webview));
                     }
                     let generation = self.next_generation();
-                    SystemCallbackSink::register(self.callbacks.clone(), webview, generation);
+                    let sink =
+                        SystemCallbackSink::register(self.callbacks.clone(), webview, generation);
+                    #[cfg(feature = "macos-webkit-automation")]
+                    self.automation
+                        .initialize_view(&sink, options.webkit_automation);
+                    #[cfg(not(feature = "macos-webkit-automation"))]
+                    let _ = sink;
                     self.views.insert(
                         webview,
                         MacOsView::System(Box::new(SystemWebViewState::new(generation))),
@@ -1144,6 +1290,8 @@ where
     }
 
     fn shutdown(&mut self) -> Result<(), HostError> {
+        #[cfg(feature = "macos-webkit-automation")]
+        self.automation.disconnect(None);
         self.sync_views();
         #[cfg(feature = "macos-webkit")]
         {
@@ -1192,6 +1340,15 @@ where
     }
 
     fn destroy_webview(&mut self, webview: WebViewHandle) -> Result<(), HostError> {
+        #[cfg(feature = "macos-webkit-automation")]
+        if self
+            .registrar
+            .as_ref()
+            .is_some_and(WebViewRegistrar::is_shutting_down)
+        {
+            // Must precede view_is_servo: sync_views may already drop retired owners.
+            self.automation.disconnect(None);
+        }
         let _is_servo = self.view_is_servo(webview)?;
         #[cfg(feature = "servo")]
         if _is_servo {
@@ -1205,7 +1362,17 @@ where
                 Some(MacOsView::System(state)) => state.generation,
                 _ => return Err(unknown_webview(webview)),
             };
-            self.system_sink(webview, generation).invalidate();
+            let sink = self.system_sink(webview, generation);
+            #[cfg(feature = "macos-webkit-automation")]
+            {
+                automation::dialogs::retire(&sink);
+                if let Some(registrar) = &self.registrar {
+                    for event in sink.drain() {
+                        registrar.record_event(webview, event);
+                    }
+                }
+            }
+            sink.invalidate();
             self.views.remove(&webview);
             Ok(())
         }
@@ -1245,6 +1412,10 @@ where
                     matches!(view, MacOsView::System(_)).then_some(handle)
                 })
                 .collect();
+            #[cfg(feature = "macos-webkit-automation")]
+            while self.automation.pump_one() {
+                self.sync_views();
+            }
             #[cfg(feature = "servo")]
             let servo_result = self.servo.perform_all_updates(&servo_views);
             self.sync_views();
@@ -1413,6 +1584,16 @@ where
                 .expect("attached system webview has a container")
                 .detach();
             state.viewport = None;
+            #[cfg(feature = "macos-webkit-automation")]
+            {
+                self.callbacks
+                    .borrow_mut()
+                    .views
+                    .get_mut(&(webview.raw(), state.generation))
+                    .unwrap()
+                    .automation
+                    .attached = false;
+            }
             // The SDK container and native document survive independently of the
             // initial app slot. Release its lease only after leaving the hierarchy.
             let parent = state.destination_parent.take();
@@ -1623,10 +1804,7 @@ where
             }
             if let Some(MacOsView::System(state)) = self.views.get(&webview) {
                 if !self.system_sink(webview, state.generation).is_live()
-                    && !state
-                        .ui_registration
-                        .as_ref()
-                        .is_some_and(|ui| ui.is_active())
+                    && !state.ui_callback_is_active()
                 {
                     self.views.remove(&webview);
                     return Err(unknown_webview(webview));
@@ -1699,6 +1877,14 @@ where
         }
         #[cfg(feature = "macos-webkit")]
         {
+            #[cfg(feature = "macos-webkit-automation")]
+            {
+                let generation = system_state_mut(&mut self.views, webview)?.generation;
+                let sink = self.system_sink(webview, generation);
+                automation::dialogs::resolve(&sink, dialog_id, confirmed, prompt_value)?;
+                Ok(sink.drain())
+            }
+            #[cfg(not(feature = "macos-webkit-automation"))]
             Err(system_unsupported(webview, "Servo dialog resolution"))
         }
         #[cfg(not(feature = "macos-webkit"))]
@@ -1831,6 +2017,13 @@ where
     }
 
     fn perform_updates(&mut self, webview: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
+        #[cfg(feature = "macos-webkit-automation")]
+        {
+            self.sync_views();
+            while self.automation.pump_one() {
+                self.sync_views();
+            }
+        }
         let _is_servo = self.view_is_servo(webview)?;
         #[cfg(feature = "servo")]
         if _is_servo {
@@ -1993,6 +2186,16 @@ where
         }
         state.pending_commands.clear();
         state.viewport = Some(viewport);
+        #[cfg(feature = "macos-webkit-automation")]
+        {
+            host.callbacks
+                .borrow_mut()
+                .views
+                .get_mut(&sink.target)
+                .unwrap()
+                .automation
+                .attached = true;
+        }
         events.extend(collect_system_updates(
             &mut host.views,
             &host.callbacks,
@@ -2037,6 +2240,8 @@ where
             return Err(error);
         }
     };
+    #[cfg(feature = "macos-webkit-automation")]
+    host.automation.attached(&sink, webview, &native.webview());
     let state = system_state_mut(&mut host.views, webview)?;
     state.ui_registration = Some(ui);
     state.icon_registration = favicon::IconRegistration::attach(&native, sink.clone());
@@ -2084,11 +2289,37 @@ fn build_system_webview(
     sink: SystemCallbackSink,
     context: &mut Option<SystemWebViewContext>,
 ) -> Result<WebView, HostError> {
+    #[cfg(feature = "macos-webkit-automation")]
+    let eligible = automation::dialogs::enabled(&sink);
     let mut builder = system_webview_builder(sink)
         .with_bounds(wry_rect(viewport))
         .with_data_store_identifier(data_store_identifier.0);
     if let Some(context) = context {
-        builder = builder.with_webview_configuration(context.configuration());
+        let configuration = context.configuration();
+        #[cfg(feature = "macos-webkit-automation")]
+        if eligible {
+            automation::native::configure(&configuration, true);
+        }
+        builder = builder.with_webview_configuration(configuration);
+    }
+    #[cfg(feature = "macos-webkit-automation")]
+    if context.is_none() && eligible {
+        let mtm =
+            MainThreadMarker::new().ok_or_else(|| HostError::new("AppKit main thread required"))?;
+        // Preserve Wry's selected named data-store behavior when supplying the
+        // first configuration ourselves to set eligibility before allocation.
+        let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
+        let store_class = objc2::runtime::AnyClass::get(c"WKWebsiteDataStore").unwrap();
+        if store_class.responds_to(sel!(dataStoreForIdentifier:)) {
+            let identifier = objc2_foundation::NSUUID::from_bytes(data_store_identifier.0);
+            unsafe {
+                configuration.setWebsiteDataStore(
+                    &objc2_web_kit::WKWebsiteDataStore::dataStoreForIdentifier(&identifier, mtm),
+                );
+            }
+        }
+        automation::native::configure(&configuration, true);
+        builder = builder.with_webview_configuration(configuration);
     }
     let native = builder.build_as_child(parent).map_err(wry_error)?;
     if context.is_none() {
@@ -3175,6 +3406,196 @@ mod tests {
                 );
             }
             self.dropped.set(self.dropped.get() + 1);
+        }
+    }
+
+    #[cfg(feature = "macos-webkit-automation")]
+    #[test]
+    fn automation_retirement_barrier_waits_for_owners_and_callback_exit() {
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        struct Lease {
+            owner: Weak<automation::State>,
+            pending: Weak<SystemChildViews>,
+            events: Rc<RefCell<Vec<&'static str>>>,
+        }
+        impl HasWindowHandle for Lease {
+            fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+                Err(HandleError::Unavailable)
+            }
+        }
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                assert!(
+                    self.owner.upgrade().unwrap().retirement_pending.get(),
+                    "barrier must outlive owner release"
+                );
+                assert!(
+                    self.pending.upgrade().unwrap().try_borrow_mut().is_ok(),
+                    "no staging guard crosses owner destruction"
+                );
+                self.events.borrow_mut().push("drop");
+            }
+        }
+        for staged in [false, true] {
+            for active in [false, true] {
+                for disconnect in [false, true] {
+                    let (mut runtime, host) = staging_runtime();
+                    let session = runtime.create_session();
+                    let source = runtime.create_webview(session).unwrap();
+                    let candidate = if staged {
+                        staged_child(&host.borrow(), source)
+                    } else {
+                        runtime.create_webview(session).unwrap()
+                    };
+                    let events = Rc::new(RefCell::new(Vec::new()));
+                    let wake_count = Arc::new(AtomicUsize::new(0));
+                    let signal = wake_count.clone();
+                    let (owner, token) = {
+                        let mut host = host.borrow_mut();
+                        host.callbacks.borrow_mut().wake = Arc::new(move || {
+                            signal.fetch_add(1, Ordering::Relaxed);
+                        });
+                        let owner = host.automation.clone();
+                        let token =
+                            automation::tests::seed_retirement_probe(&owner, events.clone());
+                        let lease = Rc::new(Lease {
+                            owner: Rc::downgrade(&owner),
+                            pending: Rc::downgrade(&host.pending_children),
+                            events: events.clone(),
+                        });
+                        let generation = if staged {
+                            let mut pending = host.pending_children.borrow_mut();
+                            let state = pending.get_mut(&candidate).unwrap();
+                            state.destination_parent = Some(lease);
+                            state.test_callback_depth.set(usize::from(active));
+                            state.generation
+                        } else {
+                            let state = system_state_mut(&mut host.views, candidate).unwrap();
+                            state.destination_parent = Some(lease);
+                            state.test_callback_depth.set(usize::from(active));
+                            state.generation
+                        };
+                        host.system_sink(candidate, generation).invalidate();
+                        host.registrar.as_ref().unwrap().retire_webview(candidate);
+                        (owner, token)
+                    };
+                    assert!(
+                        automation::tests::resolve_probe(&owner, token, Some(source))
+                            .unwrap_err()
+                            .to_string()
+                            .contains("retirement")
+                    );
+                    assert!(
+                        !owner.pump_one(),
+                        "queued native work stays queued at the barrier"
+                    );
+                    assert!(events.borrow().is_empty());
+                    if disconnect {
+                        owner.disconnect(None);
+                        assert!(owner.retirement_pending.get());
+                        assert!(automation::tests::resolve_probe(&owner, token, None)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("stale"));
+                    }
+                    let before = wake_count.load(Ordering::Relaxed);
+                    host.borrow_mut().sync_views();
+                    if active {
+                        assert!(events.borrow().is_empty());
+                        assert!(owner.retirement_pending.get());
+                        assert_eq!(wake_count.load(Ordering::Relaxed), before);
+                        system_state_mut(&mut host.borrow_mut().views, candidate)
+                            .unwrap()
+                            .test_callback_depth
+                            .set(0);
+                        host.borrow_mut().sync_views();
+                    }
+                    assert_eq!(*events.borrow(), ["drop"]);
+                    assert!(!owner.retirement_pending.get());
+                    assert_eq!(wake_count.load(Ordering::Relaxed), before + 1);
+                    host.borrow_mut().sync_views();
+                    assert_eq!(
+                        wake_count.load(Ordering::Relaxed),
+                        before + 1,
+                        "clearing the barrier wakes once, without a spin"
+                    );
+                    if disconnect {
+                        assert!(automation::tests::resolve_probe(&owner, token, None)
+                            .unwrap_err()
+                            .to_string()
+                            .contains("stale"));
+                        assert!(!owner.pump_one());
+                    } else {
+                        automation::tests::resolve_probe(&owner, token, None).unwrap();
+                        assert!(
+                            owner.pump_one(),
+                            "paused native command resumes after owner release"
+                        );
+                        assert!(!owner.pump_one());
+                        assert_eq!(*events.borrow(), ["drop", "dispatch", "dispatch"]);
+                    }
+                    assert!(host.borrow().views.contains_key(&source));
+                    assert!(!host.borrow().views.contains_key(&candidate));
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "macos-webkit-automation")]
+    #[test]
+    fn final_shutdown_disconnects_before_owner_retirement_including_sync_views() {
+        struct Lease {
+            check: Box<dyn Fn()>,
+            count: Rc<Cell<usize>>,
+        }
+        impl HasWindowHandle for Lease {
+            fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
+                Err(HandleError::Unavailable)
+            }
+        }
+        impl Drop for Lease {
+            fn drop(&mut self) {
+                (self.check)();
+                self.count.set(self.count.get() + 1);
+            }
+        }
+        for retired_count in 0..=2 {
+            let (mut runtime, host) = staging_runtime();
+            let session = runtime.create_session();
+            let first = runtime.create_webview(session).unwrap();
+            let second = runtime.create_webview(session).unwrap();
+            let count = Rc::new(Cell::new(0));
+            {
+                let mut host = host.borrow_mut();
+                let check = automation::tests::pending_shutdown_probe(&host.automation);
+                system_state_mut(&mut host.views, first)
+                    .unwrap()
+                    .destination_parent = Some(Rc::new(Lease {
+                    check: Box::new(check),
+                    count: count.clone(),
+                }));
+                if retired_count > 0 {
+                    let generation = system_state_mut(&mut host.views, first).unwrap().generation;
+                    host.system_sink(first, generation).invalidate();
+                    host.registrar.as_ref().unwrap().retire_webview(first);
+                    // first stays in the host until second's view_is_servo calls
+                    // sync_views. Disconnect must already have happened then.
+                    assert!(host.views.contains_key(&first));
+                    assert!(host.views.contains_key(&second));
+                    if retired_count == 2 {
+                        let generation = system_state_mut(&mut host.views, second)
+                            .unwrap()
+                            .generation;
+                        host.system_sink(second, generation).invalidate();
+                        host.registrar.as_ref().unwrap().retire_webview(second);
+                    }
+                }
+            }
+            runtime.shutdown().unwrap();
+            assert_eq!(count.get(), 1);
         }
     }
 

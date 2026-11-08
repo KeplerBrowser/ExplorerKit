@@ -652,6 +652,7 @@ impl WebViewState {
 
 #[derive(Debug, Default)]
 struct RuntimeRegistry {
+    shutting_down: bool,
     next_session_id: u64,
     next_webview_id: u64,
     sessions: HashSet<SessionHandle>,
@@ -716,7 +717,11 @@ impl RuntimeRegistry {
     fn destroy_webview(&mut self, webview: WebViewHandle) {
         self.webviews.remove(&webview);
         for queue in [&mut self.events, &mut self.journal] {
-            queue.retain(|event| event.webview != webview || event.created_webview.is_some());
+            queue.retain(|event| {
+                event.webview != webview
+                    || event.created_webview.is_some()
+                    || matches!(event.event, HostEvent::SimpleDialogDismissed { .. })
+            });
         }
     }
 }
@@ -731,6 +736,20 @@ pub struct WebViewRegistrar {
 }
 
 impl WebViewRegistrar {
+    /// Observes the consuming Runtime shutdown phase for native lifecycle owners.
+    ///
+    /// This is set before the first view teardown attempt. Ordinary destruction
+    /// and retries leave it false. Final engine shutdown still happens afterward.
+    #[doc(hidden)]
+    pub fn is_shutting_down(&self) -> bool {
+        self.registry.upgrade().is_some_and(|registry| {
+            registry
+                .lock()
+                .expect("Runtime registry poisoned")
+                .shutting_down
+        })
+    }
+
     /// Reserves an ordinary handle in the live source's existing session.
     ///
     /// Reserve before accepting the native request. Until commit, the handle is
@@ -1013,7 +1032,9 @@ impl<H: Host> Runtime<H> {
     ///
     /// The host detaches the renderer before dropping the underlying view. On success,
     /// queued ordinary events for this view are discarded; committed child-creation
-    /// receipts survive. Later commands return `UnknownWebView`.
+    /// receipts survive. Terminal `SimpleDialogDismissed` receipts also survive,
+    /// so a native completion settled during destruction can dismiss host UI.
+    /// This does not synthesize `Closed`; later commands return `UnknownWebView`.
     pub fn destroy_webview(&mut self, webview: WebViewHandle) -> Result<(), RuntimeError> {
         self.webview_state(webview, |_| ())?;
         self.call_host(|host| host.destroy_webview(webview))?;
@@ -1036,6 +1057,12 @@ impl<H: Host> Runtime<H> {
     /// independent exit deadline before entering shutdown, without moving the engine
     /// off its owning thread. ExplorerKit does not terminate the app on its behalf.
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
+        // Notify lifecycle owners before even snapshotting views: a native host's
+        // synchronization can release previously retired owners during teardown.
+        self.registry
+            .lock()
+            .expect("Runtime registry poisoned")
+            .shutting_down = true;
         let views = self.live_views();
         let mut first_error = None;
         for view in views {
@@ -2407,6 +2434,191 @@ mod tests {
             target_url: None,
             window_features: None,
             wants_popup: None,
+        }
+    }
+
+    #[test]
+    fn final_shutdown_is_observable_before_every_teardown_and_preserves_final_host_order() {
+        use std::cell::RefCell;
+        struct Probe {
+            registrar: Option<WebViewRegistrar>,
+            calls: Rc<RefCell<Vec<(String, bool)>>>,
+            fail_destroy: Rc<std::cell::Cell<bool>>,
+            fail_shutdown: bool,
+        }
+        impl Probe {
+            fn record(&self, call: String) {
+                let registrar = self.registrar.as_ref().unwrap();
+                let registry = registrar.registry.upgrade().unwrap();
+                assert!(
+                    registry.try_lock().is_ok(),
+                    "no registry guard crosses a host callback"
+                );
+                self.calls
+                    .borrow_mut()
+                    .push((call, registrar.is_shutting_down()));
+            }
+        }
+        impl Host for Probe {
+            fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
+                self.registrar = Some(registrar);
+            }
+            fn create_webview(
+                &mut self,
+                _: SessionHandle,
+                _: WebViewHandle,
+            ) -> Result<(), HostError> {
+                Ok(())
+            }
+            fn destroy_webview(&mut self, view: WebViewHandle) -> Result<(), HostError> {
+                self.record(format!("destroy:{}", view.raw()));
+                if self.fail_destroy.get() {
+                    Err(HostError::new("injected teardown failure"))
+                } else {
+                    Ok(())
+                }
+            }
+            fn observe_webview_events(
+                &mut self,
+                _: WebViewHandle,
+                _: &[HostEvent],
+            ) -> Result<(), HostError> {
+                Ok(())
+            }
+            fn shutdown(&mut self) -> Result<(), HostError> {
+                self.record("shutdown".into());
+                if self.fail_shutdown {
+                    Err(HostError::new("injected final failure"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+        impl Drop for Probe {
+            fn drop(&mut self) {
+                self.record("drop".into());
+            }
+        }
+        for (count, fail, final_fail) in [
+            (0, false, false),
+            (2, false, false),
+            (2, true, false),
+            (2, true, true),
+            (0, false, true),
+        ] {
+            let calls = Rc::new(RefCell::new(Vec::new()));
+            let failed = Rc::new(std::cell::Cell::new(fail));
+            let mut runtime = Runtime::new(Probe {
+                registrar: None,
+                calls: calls.clone(),
+                fail_destroy: failed,
+                fail_shutdown: final_fail,
+            });
+            let session = runtime.create_session();
+            for _ in 0..count {
+                runtime.create_webview(session).unwrap();
+            }
+            let result = runtime.shutdown();
+            assert_eq!(result.is_err(), fail || final_fail);
+            if let Err(error) = result {
+                assert_eq!(
+                    error.to_string(),
+                    if fail {
+                        "injected teardown failure"
+                    } else {
+                        "injected final failure"
+                    }
+                );
+            }
+            let expected: Vec<_> = (1..=count)
+                .map(|id| (format!("destroy:{id}"), true))
+                .chain([("shutdown".into(), true), ("drop".into(), true)])
+                .collect();
+            assert_eq!(*calls.borrow(), expected);
+        }
+        // A failed ordinary destruction is retryable and never enters shutdown.
+        let calls = Rc::new(RefCell::new(Vec::new()));
+        let failed = Rc::new(std::cell::Cell::new(true));
+        let mut runtime = Runtime::new(Probe {
+            registrar: None,
+            calls: calls.clone(),
+            fail_destroy: failed.clone(),
+            fail_shutdown: false,
+        });
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        assert!(runtime.destroy_webview(view).is_err());
+        failed.set(false);
+        runtime.destroy_webview(view).unwrap();
+        drop(runtime);
+        assert_eq!(
+            *calls.borrow(),
+            [
+                ("destroy:1".into(), false),
+                ("destroy:1".into(), false),
+                ("drop".into(), false)
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_destroy_preserves_only_terminal_dialog_and_child_receipts_in_both_queues() {
+        for journal in [false, true] {
+            let mut runtime = Runtime::new(JournalHost::default());
+            let session = runtime.create_session();
+            let source = runtime.create_webview(session).unwrap();
+            let registrar = runtime.host().registrar.clone().unwrap();
+            runtime.drain_events();
+            for event in [
+                HostEvent::SimpleDialogRequested {
+                    dialog_id: "pending".into(),
+                    kind: crate::SimpleDialogKind::Alert,
+                    message: "message".into(),
+                    default_value: None,
+                },
+                HostEvent::PageTitleChanged {
+                    title: Some("obsolete".into()),
+                },
+                HostEvent::JavaScriptEvaluationResult {
+                    evaluation_id: "obsolete".into(),
+                    ok: true,
+                    value_json: Some("1".into()),
+                    error_type: None,
+                },
+                HostEvent::SimpleDialogDismissed {
+                    dialog_id: "pending".into(),
+                },
+            ] {
+                registrar.record_event(source, event);
+            }
+            let child = registrar.reserve_child(source, "created".into()).unwrap();
+            let child_handle = child.webview();
+            child.commit(creation("created", "native-child"));
+            if !journal {
+                runtime.registry.lock().unwrap().drain_journal();
+            }
+            runtime.destroy_webview(source).unwrap();
+            registrar.record_event(
+                source,
+                HostEvent::SimpleDialogDismissed {
+                    dialog_id: "late".into(),
+                },
+            );
+            let events = runtime.drain_events();
+            let source_events: Vec<_> = events
+                .iter()
+                .filter(|event| event.webview == source)
+                .collect();
+            assert_eq!(source_events.len(), 2);
+            assert!(
+                matches!(&source_events[0].event, HostEvent::SimpleDialogDismissed { dialog_id } if dialog_id == "pending")
+            );
+            assert_eq!(source_events[1].created_webview, Some(child_handle));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event.event, HostEvent::Closed)));
+            assert!(runtime.reload(source).is_err());
+            assert!(runtime.reload(child_handle).is_ok());
         }
     }
 

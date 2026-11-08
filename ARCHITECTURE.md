@@ -73,8 +73,9 @@ accepted design decision first.
 3. **Browser logic lives in Rust, once.** Command names, field validation,
    request IDs, pending prompts, and answer checking are written in Rust and
    shared by every platform. Writing them once is what keeps them consistent.
-   Known gap: macOS system web views don't pass prompts to the app yet, so
-   WebKit's defaults apply.
+   macOS system views opted into automation share Rust's simple-dialog records
+   and answer checking. Other system-view prompts use WebKit's defaults; see
+   [macOS automation](docs/reference/macos-webkit-automation.md#handle-page-dialogs).
 
 4. **Adapters stay thin.** Platform code owns only what the platform forces on
    it: views, native handles, input translation, presentation, threads, and
@@ -86,6 +87,11 @@ accepted design decision first.
    one versioned JSON envelope, parsed only by `ControllerCommand` in Rust.
    Surfaces, input, and the update loop have their own APIs and stay out of
    the envelope.
+   The opt-in macOS WebKit automation adapter connects standard WebDriver
+   clients to the engine's native protocol dispatcher. It does not translate
+   that protocol into a second SDK command language. Rust prepares ordinary
+   views before native creation and owns their lifetimes and pending dialogs;
+   minidriver and WebKit own protocol validation, execution and replies.
 
 6. **A web view outlives its surface.** A web view can exist before, between,
    and after surfaces. Detaching keeps its page and state. Disposing it makes
