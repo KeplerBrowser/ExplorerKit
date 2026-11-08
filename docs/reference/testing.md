@@ -187,6 +187,15 @@ covers cleanup when a window closes or the app quits, with both orders of
 logger setup, and with shutdown through the original host or a fresh
 replacement host. Every combination must exit successfully.
 
+That check does not cover SharedWorker shutdown stalls. When a host changes
+its [final process-exit policy](../concepts/surfaces.md#final-process-exit-when-servo-shutdown-stalls),
+check a no-worker normal exit and a SharedWorker deadline exit with the actual
+terminal primitive. Reopen each disposable profile in a new process and check
+one persistent cookie and one app-owned saved marker. Record the revision,
+commands, deadline observations and limits in the PR; keep one-time proof tools
+out of production source. A consumer app must also check its own update and
+relaunch ordering.
+
 ### GPU frame export on macOS
 
 For `OffscreenSurface::exportable()`, check by hand that you can: consume

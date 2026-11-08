@@ -1024,13 +1024,17 @@ impl<H: Host> Runtime<H> {
         Ok(())
     }
 
-    /// Closes all views and performs final host shutdown, consuming this runtime.
+    /// Attempts to close all views and perform final host shutdown, consuming this runtime.
     ///
     /// Call at application exit while the owning thread, native surfaces and logging
     /// remain alive. Servo cannot initialize again after final shutdown. Ordinary
     /// drop closes the views but retains the process engine for subsequent host creation.
     /// All views and the host receive a cleanup attempt even if one fails; the first
-    /// error is returned after final cleanup.
+    /// error is returned if those attempts return. A Servo-backed host can block inside
+    /// native engine destruction. This call provides no timeout or separate profile-write
+    /// completion notification. An app committed to final process exit must arrange any
+    /// independent exit deadline before entering shutdown, without moving the engine
+    /// off its owning thread. ExplorerKit does not terminate the app on its behalf.
     pub fn shutdown(mut self) -> Result<(), RuntimeError> {
         let views = self.live_views();
         let mut first_error = None;

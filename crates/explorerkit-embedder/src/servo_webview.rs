@@ -683,11 +683,15 @@ pub struct ServoRuntime {
 }
 
 impl ServoRuntime {
-    /// Permanently shuts down the process engine after every view and other owner
+    /// Requests permanent shutdown of the process engine after every view and other owner
     /// clone has been dropped. Ordinary drop releases the lease for later reuse.
     ///
     /// Servo supports only one engine initialization per process. Subsequent
     /// acquisition after this call returns an error, rather than rebuilding Servo.
+    /// Shutdown is synchronous and can block inside Servo; there is no timeout or
+    /// separate profile-write completion notification. Arm any host-owned final process-exit
+    /// deadline before this call; it must not depend on the engine's owning thread
+    /// making progress.
     pub fn shutdown(self) -> Result<(), String> {
         let lease = Rc::try_unwrap(self.lease)
             .map_err(|_| "cannot shut down Servo while views or owner clones remain".to_owned())?;
@@ -699,6 +703,8 @@ impl ServoRuntime {
     ///
     /// This also supports finalizing a host that never attached a surface. It must
     /// run on the engine's owning thread and cannot retire another live owner's engine.
+    /// Dropping the retained engine is synchronous and can block inside Servo. This
+    /// method does not impose a deadline or terminate the host process.
     pub fn shutdown_retained() -> Result<(), String> {
         if PROCESS_SERVO_THREAD
             .get()
