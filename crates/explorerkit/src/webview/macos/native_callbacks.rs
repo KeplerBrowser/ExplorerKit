@@ -2,6 +2,8 @@
 
 use std::cell::Cell;
 
+#[cfg(feature = "macos-webkit-automation")]
+use super::automation::dialogs;
 use block2::DynBlock;
 use objc2::{
     define_class, msg_send,
@@ -10,6 +12,8 @@ use objc2::{
     sel, DefinedClass, MainThreadOnly,
 };
 use objc2_foundation::{NSArray, NSObject, NSObjectProtocol, NSURL};
+#[cfg(feature = "macos-webkit-automation")]
+use objc2_foundation::{NSRect, NSString};
 use objc2_web_kit::{
     WKFrameInfo, WKMediaCaptureType, WKNavigationAction, WKOpenPanelParameters,
     WKPermissionDecision, WKSecurityOrigin, WKUIDelegate, WKWebView, WKWebViewConfiguration,
@@ -48,6 +52,15 @@ define_class!(
         }
     }
 
+    impl SystemUiDelegate {
+        #[cfg(feature = "macos-webkit-automation")]
+        #[unsafe(method(_webView:getWindowFrameWithCompletionHandler:))]
+        fn window_frame(&self, view: &WKWebView, completion: &DynBlock<dyn Fn(NSRect)>) {
+            let _callback = self.enter();
+            completion.call((view.window().map(|window| window.frame()).unwrap_or_default(),));
+        }
+    }
+
     unsafe impl WKUIDelegate for SystemUiDelegate {
         #[unsafe(method_id(webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:))]
         fn create(
@@ -73,6 +86,36 @@ define_class!(
             if view as *const WKWebView as usize == self.ivars().native_identity {
                 self.ivars().callbacks.closed();
             }
+        }
+
+        #[cfg(feature = "macos-webkit-automation")]
+        #[unsafe(method(webView:runJavaScriptAlertPanelWithMessage:initiatedByFrame:completionHandler:))]
+        fn alert(&self, _: &WKWebView, message: &NSString, _: &WKFrameInfo, completion: &DynBlock<dyn Fn()>) {
+            let _callback = self.enter();
+            let sink = &self.ivars().callbacks.sink;
+            if dialogs::enabled(sink) {
+                dialogs::capture(sink, explorerkit_embedder::SimpleDialogKind::Alert, message.to_string(), None, dialogs::Completion::alert(completion));
+            } else { completion.call(()); }
+        }
+
+        #[cfg(feature = "macos-webkit-automation")]
+        #[unsafe(method(webView:runJavaScriptConfirmPanelWithMessage:initiatedByFrame:completionHandler:))]
+        fn confirm(&self, _: &WKWebView, message: &NSString, _: &WKFrameInfo, completion: &DynBlock<dyn Fn(objc2::runtime::Bool)>) {
+            let _callback = self.enter();
+            let sink = &self.ivars().callbacks.sink;
+            if dialogs::enabled(sink) {
+                dialogs::capture(sink, explorerkit_embedder::SimpleDialogKind::Confirm, message.to_string(), None, dialogs::Completion::confirm(completion));
+            } else { completion.call((objc2::runtime::Bool::NO,)); }
+        }
+
+        #[cfg(feature = "macos-webkit-automation")]
+        #[unsafe(method(webView:runJavaScriptTextInputPanelWithPrompt:defaultText:initiatedByFrame:completionHandler:))]
+        fn prompt(&self, _: &WKWebView, message: &NSString, default_text: Option<&NSString>, _: &WKFrameInfo, completion: &DynBlock<dyn Fn(*mut NSString)>) {
+            let _callback = self.enter();
+            let sink = &self.ivars().callbacks.sink;
+            if dialogs::enabled(sink) {
+                dialogs::capture(sink, explorerkit_embedder::SimpleDialogKind::Prompt, message.to_string(), default_text.map(ToString::to_string), dialogs::Completion::prompt(completion));
+            } else { completion.call((std::ptr::null_mut(),)); }
         }
 
         #[unsafe(method(webView:runOpenPanelWithParameters:initiatedByFrame:completionHandler:))]

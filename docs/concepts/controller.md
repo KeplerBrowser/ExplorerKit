@@ -13,8 +13,9 @@ Apps talk to a web view in three ways:
 ExplorerKit handles all three in Rust, in one place, so every platform behaves
 the same way. Platform adapters carry messages in and out, but don't decide
 what they mean. This holds for Servo views and for the iOS `WKWebView`
-adapter. macOS system web views use WebKit's own defaults for page prompts;
-see [macOS system web view](../reference/macos-system-webview.md).
+adapter. macOS system views opted into automation also use the shared Rust
+simple-dialog flow. Other system-view prompts use WebKit's defaults; see
+[macOS automation dialogs](../reference/macos-webkit-automation.md#handle-page-dialogs).
 
 ## Who decides what
 
@@ -37,6 +38,11 @@ completing the same native callback twice, but Rust decides when a prompt
 exists and when it is over.
 
 ## The command envelope
+
+Standard WebDriver clients on the opt-in macOS WebKit path use the engine's
+native dispatcher, outside this SDK envelope. The adapter prepares SDK views
+and shares pending dialog state; it does not implement another driver. See
+[the native connection](../reference/macos-webkit-automation.md#connect-the-helper).
 
 Every command is one JSON object with a version, a command name, and its
 fields:

@@ -19,6 +19,7 @@ your host:
 | --- | --- |
 | `servo` | Servo |
 | `macos-webkit` | System WebKit integration, without Servo |
+| `macos-webkit-automation` | System WebKit with opt-in native automation, without Servo |
 | `servo, macos-webkit` | Both |
 | `macos-system-webview` | Both; preserves the existing build flag |
 
@@ -57,7 +58,7 @@ Your delegate's `appkit_parent` returns the live AppKit parent view for a
 slot. ExplorerKit creates the system view inside it and never takes ownership of
 your window.
 
-Both engine-kind variants and the host's constructor stay the same in all three
+Both engine-kind variants and the host's constructor stay the same across these
 builds. `MacOsWebViewOptions::default()` and `Runtime::create_webview` still
 select Servo. In a WebKit-only build, explicitly select `SystemWebView` as
 above. Selecting an engine omitted from the build returns a `HostError` through
@@ -101,6 +102,10 @@ Servo-only; these choices apply to the native Rust facade.
 - **Defaults.** WebKit applies its own defaults for normal navigation and
   permissions. New windows are denied unless explicitly enabled as described
   below. Downloads are denied.
+- **Automation.** Hosts can opt ordinary views into the experimental
+  [native WebDriver connection](macos-webkit-automation.md). Those views also
+  use the shared SDK simple-dialog flow. The host owns eligibility, helper
+  processes and presentation.
 - **Storage.** System views use a WebKit data store named by your
   `WebKitDataStoreIdentifier`. Use the same identifier to keep cookies, local
   storage, and IndexedDB across launches; use a different one to isolate

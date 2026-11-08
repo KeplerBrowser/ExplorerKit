@@ -50,6 +50,39 @@ native Rust, but its React Native wiring is incomplete and not supported.
 
 ## Details by capability
 
+### Native automation
+
+The experimental `macos-webkit-automation` feature supports native Rust hosts
+using **macOS system WebKit** with a compatible patched minidriver. It does not
+add automation to Servo, React Native or mobile adapters. See
+[setup and ownership](macos-webkit-automation.md).
+
+Validation is limited to arm64 macOS 27.0.1 with system WebKit
+22625.1.29.11.28. The adapter uses private WebKit APIs and checks availability
+at runtime. The validated helper binary declares a macOS 27.0 minimum. Building
+the SDK host for macOS 14 does not make that helper launchable on macOS 14 or
+prove automation support on its installed WebKit.
+
+| Operation | Validated behavior or limit |
+| --- | --- |
+| Existing views | Explicit enrollment and native context mapping without replacing the document; ordinary detach/reattach preserves identity. |
+| New views | Host prepares an ordinary attached SDK view for Classic New Window or BiDi `browsingContext.create`; native popup children inherit enrollment. |
+| Classic commands | Native script reads, element click, pointer actions, successful release state, screenshots and shared JavaScript dialogs. |
+| BiDi | Native context tree and load events; partial support, not full conformance. |
+| BiDi tree reliability | Queries have timed out during new-page startup and after ordinary close on the tested runtime. Waiting for initial load does not eliminate all observed timeouts. |
+| Session teardown | Delete Session, stream loss and explicit disconnect preserve existing views; reconnect uses fresh session-local mappings. Explicit Close Window retires its view. |
+| Input after a failed batch | A mouse-down followed by an invalid move can leave release without the expected mouse-up. Successful-batch release does not prove recovery from partial failure. |
+| BiDi input | The tested system WebKit has no native BiDi input domain. Use the supported Classic commands. |
+| Lifecycle events | Top-level `browsingContext.contextCreated` is missing; iframe destruction can report an identity that differs from the tree. |
+| Invalid creation | Preparing and retiring a temporary candidate can emit native lifecycle events even though the command fails. |
+| Window management | Missing optional native window callbacks can produce success without a layout effect. The SDK does not manage OS windows. |
+
+Native input still depends on view visibility and focus; background input is
+not guaranteed. Classic selected-window state is shared by the session, so the
+host must coordinate competing workflows. Eligibility is an enumeration policy,
+not per-agent authorization or storage isolation. The adapter forwards native
+replies/events without repairing the documented engine defects.
+
 ### Favicons
 
 - **Native Rust with Servo:** forwards Servo's decoded first frame and pixel
@@ -115,6 +148,9 @@ The page asks before following a link or loading a frame (Servo's
   complete and `confirm` and `prompt` are cancelled. The Rust controller
   applies the same defaults after 60 seconds without an answer.
 - **Native Rust:** answer with `resolve_simple_dialog`.
+- **Native Rust with macOS system WebKit:** views opted into automation share
+  that pending-dialog and answer flow with the driver. Other system views keep
+  native defaults. See [dialog ownership](macos-webkit-automation.md#handle-page-dialogs).
 - Test page: `controls/dialogs.html`.
 
 ### Context menus

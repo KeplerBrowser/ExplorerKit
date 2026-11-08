@@ -50,12 +50,19 @@ Always build with `--locked` so Cargo uses the checked-in lockfile.
 | `tikv-jemalloc-sys` (`crates/vendor/tikv-jemalloc-sys`) | `crates/Cargo.toml`, both desktop examples | Removes an obsolete Android `libgcc` link so Servo links with modern NDKs |
 | `stylo_derive` 0.21.0 (`patches/stylo_derive-0.21.0`) | GPUI example only | GPUI's logging stack makes Stylo's generated `ToCss` error conversion ambiguous. The patch replaces the ambiguous `?` with explicit error returns. |
 | `zed-font-kit` 0.14.1-zed (`patches/zed-font-kit-0.14.1-zed`) | GPUI example only | GPUI 0.2.2 needs FreeType 0.20, which conflicts with Servo's FreeType 0.23. The patch applies an upstream manifest-only fix. |
+| `minidriver` (`patches/minidriver`) | Host-bundled macOS automation helper, outside Cargo | Attaches to existing system WebKit views and adapts native mouse input for the tested system backend. |
 
 Each patch folder has a `PATCH.md` with its source, license, and removal
 criteria. Remove a patch as soon as the upstream graph no longer needs it.
 
 If your own app combines GPUI with ExplorerKit, add both GPUI patches to your
 own Cargo root. Cargo does not inherit patches from dependencies.
+
+The minidriver directory retains the exact driver pin, two ordered patches,
+their hashes, upstream notices and a [helper build recipe](../../patches/minidriver/PATCH.md).
+It does not contain or build a replacement WebKit engine. The host packages
+and launches the helper; system WebKit stays supplied by macOS. Rebuilding or
+publishing the helper is separate from compiling ExplorerKit's Rust feature.
 
 ## Updating a dependency
 
@@ -106,14 +113,15 @@ dependency keeps its own license. The main ones:
 
 `crates/Cargo.lock` and `bun.lock` list every dependency.
 
-Three folders hold copies of third-party code. Each keeps its original
-license files:
+The retained third-party sources and patches keep their original license
+files or source notices:
 
 | Folder | License |
 | --- | --- |
 | `crates/vendor/tikv-jemalloc-sys` | MIT or Apache-2.0; the bundled jemalloc source is BSD 2-clause (`jemalloc/COPYING`) |
 | `patches/stylo_derive-0.21.0` | MPL-2.0. Changed files stay under MPL-2.0. |
 | `patches/zed-font-kit-0.14.1-zed` | MIT or Apache-2.0 |
+| `patches/minidriver` | Changed WebDriver files retain their upstream notices. The helper also links WTF and bmalloc; its binary distribution needs the applicable notices for all compiled code. |
 
 The Android AAR, the iOS XCFramework, and the macOS framework contain
 compiled third-party code, including Servo. Before publishing any of them,
