@@ -13,10 +13,13 @@ use raw_window_handle::{
 
 use super::{NativeSurface, SurfaceError, SurfaceSize, SurfaceViewport};
 
+#[cfg(feature = "servo")]
 mod exportable;
+mod gpu_frame;
 
+#[cfg(feature = "servo")]
 pub(crate) use exportable::ExportableRenderingContext;
-pub use exportable::{CVPixelBuffer, GpuFrame, GpuFrameCompletion, GpuFrameInfo};
+pub use gpu_frame::{CVPixelBuffer, GpuFrame, GpuFrameCompletion, GpuFrameInfo};
 
 /// Logical AppKit bounds, in points, for an embedded child surface.
 #[derive(Debug, Clone, Copy, PartialEq)]

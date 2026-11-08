@@ -38,7 +38,9 @@ flowchart TD
 ```
 
 Servo is the engine. The platform's own web view is a compatibility layer
-for what Servo can't do yet. Today, native Rust apps on macOS choose per view,
+for what Servo can't do yet. Native Rust apps on macOS choose which engines
+to compile and, when both are included, choose per view. See
+[macOS build selection](docs/reference/macos-system-webview.md#set-up).
 Android and the other desktop paths use only Servo, and iOS uses only
 `WKWebView`, because Apple requires WebKit for most iOS apps and Servo doesn't
 support iOS yet. On iOS, the same Rust controller logic drives `WKWebView`.

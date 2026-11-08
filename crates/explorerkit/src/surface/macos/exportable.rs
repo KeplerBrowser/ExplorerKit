@@ -1,16 +1,10 @@
 use std::cell::{Cell, RefCell};
-use std::fmt;
-use std::mem;
 use std::rc::Rc;
 use std::sync::{mpsc, Arc};
 
 use core_foundation::{
-    base::{CFRelease, CFRetain, CFTypeRef, TCFType},
-    boolean::CFBoolean,
-    dictionary::CFDictionary,
-    string::CFString,
+    base::TCFType, boolean::CFBoolean, dictionary::CFDictionary, string::CFString,
 };
-pub use core_video::pixel_buffer::CVPixelBuffer;
 use core_video::pixel_buffer::{kCVPixelFormatType_32BGRA, CVPixelBufferKeys};
 use dpi::PhysicalSize;
 use euclid::default::{Size2D, Size2D as UntypedSize2D};
@@ -30,148 +24,7 @@ use super::super::{SurfaceError, SurfaceSize};
 
 const SLOT_COUNT: u32 = 3;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct FrameIdentity {
-    webview: WebViewHandle,
-    generation: u64,
-    slot: u32,
-    frame_serial: u64,
-}
-
-/// Stable identity and physical extent for one exported macOS GPU frame.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct GpuFrameInfo {
-    identity: FrameIdentity,
-    physical_size: SurfaceSize,
-}
-
-impl GpuFrameInfo {
-    /// Returns the webview that produced this frame.
-    pub fn webview(&self) -> WebViewHandle {
-        self.identity.webview
-    }
-
-    /// Returns the physical-size generation that owns this frame.
-    pub fn generation(&self) -> u64 {
-        self.identity.generation
-    }
-
-    /// Returns the producer pool slot identity within its generation.
-    pub fn slot(&self) -> u32 {
-        self.identity.slot
-    }
-
-    /// Returns the monotonically increasing frame identity for this webview.
-    pub fn frame_serial(&self) -> u64 {
-        self.identity.frame_serial
-    }
-
-    /// Returns the exact physical pixel extent of the exported storage.
-    pub fn physical_size(&self) -> SurfaceSize {
-        self.physical_size
-    }
-}
-
-/// A retained opaque BGRA macOS frame exported from ExplorerKit-owned GPU storage.
-#[must_use = "the frame must be completed before ExplorerKit can reuse its storage"]
-pub struct GpuFrame {
-    info: GpuFrameInfo,
-    pixel_buffer: CVPixelBuffer,
-    completion: GpuFrameCompletion,
-}
-
-impl GpuFrame {
-    /// Returns this frame's stable producer identity and physical extent.
-    pub fn info(&self) -> GpuFrameInfo {
-        self.info
-    }
-
-    /// Borrows the retained single-plane opaque 32BGRA CoreVideo pixel buffer.
-    pub fn pixel_buffer(&self) -> &CVPixelBuffer {
-        &self.pixel_buffer
-    }
-
-    /// Splits the frame into its retained pixel buffer and one-shot completion token.
-    pub fn into_parts(self) -> (CVPixelBuffer, GpuFrameCompletion) {
-        (self.pixel_buffer, self.completion)
-    }
-}
-
-impl fmt::Debug for GpuFrame {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GpuFrame")
-            .field("info", &self.info)
-            .finish_non_exhaustive()
-    }
-}
-
-struct PendingCompletion {
-    identity: FrameIdentity,
-    sender: mpsc::Sender<FrameIdentity>,
-    wake: Arc<dyn Fn() + Send + Sync + 'static>,
-    quarantine: Option<IOSurfaceLease>,
-}
-
-struct IOSurfaceLease(usize);
-
-impl IOSurfaceLease {
-    fn new(surface: &SurfmanNativeSurface) -> Self {
-        let reference = CFRetained::as_ptr(&surface.0).as_ptr() as CFTypeRef;
-        // SAFETY: the surfman native surface is live and owns this IOSurface reference.
-        unsafe { CFRetain(reference) };
-        Self(reference as usize)
-    }
-}
-
-impl Drop for IOSurfaceLease {
-    fn drop(&mut self) {
-        // IOSurface is a process-shareable Core Foundation object whose retain/release operations
-        // are thread-safe. Storing the retained address as `usize` keeps the completion token Send
-        // without claiming that surfman's thread-local wrapper itself is Send.
-        unsafe { CFRelease(self.0 as CFTypeRef) };
-    }
-}
-
-/// One-shot acknowledgement that the consumer has finished sampling a GPU frame.
-#[must_use = "dropping an incomplete token permanently quarantines the frame storage"]
-pub struct GpuFrameCompletion {
-    pending: Option<PendingCompletion>,
-}
-
-impl GpuFrameCompletion {
-    /// Acknowledges that all consumer GPU work which can sample this frame has completed.
-    pub fn complete(mut self) {
-        let Some(mut pending) = self.pending.take() else {
-            return;
-        };
-        if pending.sender.send(pending.identity).is_ok() {
-            (pending.wake)();
-        }
-        pending.quarantine.take();
-    }
-}
-
-impl fmt::Debug for GpuFrameCompletion {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("GpuFrameCompletion")
-            .field("pending", &self.pending.is_some())
-            .finish()
-    }
-}
-
-impl Drop for GpuFrameCompletion {
-    fn drop(&mut self) {
-        if let Some(mut pending) = self.pending.take() {
-            // A missing consumer completion must never make the producer allocation reusable.
-            // Leaking one retained IOSurface is the bounded fail-safe; process exit reclaims it.
-            if let Some(quarantine) = pending.quarantine.take() {
-                mem::forget(quarantine);
-            }
-        }
-    }
-}
+use super::gpu_frame::*;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SlotState {

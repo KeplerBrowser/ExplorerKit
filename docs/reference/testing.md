@@ -129,6 +129,40 @@ events.
 
 ### macOS
 
+For changes to macOS engine feature flags, host ownership or shared frame
+types, check each [build configuration](macos-system-webview.md#set-up)
+separately. An all-features run cannot prove either single-engine build:
+
+```sh
+for features in servo macos-webkit servo,macos-webkit macos-system-webview; do
+  cargo test --manifest-path crates/Cargo.toml -p explorerkit --locked \
+    --no-default-features --features "$features" --lib -- --test-threads=1
+done
+```
+
+The facade's build-selection tests check the exact `compiled_engines()` list,
+the unchanged Servo default, unavailable-engine errors, and sibling/registry
+cleanup after failed creation. The WebKit-only run also retains the system
+callback, evaluation and lifecycle regressions. Run the portable quick checks
+above to preserve the no-engine configuration.
+
+For native acceptance, compile the same app-owned `MacOsViewHost` consumer
+source in the three engine configurations. Keep its constructor, delegate,
+`SurfaceFrame` and GPU resource signatures unchanged. Inspect each actual
+consumer's normal/build dependency graph: WebKit-only must exclude the Servo
+engine/rendering dependency chain, and Servo-only must exclude the WebKit
+integration chain. Verify the legacy flag enables both without explicitly
+enabling the two individual flags alongside it.
+
+Exercise real native placement, loading, evaluation, input, resize,
+detach/reattach, original popup children, sibling isolation and cleanup in
+each applicable configuration. Include WebKit store reopen and Servo GPU
+frame/completion evidence. Check staged and closed WebKit children are released
+on updates even when no live views remain, before the app's parent-view
+delegate drops. Record the native evidence and limitations with the change;
+placeholder-host tests do not establish browser behavior. Use the existing
+application Cargo target and one native build stream.
+
 Automatic checks:
 
 ```sh

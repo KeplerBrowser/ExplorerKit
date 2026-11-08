@@ -1,44 +1,70 @@
 //! macOS host adapter for create-time Servo or system-WebView selection.
 
+#[cfg(feature = "macos-webkit")]
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
+#[cfg(feature = "macos-webkit")]
+use std::collections::VecDeque;
+#[cfg(feature = "macos-webkit")]
 use std::ffi::c_void;
+#[cfg(feature = "macos-webkit")]
 use std::ptr::NonNull;
-use std::rc::{Rc, Weak};
+use std::rc::Rc;
+#[cfg(feature = "macos-webkit")]
+use std::rc::Weak;
 
+#[cfg(feature = "macos-webkit")]
 use dpi::{PhysicalPosition, PhysicalSize};
 use explorerkit_embedder::{
     ConfigurableHost, ContextMenuAction, Host, HostError, HostEvent, HostInputEvent,
-    JavaScriptEvaluationErrorKind, LoadStatusKind, NewWebViewDecision, NewWebViewRequest,
-    PopupCreated, PopupRequestPolicy, SessionHandle, WebViewCommand, WebViewHandle,
-    WebViewRegistrar,
+    NewWebViewDecision, NewWebViewRequest, PopupRequestPolicy, SessionHandle, WebViewCommand,
+    WebViewHandle, WebViewRegistrar,
 };
+#[cfg(feature = "macos-webkit")]
+use explorerkit_embedder::{JavaScriptEvaluationErrorKind, LoadStatusKind, PopupCreated};
 use explorerkit_host::{
     HostSurface, NativeSurface, SurfaceDelegate, SurfaceError, SurfaceSize, SurfaceViewport,
 };
+#[cfg(feature = "macos-webkit")]
 use objc2::{msg_send, rc::Retained, sel, MainThreadMarker, MainThreadOnly, Message};
+#[cfg(feature = "macos-webkit")]
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
+#[cfg(feature = "macos-webkit")]
 use objc2_foundation::{NSObject, NSObjectProtocol};
-use raw_window_handle::{
-    AppKitWindowHandle, HandleError, HasWindowHandle, RawWindowHandle, WindowHandle,
-};
+use raw_window_handle::HasWindowHandle;
+#[cfg(feature = "macos-webkit")]
+use raw_window_handle::{AppKitWindowHandle, HandleError, RawWindowHandle, WindowHandle};
+#[cfg(feature = "macos-webkit")]
 use wry::{
     PageLoadEvent, PermissionResponse, Rect, WebView, WebViewBuilder, WebViewBuilderExtDarwin,
     WebViewBuilderExtMacos, WebViewExtMacOS,
 };
 
-use crate::surface::{SurfaceEventLoopWaker, SurfaceFrame, SurfaceHost, SurfaceHostOptions};
+#[cfg(feature = "macos-webkit")]
+use crate::surface::SurfaceEventLoopWaker;
+#[cfg(feature = "servo")]
+use crate::surface::SurfaceHost;
+use crate::surface::{SurfaceFrame, SurfaceHostOptions};
 
+#[cfg(feature = "macos-webkit")]
 mod configuration;
+#[cfg(feature = "macos-webkit")]
 mod favicon;
+#[cfg(feature = "macos-webkit")]
 mod javascript;
+#[cfg(feature = "macos-webkit")]
 mod native_callbacks;
+#[cfg(feature = "macos-webkit")]
 mod observation;
 
+#[cfg(feature = "macos-webkit")]
 use configuration::SystemWebViewContext;
+#[cfg(feature = "macos-webkit")]
 use native_callbacks::SystemUiDelegateRegistration;
+#[cfg(feature = "macos-webkit")]
 use objc2_web_kit::{WKNavigationAction, WKWebView, WKWebViewConfiguration, WKWindowFeatures};
 
+#[cfg(feature = "macos-webkit")]
 use javascript::{evaluation_event, NativeEvaluationError};
 
 /// Stable WKWebView website-data store identity supplied by the host.
@@ -56,6 +82,23 @@ pub enum MacOsWebViewKind {
     Servo,
     /// Create a WRY-owned child WKWebView.
     SystemWebView,
+}
+
+/// Returns the engine integrations compiled into this macOS facade build.
+///
+/// The order is Servo followed by the system WebView when both are compiled.
+/// This does not initialize or probe an engine, promise successful startup, or
+/// report engine capabilities or live engine processes. It does not inventory
+/// engine libraries elsewhere in the application. macOS supplies the system
+/// WebKit engine itself.
+/// Runtime view selection must still choose one of these compiled integrations.
+pub fn compiled_engines() -> &'static [MacOsWebViewKind] {
+    &[
+        #[cfg(feature = "servo")]
+        MacOsWebViewKind::Servo,
+        #[cfg(feature = "macos-webkit")]
+        MacOsWebViewKind::SystemWebView,
+    ]
 }
 
 /// Create-time options for [`MacOsViewHost`].
@@ -81,7 +124,9 @@ pub struct MacOsViewHostOptions {
 
 type NewWebViewDestinationHandler =
     dyn Fn(&NewWebViewRequest) -> Result<AppKitNewWebViewDestination, SurfaceError>;
+#[cfg(feature = "macos-webkit")]
 type NewWebViewHandler = dyn Fn(&NewWebViewRequest) -> NewWebViewDecision;
+#[cfg(feature = "macos-webkit")]
 type SystemChildViews = RefCell<HashMap<WebViewHandle, Box<SystemWebViewState>>>;
 
 /// An already mounted app-owned destination for an original native child.
@@ -89,6 +134,7 @@ type SystemChildViews = RefCell<HashMap<WebViewHandle, Box<SystemWebViewState>>>
 /// The retained parent must own its AppKit view and keep its containing window
 /// valid until successful detach or destruction. ExplorerKit owns only the
 /// native webview and its inner container, not the app window or layout policy.
+#[cfg_attr(not(feature = "macos-webkit"), allow(dead_code))]
 pub struct AppKitNewWebViewDestination {
     surface: HostSurface,
     viewport: SurfaceViewport,
@@ -160,8 +206,10 @@ pub trait AppKitViewDelegate: SurfaceDelegate {
     ) -> Result<NativeSurface<'_>, SurfaceError>;
 }
 
+#[cfg(feature = "macos-webkit")]
 type CallbackTarget = (u64, u64);
 
+#[cfg(feature = "macos-webkit")]
 struct SystemCallbacks {
     views: HashMap<CallbackTarget, SystemCallbackState>,
     wake: SurfaceEventLoopWaker,
@@ -169,6 +217,7 @@ struct SystemCallbacks {
     liveness_checks: Cell<usize>,
 }
 
+#[cfg(feature = "macos-webkit")]
 impl SystemCallbacks {
     fn new(wake: SurfaceEventLoopWaker) -> Self {
         Self {
@@ -181,6 +230,7 @@ impl SystemCallbacks {
 }
 
 #[derive(Default)]
+#[cfg(feature = "macos-webkit")]
 struct SystemCallbackState {
     observed_url: Option<String>,
     observed_navigation_state: Option<(bool, bool)>,
@@ -194,6 +244,7 @@ struct SystemCallbackState {
     favicons: Option<favicon::IconState>,
 }
 
+#[cfg(feature = "macos-webkit")]
 impl SystemCallbackState {
     fn retire_evaluations(&mut self, error: JavaScriptEvaluationErrorKind) {
         for (id, _) in self.pending.drain() {
@@ -203,11 +254,13 @@ impl SystemCallbackState {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "macos-webkit")]
 struct SystemCallbackSink {
     target: CallbackTarget,
     callbacks: Rc<RefCell<SystemCallbacks>>,
 }
 
+#[cfg(feature = "macos-webkit")]
 impl SystemCallbackSink {
     fn register(
         callbacks: Rc<RefCell<SystemCallbacks>>,
@@ -508,10 +561,13 @@ impl SystemCallbackSink {
 }
 
 enum MacOsView {
+    #[cfg(feature = "servo")]
     Servo,
+    #[cfg(feature = "macos-webkit")]
     System(Box<SystemWebViewState>),
 }
 
+#[cfg(feature = "macos-webkit")]
 struct SystemWebViewState {
     generation: u64,
     ui_registration: Option<SystemUiDelegateRegistration>,
@@ -527,6 +583,7 @@ struct SystemWebViewState {
     last_navigation_state: Option<(bool, bool)>,
 }
 
+#[cfg(feature = "macos-webkit")]
 impl SystemWebViewState {
     fn new(generation: u64) -> Self {
         Self {
@@ -547,6 +604,7 @@ impl SystemWebViewState {
 }
 
 #[derive(Clone)]
+#[cfg(feature = "macos-webkit")]
 struct SystemNewWebView {
     source: WebViewHandle,
     sink: SystemCallbackSink,
@@ -557,6 +615,7 @@ struct SystemNewWebView {
     next_request: Rc<Cell<u64>>,
 }
 
+#[cfg(feature = "macos-webkit")]
 impl SystemNewWebView {
     fn request(
         &self,
@@ -709,6 +768,7 @@ impl SystemNewWebView {
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 fn validate_destination(destination: &AppKitNewWebViewDestination) -> Result<(), HostError> {
     MainThreadMarker::new()
         .ok_or_else(|| HostError::new("native child must be created on the AppKit main thread"))?;
@@ -732,6 +792,7 @@ fn validate_destination(destination: &AppKitNewWebViewDestination) -> Result<(),
 }
 
 // WebKit's private computed preference, never the optional explicit `_popup` token.
+#[cfg(feature = "macos-webkit")]
 fn wants_popup(features: &NSObject) -> Option<bool> {
     if !features.respondsToSelector(sel!(_wantsPopup)) {
         return None;
@@ -741,6 +802,7 @@ fn wants_popup(features: &NSObject) -> Option<bool> {
     Some(unsafe { msg_send![features, _wantsPopup] })
 }
 
+#[cfg(feature = "macos-webkit")]
 fn window_features(features: &WKWindowFeatures) -> Option<String> {
     let mut values = Vec::new();
     // SAFETY: WebKit lends these feature hints for the creation callback.
@@ -761,64 +823,111 @@ fn window_features(features: &WKWindowFeatures) -> Option<String> {
     (!values.is_empty()).then(|| values.join(","))
 }
 
-/// One macOS runtime host that owns both Servo and WRY/WKWebView view lifetimes.
+/// One macOS runtime host that owns view lifetimes for the compiled Servo
+/// and/or WRY/WKWebView integrations.
 ///
 /// The application still owns its top-level window, layout slot, chrome, tabs,
 /// and engine-selection policy. Each [`WebViewHandle`] identifies exactly one
 /// concrete engine-view lifetime.
 pub struct MacOsViewHost<S> {
+    #[cfg(feature = "servo")]
     servo: SurfaceHost<S>,
+    #[cfg(not(feature = "servo"))]
+    services: S,
+    #[cfg(feature = "macos-webkit")]
     webkit_data_store_identifier: WebKitDataStoreIdentifier,
     views: HashMap<WebViewHandle, MacOsView>,
+    #[cfg(feature = "macos-webkit")]
     system_context: Option<SystemWebViewContext>,
+    #[cfg(feature = "macos-webkit")]
     callbacks: Rc<RefCell<SystemCallbacks>>,
+    #[cfg(feature = "macos-webkit")]
     registrar: Option<WebViewRegistrar>,
+    #[cfg(feature = "macos-webkit")]
     next_generation: u64,
+    #[cfg(feature = "macos-webkit")]
     pending_children: Rc<SystemChildViews>,
+    #[cfg(feature = "macos-webkit")]
     new_webview_destination_handler: Option<Rc<NewWebViewDestinationHandler>>,
 }
 
 impl<S> MacOsViewHost<S> {
     /// Creates the macOS host with existing Servo surface services and one WebKit store.
     pub fn new(services: S, options: MacOsViewHostOptions) -> Self {
+        #[cfg(feature = "macos-webkit")]
         let wake = options.surface_host.event_loop_waker().clone();
-        let mut servo = SurfaceHost::new(services, options.surface_host);
-        servo.set_navigation_state_events();
+        #[cfg(feature = "servo")]
+        let servo = {
+            let mut servo = SurfaceHost::new(services, options.surface_host);
+            servo.set_navigation_state_events();
+            servo
+        };
+        #[cfg(not(feature = "macos-webkit"))]
+        let _ = (
+            options.webkit_data_store_identifier,
+            options.new_webview_destination_handler,
+        );
         Self {
+            #[cfg(feature = "servo")]
             servo,
+            #[cfg(not(feature = "servo"))]
+            services,
+            #[cfg(feature = "macos-webkit")]
             webkit_data_store_identifier: options.webkit_data_store_identifier,
             views: HashMap::new(),
+            #[cfg(feature = "macos-webkit")]
             system_context: None,
+            #[cfg(feature = "macos-webkit")]
             callbacks: Rc::new(RefCell::new(SystemCallbacks::new(wake))),
+            #[cfg(feature = "macos-webkit")]
             registrar: None,
+            #[cfg(feature = "macos-webkit")]
             next_generation: 0,
+            #[cfg(feature = "macos-webkit")]
             pending_children: Rc::default(),
+            #[cfg(feature = "macos-webkit")]
             new_webview_destination_handler: options.new_webview_destination_handler,
         }
     }
 
     /// Borrows the app-provided surface and AppKit-parent delegate.
     pub fn services(&self) -> &S {
-        self.servo.services()
+        #[cfg(feature = "servo")]
+        {
+            self.servo.services()
+        }
+        #[cfg(not(feature = "servo"))]
+        {
+            &self.services
+        }
     }
 
     /// Mutably borrows the app-provided surface and AppKit-parent delegate.
     pub fn services_mut(&mut self) -> &mut S {
-        self.servo.services_mut()
+        #[cfg(feature = "servo")]
+        {
+            self.servo.services_mut()
+        }
+        #[cfg(not(feature = "servo"))]
+        {
+            &mut self.services
+        }
     }
 
     #[allow(
         clippy::type_complexity,
         reason = "Preserve the host batch-update result shape."
     )]
+    #[cfg(all(feature = "servo", feature = "macos-webkit"))]
     fn finish_servo_pump(
         &self,
-        webviews: &[WebViewHandle],
+        _webviews: &[WebViewHandle],
         result: Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError>,
     ) -> Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError> {
+        #[cfg(feature = "macos-webkit")]
         if result.is_err() {
             if let Some(registrar) = &self.registrar {
-                for &webview in webviews {
+                for &webview in _webviews {
                     if let Some(MacOsView::System(state)) = self.views.get(&webview) {
                         for event in self.system_sink(webview, state.generation).drain() {
                             registrar.record_event(webview, event);
@@ -830,63 +939,73 @@ impl<S> MacOsViewHost<S> {
         result
     }
 
+    #[cfg(feature = "macos-webkit")]
     fn next_generation(&mut self) -> u64 {
         self.next_generation = self.next_generation.wrapping_add(1);
         self.next_generation
     }
 
-    fn sync_servo_views(&mut self) {
+    fn sync_views(&mut self) {
         // Callbacks stage complete owners without borrowing this host. End the
         // staging guard before transfer or destruction can call native code.
-        let children = std::mem::take(&mut *self.pending_children.borrow_mut());
-        for (handle, state) in children {
-            if self.system_sink(handle, state.generation).is_live()
-                || state
-                    .ui_registration
-                    .as_ref()
-                    .is_some_and(|ui| ui.is_active())
-            {
-                self.views.insert(handle, MacOsView::System(state));
-            }
-        }
-        let retired: Vec<_> = self
-            .views
-            .iter()
-            .filter_map(|(&handle, view)| match view {
-                MacOsView::System(state)
-                    if !self.system_sink(handle, state.generation).is_live()
-                        && !state
-                            .ui_registration
-                            .as_ref()
-                            .is_some_and(|ui| ui.is_active()) =>
+        #[cfg(feature = "macos-webkit")]
+        {
+            let children = std::mem::take(&mut *self.pending_children.borrow_mut());
+            for (handle, state) in children {
+                if self.system_sink(handle, state.generation).is_live()
+                    || state
+                        .ui_registration
+                        .as_ref()
+                        .is_some_and(|ui| ui.is_active())
                 {
-                    Some(handle)
+                    self.views.insert(handle, MacOsView::System(state));
                 }
-                _ => None,
-            })
-            .collect();
-        let retired: Vec<_> = retired
-            .into_iter()
-            .filter_map(|handle| self.views.remove(&handle))
-            .collect();
-        drop(retired);
-        let live = self.servo.native_view_handles();
-        self.views
-            .retain(|handle, view| !matches!(view, MacOsView::Servo) || live.contains(handle));
-        for handle in live {
-            self.views.entry(handle).or_insert(MacOsView::Servo);
+            }
+            let retired: Vec<_> = self
+                .views
+                .iter()
+                .filter_map(|(&handle, view)| match view {
+                    MacOsView::System(state)
+                        if !self.system_sink(handle, state.generation).is_live()
+                            && !state
+                                .ui_registration
+                                .as_ref()
+                                .is_some_and(|ui| ui.is_active()) =>
+                    {
+                        Some(handle)
+                    }
+                    _ => None,
+                })
+                .collect();
+            let retired: Vec<_> = retired
+                .into_iter()
+                .filter_map(|handle| self.views.remove(&handle))
+                .collect();
+            drop(retired);
+        }
+        #[cfg(feature = "servo")]
+        {
+            let live = self.servo.native_view_handles();
+            self.views
+                .retain(|handle, view| !matches!(view, MacOsView::Servo) || live.contains(handle));
+            for handle in live {
+                self.views.entry(handle).or_insert(MacOsView::Servo);
+            }
         }
     }
 
     fn view_is_servo(&mut self, webview: WebViewHandle) -> Result<bool, HostError> {
-        self.sync_servo_views();
+        self.sync_views();
         match self.views.get(&webview) {
+            #[cfg(feature = "servo")]
             Some(MacOsView::Servo) => Ok(true),
+            #[cfg(feature = "macos-webkit")]
             Some(MacOsView::System(_)) => Ok(false),
             None => Err(unknown_webview(webview)),
         }
     }
 
+    #[cfg(feature = "macos-webkit")]
     fn system_sink(&self, webview: WebViewHandle, generation: u64) -> SystemCallbackSink {
         SystemCallbackSink {
             target: (webview.raw(), generation),
@@ -894,6 +1013,7 @@ impl<S> MacOsViewHost<S> {
         }
     }
 
+    #[cfg(feature = "macos-webkit")]
     fn reset_system_generation(&mut self, webview: WebViewHandle) {
         let old_generation = match self.views.get(&webview) {
             Some(MacOsView::System(state)) => state.generation,
@@ -912,19 +1032,23 @@ impl<S> MacOsViewHost<S> {
 
 impl<S> Drop for MacOsViewHost<S> {
     fn drop(&mut self) {
-        let pending = std::mem::take(&mut *self.pending_children.borrow_mut());
-        for (&webview, state) in &pending {
-            self.system_sink(webview, state.generation).invalidate();
-        }
-        for (&webview, view) in &self.views {
-            if let MacOsView::System(state) = view {
+        #[cfg(feature = "macos-webkit")]
+        {
+            let pending = std::mem::take(&mut *self.pending_children.borrow_mut());
+            for (&webview, state) in &pending {
                 self.system_sink(webview, state.generation).invalidate();
             }
+            for (&webview, view) in &self.views {
+                #[allow(irrefutable_let_patterns)]
+                if let MacOsView::System(state) = view {
+                    self.system_sink(webview, state.generation).invalidate();
+                }
+            }
+            // WRY removes each WKWebView from its AppKit superview on drop. Do that
+            // while the delegate owning those parent views is still alive.
+            self.views.clear();
+            drop(pending);
         }
-        // WRY removes each WKWebView from its AppKit superview on drop. Do that
-        // while the delegate owning those parent views is still alive.
-        self.views.clear();
-        drop(pending);
     }
 }
 
@@ -943,27 +1067,42 @@ where
         match options.kind {
             MacOsWebViewKind::Servo => self.create_webview(session, webview),
             MacOsWebViewKind::SystemWebView => {
-                if self.views.contains_key(&webview) {
-                    return Err(duplicate_webview(webview));
+                #[cfg(not(feature = "macos-webkit"))]
+                {
+                    Err(system_not_compiled())
                 }
-                let generation = self.next_generation();
-                SystemCallbackSink::register(self.callbacks.clone(), webview, generation);
-                self.views.insert(
-                    webview,
-                    MacOsView::System(Box::new(SystemWebViewState::new(generation))),
-                );
-                Ok(())
+                #[cfg(feature = "macos-webkit")]
+                {
+                    if self.views.contains_key(&webview) {
+                        return Err(duplicate_webview(webview));
+                    }
+                    let generation = self.next_generation();
+                    SystemCallbackSink::register(self.callbacks.clone(), webview, generation);
+                    self.views.insert(
+                        webview,
+                        MacOsView::System(Box::new(SystemWebViewState::new(generation))),
+                    );
+                    Ok(())
+                }
             }
         }
     }
 }
 
+#[cfg_attr(
+    not(all(feature = "servo", feature = "macos-webkit")),
+    allow(unused_variables)
+)]
 impl<S> Host for MacOsViewHost<S>
 where
     S: AppKitViewDelegate + for<'a> SurfaceDelegate<Frame<'a> = SurfaceFrame<'a>>,
 {
     fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
-        self.registrar = Some(registrar.clone());
+        #[cfg(feature = "macos-webkit")]
+        {
+            self.registrar = Some(registrar.clone());
+        }
+        #[cfg(feature = "servo")]
         self.servo.set_webview_registrar(registrar);
     }
 
@@ -972,38 +1111,61 @@ where
         webview: WebViewHandle,
         handler: Option<Rc<dyn Fn(&NewWebViewRequest) -> NewWebViewDecision>>,
     ) -> Result<(), HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return self.servo.set_new_webview_handler(webview, handler);
         }
-        if handler.is_none() {
+        #[cfg(feature = "macos-webkit")]
+        {
+            if handler.is_none() {
+                let previous = system_state_mut(&mut self.views, webview)?
+                    .handler
+                    .borrow_mut()
+                    .take();
+                drop(previous);
+                return Ok(());
+            }
+            if self.new_webview_destination_handler.is_none() {
+                return Err(HostError::new(
+                    "native child creation needs an AppKit destination handler",
+                ));
+            }
             let previous = system_state_mut(&mut self.views, webview)?
                 .handler
-                .borrow_mut()
-                .take();
+                .replace(handler);
             drop(previous);
-            return Ok(());
+            Ok(())
         }
-        if self.new_webview_destination_handler.is_none() {
-            return Err(HostError::new(
-                "native child creation needs an AppKit destination handler",
-            ));
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
-        let previous = system_state_mut(&mut self.views, webview)?
-            .handler
-            .replace(handler);
-        drop(previous);
-        Ok(())
     }
 
     fn shutdown(&mut self) -> Result<(), HostError> {
-        self.sync_servo_views();
-        for (&webview, view) in &self.views {
-            if let MacOsView::System(state) = view {
-                self.system_sink(webview, state.generation).invalidate();
+        self.sync_views();
+        #[cfg(feature = "macos-webkit")]
+        {
+            for (&webview, view) in &self.views {
+                #[allow(irrefutable_let_patterns)]
+                if let MacOsView::System(state) = view {
+                    self.system_sink(webview, state.generation).invalidate();
+                }
             }
+            self.views.retain(|_, view| {
+                #[cfg(feature = "servo")]
+                {
+                    matches!(view, MacOsView::Servo)
+                }
+                #[cfg(not(feature = "servo"))]
+                {
+                    let _ = view;
+                    false
+                }
+            });
         }
-        self.views
-            .retain(|_, view| matches!(view, MacOsView::Servo));
+        #[cfg(feature = "servo")]
         self.servo.shutdown()?;
         self.views.clear();
         Ok(())
@@ -1014,79 +1176,117 @@ where
         session: SessionHandle,
         webview: WebViewHandle,
     ) -> Result<(), HostError> {
-        if self.views.contains_key(&webview) {
-            return Err(duplicate_webview(webview));
+        #[cfg(not(feature = "servo"))]
+        {
+            Err(servo_not_compiled())
         }
-        self.servo.create_webview(session, webview)?;
-        self.views.insert(webview, MacOsView::Servo);
-        Ok(())
+        #[cfg(feature = "servo")]
+        {
+            if self.views.contains_key(&webview) {
+                return Err(duplicate_webview(webview));
+            }
+            self.servo.create_webview(session, webview)?;
+            self.views.insert(webview, MacOsView::Servo);
+            Ok(())
+        }
     }
 
     fn destroy_webview(&mut self, webview: WebViewHandle) -> Result<(), HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             self.servo.destroy_webview(webview)?;
             self.views.remove(&webview);
             return Ok(());
         }
-
-        let generation = match self.views.get(&webview) {
-            Some(MacOsView::System(state)) => state.generation,
-            _ => return Err(unknown_webview(webview)),
-        };
-        self.system_sink(webview, generation).invalidate();
-        self.views.remove(&webview);
-        Ok(())
+        #[cfg(feature = "macos-webkit")]
+        {
+            let generation = match self.views.get(&webview) {
+                Some(MacOsView::System(state)) => state.generation,
+                _ => return Err(unknown_webview(webview)),
+            };
+            self.system_sink(webview, generation).invalidate();
+            self.views.remove(&webview);
+            Ok(())
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn perform_all_updates(
         &mut self,
         webviews: &[WebViewHandle],
     ) -> Result<Vec<(WebViewHandle, Result<Vec<HostEvent>, HostError>)>, HostError> {
-        self.sync_servo_views();
-        let servo_views: Vec<_> = webviews
-            .iter()
-            .copied()
-            .filter(|webview| matches!(self.views.get(webview), Some(MacOsView::Servo)))
-            .collect();
-        let system_views: std::collections::HashSet<_> = self
-            .views
-            .iter()
-            .filter_map(|(&handle, view)| matches!(view, MacOsView::System(_)).then_some(handle))
-            .collect();
-        let servo_result = self.servo.perform_all_updates(&servo_views);
-        self.sync_servo_views();
-        let mut servo_results: HashMap<_, _> = self
-            .finish_servo_pump(webviews, servo_result)?
-            .into_iter()
-            .collect();
-
-        Ok(webviews
-            .iter()
-            .copied()
-            .map(|webview| {
-                let result = if servo_views.contains(&webview) {
-                    with_navigation_state(
-                        servo_results
-                            .remove(&webview)
-                            .unwrap_or_else(|| Ok(Vec::new())),
-                    )
-                } else {
-                    match self.views.get(&webview) {
-                        Some(MacOsView::System(state))
-                            if !self.system_sink(webview, state.generation).is_live() =>
-                        {
-                            Ok(Vec::new())
-                        }
-                        Some(MacOsView::System(_)) => {
-                            collect_system_updates(&mut self.views, &self.callbacks, webview)
-                        }
-                        None if system_views.contains(&webview) => Ok(Vec::new()),
-                        _ => Err(unknown_webview(webview)),
-                    }
-                };
-                (webview, result)
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            self.sync_views();
+            self.servo.perform_all_updates(webviews).map(|results| {
+                results
+                    .into_iter()
+                    .map(|(view, events)| (view, with_navigation_state(events)))
+                    .collect()
             })
-            .collect())
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
+            self.sync_views();
+            #[cfg(feature = "servo")]
+            let servo_views: Vec<_> = webviews
+                .iter()
+                .copied()
+                .filter(|webview| matches!(self.views.get(webview), Some(MacOsView::Servo)))
+                .collect();
+            let system_views: std::collections::HashSet<_> = self
+                .views
+                .iter()
+                .filter_map(|(&handle, view)| {
+                    matches!(view, MacOsView::System(_)).then_some(handle)
+                })
+                .collect();
+            #[cfg(feature = "servo")]
+            let servo_result = self.servo.perform_all_updates(&servo_views);
+            self.sync_views();
+            #[cfg(feature = "servo")]
+            let mut servo_results: HashMap<_, _> = self
+                .finish_servo_pump(webviews, servo_result)?
+                .into_iter()
+                .collect();
+
+            Ok(webviews
+                .iter()
+                .copied()
+                .map(|webview| {
+                    #[cfg(feature = "servo")]
+                    if servo_views.contains(&webview) {
+                        return (
+                            webview,
+                            with_navigation_state(
+                                servo_results
+                                    .remove(&webview)
+                                    .unwrap_or_else(|| Ok(Vec::new())),
+                            ),
+                        );
+                    }
+                    let result = {
+                        match self.views.get(&webview) {
+                            Some(MacOsView::System(state))
+                                if !self.system_sink(webview, state.generation).is_live() =>
+                            {
+                                Ok(Vec::new())
+                            }
+                            Some(MacOsView::System(_)) => {
+                                collect_system_updates(&mut self.views, &self.callbacks, webview)
+                            }
+                            None if system_views.contains(&webview) => Ok(Vec::new()),
+                            _ => Err(unknown_webview(webview)),
+                        }
+                    };
+                    (webview, result)
+                })
+                .collect())
+        }
     }
 
     fn attach_surface(
@@ -1104,13 +1304,22 @@ where
         surface: &HostSurface,
         viewport: SurfaceViewport,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(
                 self.servo
                     .attach_surface_with_viewport(webview, surface, viewport),
             );
         }
-        attach_system_view(self, webview, surface, viewport)
+        #[cfg(feature = "macos-webkit")]
+        {
+            attach_system_view(self, webview, surface, viewport)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn resize_surface(
@@ -1118,11 +1327,20 @@ where
         webview: WebViewHandle,
         size: SurfaceSize,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(self.servo.resize_surface(webview, size));
         }
-        let viewport = system_viewport(&self.views, webview)?.with_size(size);
-        update_system_viewport(&mut self.views, webview, viewport)
+        #[cfg(feature = "macos-webkit")]
+        {
+            let viewport = system_viewport(&self.views, webview)?.with_size(size);
+            update_system_viewport(&mut self.views, webview, viewport)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn set_surface_scale_factor(
@@ -1130,13 +1348,22 @@ where
         webview: WebViewHandle,
         scale_factor: f32,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(
                 self.servo.set_surface_scale_factor(webview, scale_factor),
             );
         }
-        let viewport = system_viewport(&self.views, webview)?.with_scale_factor(scale_factor);
-        update_system_viewport(&mut self.views, webview, viewport)
+        #[cfg(feature = "macos-webkit")]
+        {
+            let viewport = system_viewport(&self.views, webview)?.with_scale_factor(scale_factor);
+            update_system_viewport(&mut self.views, webview, viewport)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn update_surface_viewport(
@@ -1145,39 +1372,57 @@ where
         viewport: SurfaceViewport,
         previous_viewport: SurfaceViewport,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(self.servo.update_surface_viewport(
                 webview,
                 viewport,
                 previous_viewport,
             ));
         }
-        update_system_viewport(&mut self.views, webview, viewport)
+        #[cfg(feature = "macos-webkit")]
+        {
+            update_system_viewport(&mut self.views, webview, viewport)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn detach_surface(&mut self, webview: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(self.servo.detach_surface(webview));
         }
-        let state = system_state_mut(&mut self.views, webview)?;
-        let native = state.webview.as_ref().ok_or_else(|| {
-            HostError::new(format!(
-                "system webview {} has no attached WKWebView",
-                webview.raw()
-            ))
-        })?;
-        native.set_visible(false).map_err(wry_error)?;
-        state
-            .container
-            .as_ref()
-            .expect("attached system webview has a container")
-            .detach();
-        state.viewport = None;
-        // The SDK container and native document survive independently of the
-        // initial app slot. Release its lease only after leaving the hierarchy.
-        let parent = state.destination_parent.take();
-        drop(parent);
-        Ok(Vec::new())
+        #[cfg(feature = "macos-webkit")]
+        {
+            let state = system_state_mut(&mut self.views, webview)?;
+            let native = state.webview.as_ref().ok_or_else(|| {
+                HostError::new(format!(
+                    "system webview {} has no attached WKWebView",
+                    webview.raw()
+                ))
+            })?;
+            native.set_visible(false).map_err(wry_error)?;
+            state
+                .container
+                .as_ref()
+                .expect("attached system webview has a container")
+                .detach();
+            state.viewport = None;
+            // The SDK container and native document survive independently of the
+            // initial app slot. Release its lease only after leaving the hierarchy.
+            let parent = state.destination_parent.take();
+            drop(parent);
+            Ok(Vec::new())
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn set_popup_policy(
@@ -1185,14 +1430,23 @@ where
         webview: WebViewHandle,
         popup_policy: PopupRequestPolicy,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(self.servo.set_popup_policy(webview, popup_policy));
         }
-        if popup_policy == PopupRequestPolicy::DefaultDeny {
-            self.set_new_webview_handler(webview, None)?;
-            Ok(Vec::new())
-        } else {
-            Err(system_unsupported(webview, "managed child popup policy"))
+        #[cfg(feature = "macos-webkit")]
+        {
+            if popup_policy == PopupRequestPolicy::DefaultDeny {
+                self.set_new_webview_handler(webview, None)?;
+                Ok(Vec::new())
+            } else {
+                Err(system_unsupported(webview, "managed child popup policy"))
+            }
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1203,15 +1457,25 @@ where
         surface: &HostSurface,
         viewport: SurfaceViewport,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.attach_managed_child_surface(
-                webview,
-                child_webview_id,
-                surface,
-                viewport,
-            ))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.attach_managed_child_surface(
+                    webview,
+                    child_webview_id,
+                    surface,
+                    viewport,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "managed child surfaces"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1221,14 +1485,24 @@ where
         child_webview_id: &str,
         size: SurfaceSize,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.resize_managed_child_surface(
-                webview,
-                child_webview_id,
-                size,
-            ))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.resize_managed_child_surface(
+                    webview,
+                    child_webview_id,
+                    size,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "managed child surfaces"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1239,15 +1513,25 @@ where
         viewport: SurfaceViewport,
         previous_viewport: SurfaceViewport,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.update_managed_child_surface_viewport(
-                webview,
-                child_webview_id,
-                viewport,
-                previous_viewport,
-            ))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.update_managed_child_surface_viewport(
+                    webview,
+                    child_webview_id,
+                    viewport,
+                    previous_viewport,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "managed child surfaces"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1256,13 +1540,23 @@ where
         webview: WebViewHandle,
         child_webview_id: &str,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(
-                self.servo
-                    .detach_managed_child_surface(webview, child_webview_id),
-            )
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(
+                    self.servo
+                        .detach_managed_child_surface(webview, child_webview_id),
+                )
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "managed child surfaces"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1271,13 +1565,23 @@ where
         webview: WebViewHandle,
         child_webview_id: &str,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(
-                self.servo
-                    .perform_managed_child_updates(webview, child_webview_id),
-            )
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(
+                    self.servo
+                        .perform_managed_child_updates(webview, child_webview_id),
+                )
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "managed child surfaces"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1286,43 +1590,62 @@ where
         webview: WebViewHandle,
         command: &WebViewCommand,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(self.servo.dispatch_webview_command(webview, command));
         }
-        dispatch_system_command(&mut self.views, &self.callbacks, webview, command)
+        #[cfg(feature = "macos-webkit")]
+        {
+            dispatch_system_command(&mut self.views, &self.callbacks, webview, command)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn system_webview_is_loading(&mut self, webview: WebViewHandle) -> Result<bool, HostError> {
-        // Reconcile only this target; full update/shutdown paths collect unrelated
-        // owners. A newly registered native child is queryable before any pump.
-        let child = self.pending_children.borrow_mut().remove(&webview);
-        if let Some(state) = child {
-            self.views.insert(webview, MacOsView::System(state));
-        }
-        if let Some(MacOsView::System(state)) = self.views.get(&webview) {
-            if !self.system_sink(webview, state.generation).is_live()
-                && !state
-                    .ui_registration
-                    .as_ref()
-                    .is_some_and(|ui| ui.is_active())
-            {
-                self.views.remove(&webview);
-                return Err(unknown_webview(webview));
-            }
-        } else if self.view_is_servo(webview)? {
-            return Err(HostError::new(
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            self.view_is_servo(webview)?;
+            Err(HostError::new(
                 "system-WebView loading state is unsupported by Servo",
-            ));
+            ))
         }
-        let native = system_state_mut(&mut self.views, webview)?
-            .webview
-            .as_ref()
-            .ok_or_else(|| HostError::new("system WebView has no native view yet"))?;
-        MainThreadMarker::new().ok_or_else(|| {
-            HostError::new("system WebView must be queried on the AppKit main thread")
-        })?;
-        // SAFETY: the retained WRY view is accessed on its AppKit owning thread.
-        Ok(unsafe { native.webview().isLoading() })
+        #[cfg(feature = "macos-webkit")]
+        {
+            // Reconcile only this target; full update/shutdown paths collect unrelated
+            // owners. A newly registered native child is queryable before any pump.
+            let child = self.pending_children.borrow_mut().remove(&webview);
+            if let Some(state) = child {
+                self.views.insert(webview, MacOsView::System(state));
+            }
+            if let Some(MacOsView::System(state)) = self.views.get(&webview) {
+                if !self.system_sink(webview, state.generation).is_live()
+                    && !state
+                        .ui_registration
+                        .as_ref()
+                        .is_some_and(|ui| ui.is_active())
+                {
+                    self.views.remove(&webview);
+                    return Err(unknown_webview(webview));
+                }
+            } else if self.view_is_servo(webview)? {
+                return Err(HostError::new(
+                    "system-WebView loading state is unsupported by Servo",
+                ));
+            }
+            let native = system_state_mut(&mut self.views, webview)?
+                .webview
+                .as_ref()
+                .ok_or_else(|| HostError::new("system WebView has no native view yet"))?;
+            MainThreadMarker::new().ok_or_else(|| {
+                HostError::new("system WebView must be queried on the AppKit main thread")
+            })?;
+            // SAFETY: the retained WRY view is accessed on its AppKit owning thread.
+            Ok(unsafe { native.webview().isLoading() })
+        }
     }
 
     fn resolve_navigation_request(
@@ -1331,17 +1654,27 @@ where
         navigation_id: &str,
         allow: bool,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.resolve_navigation_request(
-                webview,
-                navigation_id,
-                allow,
-            ))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.resolve_navigation_request(
+                    webview,
+                    navigation_id,
+                    allow,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(
                 webview,
                 "asynchronous navigation policy resolution",
             ))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1352,15 +1685,25 @@ where
         confirmed: bool,
         prompt_value: Option<&str>,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.resolve_simple_dialog(
-                webview,
-                dialog_id,
-                confirmed,
-                prompt_value,
-            ))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.resolve_simple_dialog(
+                    webview,
+                    dialog_id,
+                    confirmed,
+                    prompt_value,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "Servo dialog resolution"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1370,13 +1713,24 @@ where
         context_menu_id: &str,
         action: ContextMenuAction,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(
-                self.servo
-                    .resolve_context_menu(webview, context_menu_id, action),
-            )
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.resolve_context_menu(
+                    webview,
+                    context_menu_id,
+                    action,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "Servo context-menu resolution"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1385,10 +1739,20 @@ where
         webview: WebViewHandle,
         context_menu_id: &str,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.dismiss_context_menu(webview, context_menu_id))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.dismiss_context_menu(webview, context_menu_id))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "Servo context-menu dismissal"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1398,12 +1762,19 @@ where
         evaluation_id: &str,
         script: &str,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(
-                self.servo
-                    .evaluate_javascript(webview, evaluation_id, script),
-            )
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                with_navigation_state(self.servo.evaluate_javascript(
+                    webview,
+                    evaluation_id,
+                    script,
+                ))
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             let state = system_state_mut(&mut self.views, webview)?;
             let sink = SystemCallbackSink {
                 target: (webview.raw(), state.generation),
@@ -1426,6 +1797,10 @@ where
             javascript::evaluate(native, sink, evaluation_id, token, script);
             Ok(Vec::new())
         }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn dispatch_input_event(
@@ -1433,13 +1808,22 @@ where
         webview: WebViewHandle,
         event: &HostInputEvent,
     ) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
             return with_navigation_state(self.servo.dispatch_input_event(webview, event));
         }
-        Err(HostError::new(format!(
+        #[cfg(feature = "macos-webkit")]
+        {
+            Err(HostError::new(format!(
             "system webview {} receives native AppKit input; forwarded HostInputEvent is unsupported",
             webview.raw()
         )))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
+        }
     }
 
     fn synthesize_webview_command_events(&self) -> bool {
@@ -1447,10 +1831,18 @@ where
     }
 
     fn perform_updates(&mut self, webview: WebViewHandle) -> Result<Vec<HostEvent>, HostError> {
-        if self.view_is_servo(webview)? {
-            with_navigation_state(self.servo.perform_updates(webview))
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return with_navigation_state(self.servo.perform_updates(webview));
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             collect_system_updates(&mut self.views, &self.callbacks, webview)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1459,10 +1851,18 @@ where
         webview: WebViewHandle,
         events: &[HostEvent],
     ) -> Result<(), HostError> {
-        if self.view_is_servo(webview)? {
-            self.servo.observe_webview_events(webview, events)
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return self.servo.observe_webview_events(webview, events);
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Ok(())
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 
@@ -1472,15 +1872,26 @@ where
         child_webview_id: &str,
         events: &[HostEvent],
     ) -> Result<(), HostError> {
-        if self.view_is_servo(webview)? {
-            self.servo
-                .observe_managed_child_webview_events(webview, child_webview_id, events)
-        } else {
+        let _is_servo = self.view_is_servo(webview)?;
+        #[cfg(feature = "servo")]
+        if _is_servo {
+            return {
+                self.servo
+                    .observe_managed_child_webview_events(webview, child_webview_id, events)
+            };
+        }
+        #[cfg(feature = "macos-webkit")]
+        {
             Err(system_unsupported(webview, "managed child events"))
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            Err(system_not_compiled())
         }
     }
 }
 
+#[cfg(feature = "servo")]
 fn with_navigation_state(
     events: Result<Vec<HostEvent>, HostError>,
 ) -> Result<Vec<HostEvent>, HostError> {
@@ -1506,6 +1917,7 @@ fn with_navigation_state(
     Ok(result)
 }
 
+#[cfg(feature = "macos-webkit")]
 fn attach_system_view<S>(
     host: &mut MacOsViewHost<S>,
     webview: WebViewHandle,
@@ -1541,9 +1953,11 @@ where
         next_request: Rc::default(),
     };
 
-    let parent_surface = host
-        .servo
-        .services_mut()
+    #[cfg(feature = "servo")]
+    let services = host.servo.services_mut();
+    #[cfg(not(feature = "servo"))]
+    let services = &mut host.services;
+    let parent_surface = services
         .appkit_parent(surface, viewport)
         .map_err(|error| HostError::new(error.to_string()))?;
     let parent = BorrowedAppKitParent(parent_surface.window_handle());
@@ -1662,6 +2076,7 @@ where
     Ok(events)
 }
 
+#[cfg(feature = "macos-webkit")]
 fn build_system_webview(
     parent: &impl HasWindowHandle,
     viewport: SurfaceViewport,
@@ -1684,6 +2099,7 @@ fn build_system_webview(
     Ok(native)
 }
 
+#[cfg(feature = "macos-webkit")]
 fn system_webview_builder(sink: SystemCallbackSink) -> WebViewBuilder<'static> {
     let title_sink = sink.clone();
     let load_sink = sink.clone();
@@ -1713,6 +2129,7 @@ fn system_webview_builder(sink: SystemCallbackSink) -> WebViewBuilder<'static> {
         })
 }
 
+#[cfg(feature = "macos-webkit")]
 fn dispatch_system_command(
     views: &mut HashMap<WebViewHandle, MacOsView>,
     callbacks: &Rc<RefCell<SystemCallbacks>>,
@@ -1752,6 +2169,7 @@ fn dispatch_system_command(
     Ok(events)
 }
 
+#[cfg(feature = "macos-webkit")]
 fn should_queue_system_command(
     has_native_view: bool,
     has_surface: bool,
@@ -1761,6 +2179,7 @@ fn should_queue_system_command(
         || !has_surface && matches!(command, WebViewCommand::Focus | WebViewCommand::Blur)
 }
 
+#[cfg(feature = "macos-webkit")]
 fn apply_system_command(
     native: &WebView,
     command: &WebViewCommand,
@@ -1802,6 +2221,7 @@ fn apply_system_command(
     Ok(event.into_iter().collect())
 }
 
+#[cfg(feature = "macos-webkit")]
 fn blur_system_webview(native: &WebView) -> Result<(), HostError> {
     let webview = native.webview();
     // SAFETY: WRY retains the WKWebView's ExplorerKit-owned container, and an
@@ -1819,6 +2239,7 @@ fn blur_system_webview(native: &WebView) -> Result<(), HostError> {
     Ok(())
 }
 
+#[cfg(feature = "macos-webkit")]
 fn collect_system_updates(
     views: &mut HashMap<WebViewHandle, MacOsView>,
     callbacks: &Rc<RefCell<SystemCallbacks>>,
@@ -1826,6 +2247,7 @@ fn collect_system_updates(
 ) -> Result<Vec<HostEvent>, HostError> {
     let generation = match views.get(&webview) {
         Some(MacOsView::System(state)) => state.generation,
+        #[cfg(feature = "servo")]
         Some(MacOsView::Servo) => {
             return Err(HostError::new(format!(
                 "webview {} is Servo-backed",
@@ -1867,6 +2289,7 @@ fn collect_system_updates(
     Ok(events)
 }
 
+#[cfg(feature = "macos-webkit")]
 fn update_system_viewport(
     views: &mut HashMap<WebViewHandle, MacOsView>,
     webview: WebViewHandle,
@@ -1884,6 +2307,7 @@ fn update_system_viewport(
     Ok(Vec::new())
 }
 
+#[cfg(feature = "macos-webkit")]
 fn system_viewport(
     views: &HashMap<WebViewHandle, MacOsView>,
     webview: WebViewHandle,
@@ -1895,6 +2319,7 @@ fn system_viewport(
                 webview.raw()
             ))
         }),
+        #[cfg(feature = "servo")]
         Some(MacOsView::Servo) => Err(HostError::new(format!(
             "webview {} is Servo-backed",
             webview.raw()
@@ -1903,12 +2328,14 @@ fn system_viewport(
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 fn system_state_mut(
     views: &mut HashMap<WebViewHandle, MacOsView>,
     webview: WebViewHandle,
 ) -> Result<&mut SystemWebViewState, HostError> {
     match views.get_mut(&webview) {
         Some(MacOsView::System(state)) => Ok(state),
+        #[cfg(feature = "servo")]
         Some(MacOsView::Servo) => Err(HostError::new(format!(
             "webview {} is Servo-backed",
             webview.raw()
@@ -1917,6 +2344,7 @@ fn system_state_mut(
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 fn wry_rect(viewport: SurfaceViewport) -> Rect {
     Rect {
         position: PhysicalPosition::new(viewport.origin.x, viewport.origin.y).into(),
@@ -1932,6 +2360,7 @@ fn duplicate_webview(webview: WebViewHandle) -> HostError {
     HostError::new(format!("webview {} is already registered", webview.raw()))
 }
 
+#[cfg(feature = "macos-webkit")]
 fn system_unsupported(webview: WebViewHandle, capability: &str) -> HostError {
     HostError::new(format!(
         "system webview {} does not support {capability}",
@@ -1939,20 +2368,25 @@ fn system_unsupported(webview: WebViewHandle, capability: &str) -> HostError {
     ))
 }
 
+#[cfg(feature = "macos-webkit")]
 fn wry_error(error: wry::Error) -> HostError {
     HostError::new(error.to_string())
 }
 
+#[cfg(feature = "macos-webkit")]
 struct BorrowedAppKitParent<'a>(WindowHandle<'a>);
 
+#[cfg(feature = "macos-webkit")]
 impl HasWindowHandle for BorrowedAppKitParent<'_> {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
         Ok(self.0)
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 struct AppKitContainer(Retained<NSView>);
 
+#[cfg(feature = "macos-webkit")]
 impl AppKitContainer {
     fn new(parent: &impl HasWindowHandle) -> Result<Self, HostError> {
         let parent = appkit_parent_view(parent)?;
@@ -1980,12 +2414,14 @@ impl AppKitContainer {
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 impl Drop for AppKitContainer {
     fn drop(&mut self) {
         self.detach();
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 impl HasWindowHandle for AppKitContainer {
     fn window_handle(&self) -> Result<WindowHandle<'_>, HandleError> {
         let handle = AppKitWindowHandle::new(NonNull::from(&*self.0).cast::<c_void>());
@@ -1994,6 +2430,7 @@ impl HasWindowHandle for AppKitContainer {
     }
 }
 
+#[cfg(feature = "macos-webkit")]
 fn appkit_parent_view(parent: &impl HasWindowHandle) -> Result<&NSView, HostError> {
     let handle = parent
         .window_handle()
@@ -2008,7 +2445,7 @@ fn appkit_parent_view(parent: &impl HasWindowHandle) -> Result<&NSView, HostErro
     Ok(unsafe { handle.ns_view.cast::<NSView>().as_ref() })
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "macos-webkit"))]
 mod tests {
     use super::*;
 
@@ -2532,6 +2969,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "servo")]
     fn loading_query_preserves_servo_and_unknown_handle_errors() {
         let mut runtime = runtime();
         let session = runtime.create_session();
@@ -2699,6 +3137,7 @@ mod tests {
             let host_ref = host.borrow();
             let generation = match host_ref.views.get(&source).unwrap() {
                 MacOsView::System(state) => state.generation,
+                #[cfg(feature = "servo")]
                 _ => unreachable!(),
             };
             let source_callbacks = SystemNewWebView {
@@ -2835,6 +3274,7 @@ mod tests {
         let source = runtime.create_webview(session).unwrap();
         let cell = match host.borrow().views.get(&source).unwrap() {
             MacOsView::System(state) => state.handler.clone(),
+            #[cfg(feature = "servo")]
             _ => unreachable!(),
         };
         let dropped = Rc::new(Cell::new(false));
@@ -2950,6 +3390,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "servo")]
     fn default_creation_remains_servo_backed() {
         let mut runtime = runtime();
         let session = runtime.create_session();
@@ -2960,6 +3401,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "servo")]
     fn servo_history_also_reports_the_common_navigation_state() {
         let events = with_navigation_state(Ok(vec![HostEvent::HistoryChanged {
             entries: vec!["https://example.test/".to_owned()],
@@ -2987,6 +3429,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "servo")]
     fn shared_pump_errors_remain_host_errors_with_or_without_servo_views() {
         struct FailedPumpHost(MacOsViewHost<NoopDelegate>);
         impl Host for FailedPumpHost {
@@ -3689,5 +4132,148 @@ mod tests {
             view,
             evaluation_event("later", Err(JavaScriptEvaluationErrorKind::WebViewNotReady))
         )));
+    }
+}
+
+#[cfg(not(feature = "servo"))]
+fn servo_not_compiled() -> HostError {
+    HostError::new("Servo backend is not compiled; enable explorerkit feature 'servo'")
+}
+
+#[cfg(not(feature = "macos-webkit"))]
+fn system_not_compiled() -> HostError {
+    HostError::new(
+        "SystemWebView backend is not compiled; enable explorerkit feature 'macos-webkit'",
+    )
+}
+
+#[cfg(test)]
+mod build_selection_tests {
+    use super::*;
+    use crate::surface::SurfaceTarget;
+    use crate::Runtime;
+    use std::cell::Cell;
+
+    #[derive(Default)]
+    struct UnattachedDelegate {
+        native_requests: Cell<usize>,
+    }
+
+    impl SurfaceDelegate for UnattachedDelegate {
+        type Frame<'a> = SurfaceFrame<'a>;
+
+        fn render_target(
+            &mut self,
+            _: &HostSurface,
+            _: SurfaceViewport,
+        ) -> Result<SurfaceTarget<'_>, SurfaceError> {
+            self.native_requests.set(self.native_requests.get() + 1);
+            Err(SurfaceError::new("this fixture must not request a surface"))
+        }
+
+        fn present_frame(
+            &mut self,
+            _: &HostSurface,
+            frame: &mut Self::Frame<'_>,
+        ) -> Result<(), SurfaceError> {
+            // Keep the same consumer callback body compilable in every build.
+            let _ = (
+                frame.info(),
+                frame.viewport(),
+                frame.mode(),
+                frame.did_present(),
+            );
+            let _: Option<crate::surface::SurfaceFrameImage> = frame.read_rgba();
+            let _: Option<crate::surface::macos::GpuFrame> = frame.take_gpu_frame()?;
+            frame.present();
+            Ok(())
+        }
+    }
+
+    impl AppKitViewDelegate for UnattachedDelegate {
+        fn appkit_parent(
+            &mut self,
+            _: &HostSurface,
+            _: SurfaceViewport,
+        ) -> Result<NativeSurface<'_>, SurfaceError> {
+            self.native_requests.set(self.native_requests.get() + 1);
+            Err(SurfaceError::new("this fixture must not request a parent"))
+        }
+    }
+
+    fn host() -> MacOsViewHost<UnattachedDelegate> {
+        MacOsViewHost::new(
+            UnattachedDelegate::default(),
+            MacOsViewHostOptions::new(
+                SurfaceHostOptions::default(),
+                WebKitDataStoreIdentifier([0; 16]),
+            ),
+        )
+    }
+
+    #[test]
+    fn reports_compiled_integrations_without_native_initialization() {
+        #[cfg(all(feature = "servo", feature = "macos-webkit"))]
+        let expected = [MacOsWebViewKind::Servo, MacOsWebViewKind::SystemWebView];
+        #[cfg(all(feature = "servo", not(feature = "macos-webkit")))]
+        let expected = [MacOsWebViewKind::Servo];
+        #[cfg(all(feature = "macos-webkit", not(feature = "servo")))]
+        let expected = [MacOsWebViewKind::SystemWebView];
+        assert_eq!(compiled_engines(), &expected);
+        let mut host = host();
+        assert!(host.views.is_empty());
+        assert_eq!(host.services().native_requests.get(), 0);
+        assert_eq!(host.services_mut().native_requests.get(), 0);
+        assert_eq!(MacOsWebViewOptions::default().kind, MacOsWebViewKind::Servo);
+    }
+
+    #[test]
+    fn compiled_kind_creates_and_disposes_without_attaching_a_surface() {
+        for &kind in compiled_engines() {
+            let mut runtime = Runtime::new(host());
+            let session = runtime.create_session();
+            let view = runtime
+                .create_webview_with_options(session, MacOsWebViewOptions::new(kind))
+                .unwrap();
+            runtime.load_url(view, "https://example.invalid/").unwrap();
+            runtime.destroy_webview(view).unwrap();
+            assert!(runtime.load_url(view, "https://example.invalid/").is_err());
+        }
+    }
+
+    #[cfg(not(all(feature = "servo", feature = "macos-webkit")))]
+    #[test]
+    fn absent_kind_rejects_creation_without_disturbing_a_sibling() {
+        let mut runtime = Runtime::new(host());
+        let session = runtime.create_session();
+        let sibling = runtime
+            .create_webview_with_options(session, MacOsWebViewOptions::new(compiled_engines()[0]))
+            .unwrap();
+        #[cfg(not(feature = "servo"))]
+        let (absent, message) = (
+            MacOsWebViewKind::Servo,
+            "Servo backend is not compiled; enable explorerkit feature 'servo'",
+        );
+        #[cfg(not(feature = "macos-webkit"))]
+        let (absent, message) = (
+            MacOsWebViewKind::SystemWebView,
+            "SystemWebView backend is not compiled; enable explorerkit feature 'macos-webkit'",
+        );
+        let error = runtime
+            .create_webview_with_options(session, MacOsWebViewOptions::new(absent))
+            .unwrap_err();
+        assert!(error.to_string().contains(message));
+        #[cfg(not(feature = "servo"))]
+        assert!(runtime
+            .create_webview(session)
+            .unwrap_err()
+            .to_string()
+            .contains(message));
+        runtime
+            .load_url(sibling, "https://example.invalid/still-live")
+            .unwrap();
+        runtime.destroy_webview(sibling).unwrap();
+        runtime.perform_all_updates().unwrap();
+        assert!(runtime.drain_events().is_empty());
     }
 }

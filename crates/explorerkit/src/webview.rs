@@ -2,6 +2,6 @@
 
 pub use explorerkit_embedder::{NavigationError, NavigationRequest, WebViewCommand, WebViewHandle};
 
-#[cfg(all(feature = "macos-system-webview", target_os = "macos"))]
+#[cfg(all(any(feature = "servo", feature = "macos-webkit"), target_os = "macos"))]
 /// macOS host adapter for create-time Servo or system-WebView selection.
 pub mod macos;

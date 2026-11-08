@@ -5,9 +5,62 @@ pub use explorerkit_host::{
     SurfaceFrameLike, SurfaceMode, SurfacePoint, SurfaceSize, SurfaceTarget, SurfaceViewport,
 };
 
-#[cfg(all(feature = "servo", target_os = "macos"))]
+#[cfg(all(any(feature = "servo", feature = "macos-webkit"), target_os = "macos"))]
 /// AppKit child-view helpers for macOS hosts that own their windows and layout.
 pub mod macos;
+
+#[cfg(any(
+    all(
+        feature = "servo",
+        any(
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux"
+        )
+    ),
+    all(feature = "macos-webkit", target_os = "macos")
+))]
+mod frame;
+#[cfg(any(
+    all(
+        feature = "servo",
+        any(
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux"
+        )
+    ),
+    all(feature = "macos-webkit", target_os = "macos")
+))]
+mod options;
+#[cfg(any(
+    all(
+        feature = "servo",
+        any(
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux"
+        )
+    ),
+    all(feature = "macos-webkit", target_os = "macos")
+))]
+pub use frame::{SurfaceFrame, SurfaceFrameImage};
+#[cfg(any(
+    all(
+        feature = "servo",
+        any(
+            target_os = "android",
+            target_os = "macos",
+            target_os = "windows",
+            target_os = "linux"
+        )
+    ),
+    all(feature = "macos-webkit", target_os = "macos")
+))]
+pub use options::{MemoryClipboard, SurfaceClipboard, SurfaceEventLoopWaker, SurfaceHostOptions};
 
 #[cfg(all(
     feature = "servo",
@@ -18,7 +71,4 @@ pub mod macos;
         target_os = "linux"
     )
 ))]
-pub use crate::surface_host::{
-    MemoryClipboard, SurfaceClipboard, SurfaceEventLoopWaker, SurfaceFrame, SurfaceFrameImage,
-    SurfaceHost, SurfaceHostOptions,
-};
+pub use crate::surface_host::SurfaceHost;
