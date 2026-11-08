@@ -22,8 +22,9 @@ engine and never restarts it after that thread exits. Web views and surfaces
 live shorter lives and come and go independently.
 
 The host keeps its engine connection even when no views exist. Closing views
-or dropping a host leaves the engine running for reuse. Only an explicit
-`Runtime::shutdown()` stops it. See
+or dropping a host leaves the engine running for reuse. An explicit
+`Runtime::shutdown()` requests final shutdown. It runs synchronously and can
+block inside Servo. See
 [closing views and shutting down](surfaces.md#closing-views-and-shutting-down).
 
 Servo owns its own internals: IPC, networking, storage, and engine

@@ -194,16 +194,65 @@ later.
   usual. The closed document no longer receives commands or produces frames.
 - Dropping the host normally releases its engine connection after it closes
   all views. A later host in the same process can reuse the engine.
-- `Runtime::shutdown()` consumes the runtime, closes its views, and shuts the
-  engine down for good. Servo cannot restart in the same process. Call it on
-  the thread that owns the engine, before you destroy native parent windows or
-  logging. It still finishes cleanup if one detach fails, and returns the first
-  error. A runtime with no attached surfaces can also retire an engine left
-  behind by an earlier, dropped host. It cannot shut down another live host's
-  engine.
+- `Runtime::shutdown()` consumes the runtime, attempts to close its views, and
+  requests final engine shutdown. Servo cannot restart in the same process.
+  Call it on the thread that owns the engine, before you destroy native parent
+  windows or logging. It attempts the other views and host cleanup even if one
+  detach fails, and returns the first error if cleanup returns. A runtime with
+  no attached surfaces can also retire an engine left behind by an earlier,
+  dropped host. It cannot shut down another live host's engine.
 
 Always destroy or detach a view's renderer before you remove its native view
 or close its parent window.
+
+### Final process exit when Servo shutdown stalls
+
+Shutdown is synchronous. ExplorerKit provides no shutdown timeout or separate
+notification that Servo has finished writing the profile. In the pinned Servo
+release, a SharedWorker can remain alive after its view closes and block final
+JavaScript engine destruction. Servo's native shutdown is triggered by
+[dropping its last engine handle](https://github.com/servo/servo/blob/c78d2c206f80a1c8b67eefa97f773bba513205d3/components/servo/servo.rs#L877).
+Closing views or waiting longer before that drop does not supply the missing
+worker termination.
+
+For an app that has committed to exiting the **whole process**, a host-owned
+deadline can keep this wait from preventing quit or restart:
+
+1. Finish the app saves, update installation and relaunch-helper preparation
+   that must precede exit. Complete outstanding consumer GPU work before
+   releasing its producer surfaces.
+2. Arm the app's exit deadline on an independent thread before entering any
+   potentially blocking engine teardown. A UI timer or another queued quit
+   callback cannot run while the owning thread is blocked.
+3. Call `Runtime::shutdown()` on the engine's owning thread, keeping native
+   parents and logging alive during the attempt. Move neither Servo nor its
+   destructor to the deadline thread.
+4. If shutdown returns, continue normal termination. Keep the deadline armed
+   for any remaining exit path it must cover. If the deadline expires, the
+   host performs its chosen terminal process exit without waiting for that
+   thread to return.
+
+The host owns this decision; ExplorerKit never terminates the app for it. On
+macOS, a terminal fallback such as
+[`_exit`](https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man2/_exit.2.html)
+bypasses normal exit handlers. Rust's
+[`process::exit`](https://doc.rust-lang.org/std/process/fn.exit.html) skips stack
+destructors but still runs C and platform exit handlers. Ordinary drop or
+forgetting the public runtime leaves ExplorerKit's separate thread-local
+engine owner, so neither alone establishes how the final process exits.
+
+Attempting native shutdown gives Servo's normal cookie/profile exit writes an
+opportunity to run. Bypassing engine drop entirely skips that work. A deadline
+is a time budget, not a profile-write receipt: at expiry it can interrupt
+unfinished saves, worker operations, buffered output or cleanup. Choose the
+budget for your app and validate quit/reopen with its profile and saved state;
+a single proof duration is not a recommended timeout.
+
+The checked host pattern is limited to macOS and the
+[pinned Servo release](../reference/dependencies.md#servo-version). It bounds
+whole-process exit; it does not establish successful in-process cleanup,
+Servo restart in the same process, WebKit behavior or a consumer app's actual
+update and relaunch sequence. Validate those app-specific steps separately.
 
 Not covered yet: native clipping, stacking, and hide/show of embedded views.
 
