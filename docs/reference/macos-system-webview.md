@@ -11,9 +11,24 @@ uses Servo, and Windows has no equivalent.
 
 ## Set up
 
-Turn on the `macos-system-webview` feature of the `explorerkit` crate (it also
-turns on `servo`), then use `explorerkit::webview::macos::MacOsViewHost` as your
-host:
+Cargo features are build-time flags. Choose which engines your macOS native
+Rust app includes, then use `explorerkit::webview::macos::MacOsViewHost` as
+your host:
+
+| Dependency features | Engines included |
+| --- | --- |
+| `servo` | Servo |
+| `macos-webkit` | System WebKit integration, without Servo |
+| `servo, macos-webkit` | Both |
+| `macos-system-webview` | Both; preserves the existing build flag |
+
+The default feature set is empty and provides the portable types and runtime,
+not a browser. WebKit itself comes from macOS. Cargo features add together:
+another dependency enabling Servo brings it into the same build. Check the
+actual app's dependency graph rather than a workspace build that also selects
+Servo-backed Android or React Native hosts.
+
+The following example requires both engines:
 
 ```rust
 use explorerkit::webview::macos::{
@@ -42,12 +57,42 @@ Your delegate's `appkit_parent` returns the live AppKit parent view for a
 slot. ExplorerKit creates the system view inside it and never takes ownership of
 your window.
 
+Both engine-kind variants and the host's constructor stay the same in all three
+builds. `MacOsWebViewOptions::default()` and `Runtime::create_webview` still
+select Servo. In a WebKit-only build, explicitly select `SystemWebView` as
+above. Selecting an engine omitted from the build returns a `HostError` through
+the Runtime error path; it never switches to another engine.
+
+Call `explorerkit::webview::macos::compiled_engines()` to get the kinds this
+facade build can select, in Servo-then-SystemWebView order. It returns a static
+slice and can be called before creating an application, host or runtime.
+It does not start an engine or check its health. `SystemWebView` means the
+WebKit integration is compiled; macOS still supplies WebKit. The list does not
+inventory libraries pulled in by other dependencies or promise every capability
+on every listed engine. The macOS host module, including this query, is absent
+from the no-engine portable build.
+
+Shared delegate code can keep its `SurfaceFrame` and macOS GPU resource type
+signatures in a WebKit-only build. System views do not emit those frames or
+gain offscreen rendering. The Servo-specific `SurfaceHost` and crypto-provider
+helpers still require `servo`; code using them must keep that feature or adapt
+its explicit backend choice. `SurfaceHostOptions::with_config_directory` only
+configures Servo, while `WebKitDataStoreIdentifier` only configures WebKit.
+
+An app can forward its own build flags to `explorerkit/servo` and
+`explorerkit/macos-webkit`. Dependency flags do not automatically become
+`cfg(feature = "…")` flags in the app. The React Native macOS framework remains
+Servo-only; these choices apply to the native Rust facade.
+
 ## How system views behave
 
 - **Ownership.** A system view is a child `WKWebView` owned by
   [WRY](https://github.com/tauri-apps/wry). The `Runtime` still owns every
   view's lifetime. Your app still owns the window, the layout slot, the
   chrome, and which engine to pick.
+  A both-engine build can place Servo and system views together in that layout.
+  ExplorerKit does not manage a pool of interchangeable browser processes:
+  Servo owns its engine execution, and WebKit manages its native processes.
 - **Commands and events.** Load, reload, stop, back, forward, and focus work. The
   view reports URL, load status, title, crash, and navigation-state events
   (whether it can go back or forward).

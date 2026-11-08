@@ -7,7 +7,7 @@ publish = false
 [[test]]
 name = "macos-system-configuration"
 path = "tests/macos_system_configuration.rs"
-required-features = ["macos-system-webview"]
+required-features = ["macos-webkit"]
 harness = false
 
 [[example]]
@@ -17,8 +17,22 @@ required-features = ["servo"]
 
 [features]
 default = []
-macos-system-webview = [
-    "servo",
+macos-system-webview = ["servo", "macos-webkit"]
+macos-webkit = [
+    "dep:objc2-core-foundation",
+    "dep:image",
+    "image/bmp",
+    "image/gif",
+    "image/ico",
+    "image/jpeg",
+    "image/png",
+    "image/rayon",
+    "image/webp",
+    "dep:cocoa",
+    "dep:core-foundation",
+    "dep:core-video",
+    "dep:dpi",
+    "dep:raw-window-handle",
     "dep:block2",
     "dep:mime",
     "dep:objc2",

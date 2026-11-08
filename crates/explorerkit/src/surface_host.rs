@@ -1,11 +1,9 @@
+use crate::surface::{SurfaceClipboard, SurfaceEventLoopWaker, SurfaceFrame, SurfaceHostOptions};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::fmt;
 use std::mem;
 use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
-use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 use dpi::PhysicalSize;
 use explorerkit_embedder::{
@@ -14,17 +12,16 @@ use explorerkit_embedder::{
     ServoWebViewInit, SessionHandle, WebViewCommand, WebViewHandle, WebViewRegistrar,
 };
 use explorerkit_host::{
-    HostSurface, NativeSurface, OffscreenSurface, SurfaceDelegate, SurfaceError, SurfaceFrameInfo,
-    SurfaceFrameLike, SurfaceMode, SurfaceSize, SurfaceTarget, SurfaceViewport,
+    HostSurface, NativeSurface, OffscreenSurface, SurfaceDelegate, SurfaceError, SurfaceMode,
+    SurfaceSize, SurfaceTarget, SurfaceViewport,
 };
 use servo::{
     ClipboardDelegate, EventLoopWaker, OffscreenRenderingContext, RefreshDriver, RenderingContext,
     StringRequest, WebView, WindowRenderingContext,
 };
-use webrender_api::units::{DeviceIntPoint, DeviceIntRect, DeviceIntSize};
 
 #[cfg(target_os = "macos")]
-use crate::surface::macos::{ExportableRenderingContext, GpuFrame};
+use crate::surface::macos::ExportableRenderingContext;
 
 #[derive(Debug, Clone, Copy)]
 enum RenderTarget<'a> {
@@ -55,189 +52,6 @@ impl RenderTarget<'_> {
 
     fn kind(&self) -> SurfaceMode {
         self.mode()
-    }
-}
-
-/// RGBA pixels read from one CPU-offscreen Servo frame.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SurfaceFrameImage {
-    width: u32,
-    height: u32,
-    rgba: Vec<u8>,
-}
-
-impl SurfaceFrameImage {
-    /// Returns the image width in physical pixels.
-    pub fn width(&self) -> u32 {
-        self.width
-    }
-
-    /// Returns the image height in physical pixels.
-    pub fn height(&self) -> u32 {
-        self.height
-    }
-
-    /// Borrows the tightly packed RGBA8 pixel bytes.
-    pub fn rgba(&self) -> &[u8] {
-        &self.rgba
-    }
-
-    /// Consumes the image and returns its tightly packed RGBA8 pixel bytes.
-    pub fn into_rgba(self) -> Vec<u8> {
-        self.rgba
-    }
-}
-
-/// A painted Servo frame handed to host present/composite code.
-///
-/// Hosts can call [`SurfaceFrame::present`] for native-surface swap/present behavior, use
-/// [`SurfaceFrame::read_rgba`] when an offscreen target supports CPU access, or take an exported
-/// macOS GPU frame from an exportable offscreen target.
-pub struct SurfaceFrame<'a> {
-    rendering_context: Option<&'a dyn RenderingContext>,
-    info: SurfaceFrameInfo,
-    did_present: bool,
-    #[cfg(target_os = "macos")]
-    webview: Option<WebViewHandle>,
-    #[cfg(target_os = "macos")]
-    exportable_context: Option<&'a ExportableRenderingContext>,
-    #[cfg(target_os = "macos")]
-    gpu_frame_taken: bool,
-}
-
-impl<'a> SurfaceFrame<'a> {
-    fn new(
-        webview: WebViewHandle,
-        rendering_context: &'a dyn RenderingContext,
-        viewport: SurfaceViewport,
-        mode: SurfaceMode,
-        #[cfg(target_os = "macos")] exportable_context: Option<&'a ExportableRenderingContext>,
-    ) -> Self {
-        Self {
-            rendering_context: Some(rendering_context),
-            info: SurfaceFrameInfo::new(viewport, mode),
-            did_present: false,
-            #[cfg(target_os = "macos")]
-            webview: Some(webview),
-            #[cfg(target_os = "macos")]
-            exportable_context,
-            #[cfg(target_os = "macos")]
-            gpu_frame_taken: false,
-        }
-    }
-
-    #[cfg(test)]
-    fn for_test(viewport: SurfaceViewport, mode: SurfaceMode) -> Self {
-        Self {
-            rendering_context: None,
-            info: SurfaceFrameInfo::new(viewport, mode),
-            did_present: false,
-            #[cfg(target_os = "macos")]
-            webview: None,
-            #[cfg(target_os = "macos")]
-            exportable_context: None,
-            #[cfg(target_os = "macos")]
-            gpu_frame_taken: false,
-        }
-    }
-
-    /// Returns the viewport and surface-mode metadata for this frame.
-    pub fn info(&self) -> SurfaceFrameInfo {
-        self.info
-    }
-
-    /// Returns the viewport painted into this frame.
-    pub fn viewport(&self) -> SurfaceViewport {
-        self.info.viewport()
-    }
-
-    /// Returns the surface mode used to paint this frame.
-    pub fn mode(&self) -> SurfaceMode {
-        self.info.mode()
-    }
-
-    /// Reports whether [`SurfaceFrame::present`] has been called.
-    pub fn did_present(&self) -> bool {
-        self.did_present
-    }
-
-    /// Run ExplorerKit's default present operation for this target.
-    ///
-    /// For native targets this swaps/presents the native rendering surface. Servo's local
-    /// offscreen context has no default swap operation; hosts normally composite it via
-    /// [`SurfaceFrame::read_rgba`] instead.
-    pub fn present(&mut self) {
-        if let Some(rendering_context) = self.rendering_context {
-            rendering_context.present();
-        }
-        self.did_present = true;
-    }
-
-    /// Read the painted frame as RGBA pixels for host-side compositing.
-    pub fn read_rgba(&self) -> Option<SurfaceFrameImage> {
-        let rendering_context = self.rendering_context?;
-        let size = rendering_context.size();
-        let width = i32::try_from(size.width).ok()?;
-        let height = i32::try_from(size.height).ok()?;
-        let rectangle = DeviceIntRect::from_origin_and_size(
-            DeviceIntPoint::new(0, 0),
-            DeviceIntSize::new(width, height),
-        );
-        let image = rendering_context.read_to_image(rectangle)?;
-        Some(SurfaceFrameImage {
-            width: image.width(),
-            height: image.height(),
-            rgba: image.into_raw(),
-        })
-    }
-
-    /// Takes the macOS GPU resource painted for this frame, when the attached offscreen target is
-    /// exportable. The returned completion token must be completed after the consumer's final GPU
-    /// sample. Calling this more than once for one frame is an error.
-    #[cfg(target_os = "macos")]
-    pub fn take_gpu_frame(&mut self) -> Result<Option<GpuFrame>, SurfaceError> {
-        let Some(context) = self.exportable_context else {
-            return Ok(None);
-        };
-        if self.gpu_frame_taken {
-            return Err(SurfaceError::new(
-                "the exportable GPU frame has already been taken",
-            ));
-        }
-        let webview = self
-            .webview
-            .expect("real exportable frames always carry webview identity");
-        let frame = context.take_gpu_frame(webview)?;
-        self.gpu_frame_taken = true;
-        Ok(Some(frame))
-    }
-}
-
-impl Drop for SurfaceFrame<'_> {
-    fn drop(&mut self) {
-        #[cfg(target_os = "macos")]
-        if !self.gpu_frame_taken {
-            if let Some(context) = self.exportable_context {
-                let _ = context.recycle_unpublished();
-            }
-        }
-    }
-}
-
-impl SurfaceFrameLike for SurfaceFrame<'_> {
-    fn present(&mut self) {
-        Self::present(self);
-    }
-}
-
-impl fmt::Debug for SurfaceFrame<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("SurfaceFrame")
-            .field("viewport", &self.viewport())
-            .field("mode", &self.mode())
-            .field("did_present", &self.did_present)
-            .finish_non_exhaustive()
     }
 }
 
@@ -317,105 +131,6 @@ where
         frame: &mut SurfaceFrame<'_>,
     ) -> Result<(), SurfaceError> {
         <T as SurfaceDelegate>::present_frame(self, surface, frame)
-    }
-}
-
-/// Clipboard services exposed through the ExplorerKit facade and adapted to Servo internally.
-pub trait SurfaceClipboard {
-    /// Clears clipboard text, defaulting to a successful no-op.
-    fn clear_text(&self) -> Result<(), SurfaceError> {
-        Ok(())
-    }
-
-    /// Returns clipboard text, defaulting to an empty string.
-    fn get_text(&self) -> Result<String, SurfaceError> {
-        Ok(String::new())
-    }
-
-    /// Replaces clipboard text, defaulting to a successful no-op.
-    fn set_text(&self, _text: String) -> Result<(), SurfaceError> {
-        Ok(())
-    }
-}
-
-/// In-memory clipboard suitable for simple hosts and tests.
-#[derive(Debug, Default)]
-pub struct MemoryClipboard {
-    text: RefCell<String>,
-}
-
-impl SurfaceClipboard for MemoryClipboard {
-    fn clear_text(&self) -> Result<(), SurfaceError> {
-        self.text.borrow_mut().clear();
-        Ok(())
-    }
-
-    fn get_text(&self) -> Result<String, SurfaceError> {
-        Ok(self.text.borrow().clone())
-    }
-
-    fn set_text(&self, text: String) -> Result<(), SurfaceError> {
-        self.text.replace(text);
-        Ok(())
-    }
-}
-
-/// Thread-safe callback used to wake the host event loop for Servo work or queued native results.
-///
-/// Schedule a later update on the owning thread; do not synchronously reenter the Runtime.
-/// Wake hints may be coalesced or spurious. macOS system state changes also wake the host;
-/// periodic URL/history collection is unnecessary. Keep the host's animation pacing.
-pub type SurfaceEventLoopWaker = Arc<dyn Fn() + Send + Sync + 'static>;
-
-/// Event-loop, clipboard, and process-engine options supplied to [`SurfaceHost`].
-#[derive(Clone)]
-pub struct SurfaceHostOptions {
-    event_loop_waker: SurfaceEventLoopWaker,
-    clipboard: Rc<dyn SurfaceClipboard>,
-    config_directory: Option<PathBuf>,
-}
-
-impl SurfaceHostOptions {
-    /// Creates host options from an event-loop waker and clipboard service.
-    pub fn new(
-        event_loop_waker: SurfaceEventLoopWaker,
-        clipboard: Rc<dyn SurfaceClipboard>,
-    ) -> Self {
-        Self {
-            event_loop_waker,
-            clipboard,
-            config_directory: None,
-        }
-    }
-
-    /// Sets Servo's process-wide config directory for persistent website data.
-    ///
-    /// The first initialized Servo engine fixes this directory for the process.
-    /// Later hosts must request the same value.
-    pub fn with_config_directory(mut self, config_directory: impl Into<PathBuf>) -> Self {
-        self.config_directory = Some(config_directory.into());
-        self
-    }
-
-    /// Borrows the event-loop wake callback for Servo work and macOS system-view results.
-    pub fn event_loop_waker(&self) -> &SurfaceEventLoopWaker {
-        &self.event_loop_waker
-    }
-
-    /// Clones the reference-counted clipboard service.
-    pub fn clipboard(&self) -> Rc<dyn SurfaceClipboard> {
-        self.clipboard.clone()
-    }
-
-    /// Returns Servo's configured process-wide config directory, if any.
-    pub fn config_directory(&self) -> Option<&Path> {
-        self.config_directory.as_deref()
-    }
-}
-
-impl Default for SurfaceHostOptions {
-    fn default() -> Self {
-        Self::new(Arc::new(|| {}), Rc::new(MemoryClipboard::default()))
     }
 }
 
@@ -2314,6 +2029,7 @@ mod tests {
         runtime::{ExplorerKitError, Runtime},
         surface::SurfacePoint,
     };
+    use std::path::PathBuf;
 
     #[test]
     fn host_options_expose_the_process_config_directory() {
