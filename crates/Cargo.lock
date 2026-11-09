@@ -1892,6 +1892,7 @@ dependencies = [
 name = "explorerkit"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "block2",
  "cocoa",
  "core-foundation 0.10.0",
@@ -1911,9 +1912,12 @@ dependencies = [
  "objc2-foundation",
  "objc2-web-kit",
  "raw-window-handle",
+ "rusqlite",
  "serde_json",
  "servo",
+ "sha2 0.10.9",
  "surfman",
+ "url",
  "webrender_api",
  "wry",
 ]

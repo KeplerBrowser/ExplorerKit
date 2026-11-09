@@ -1,10 +1,14 @@
-//! Read-only capture through the retained native store and private origin helpers.
+//! Capture native cookies and committed localStorage from the retained named store.
 
 use std::{
     cell::RefCell,
-    collections::VecDeque,
     ptr::NonNull,
     rc::{Rc, Weak},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc,
+    },
+    thread,
 };
 
 use block2::RcBlock;
@@ -14,110 +18,91 @@ use explorerkit_embedder::site_data::{
     SiteDataMutation, SiteDataOperation, SiteDataOrigin, SiteDataSameSite, SiteDataSelection,
     SiteDataSnapshot, SiteDataStage,
 };
-use objc2::{
-    define_class, msg_send,
-    rc::Retained,
-    runtime::{AnyObject, ProtocolObject},
-    DefinedClass, MainThreadOnly,
-};
-use objc2_foundation::{
-    NSArray, NSError, NSHTTPCookie, NSObject, NSObjectProtocol, NSRect, NSString, NSURL,
-};
-use objc2_web_kit::{
-    WKNavigation, WKNavigationDelegate, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore,
-};
+use objc2::{rc::Retained, MainThreadOnly};
+use objc2_foundation::{NSArray, NSHTTPCookie, NSSet, NSUUID};
+use objc2_web_kit::{WKWebsiteDataRecord, WKWebsiteDataStore, WKWebsiteDataTypeLocalStorage};
 
 use crate::surface::SurfaceEventLoopWaker;
 
-const BLANK: &str = "<!doctype html><meta http-equiv='Content-Security-Policy' content=\"default-src 'none'; base-uri 'none'; form-action 'none'\">";
-const READ_STORAGE: &str = r#"(() => {
-    const entries = [];
-    for (let index = 0; index < localStorage.length; index++) {
-        const key = localStorage.key(index);
-        const value = localStorage.getItem(key);
-        if (key === null || value === null) throw new Error();
-        entries.push([key, value]);
+mod committed_storage;
+
+type StorageResult = Result<Option<Vec<SiteDataLocalStorage>>, ()>;
+
+struct StorageRead {
+    result: mpsc::Receiver<StorageResult>,
+    cancelled: Arc<AtomicBool>,
+}
+
+impl StorageRead {
+    fn start(
+        store: committed_storage::NamedStore,
+        origins: Vec<SiteDataOrigin>,
+        wake: SurfaceEventLoopWaker,
+    ) -> Result<Self, ()> {
+        let (sender, result) = mpsc::channel();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker_cancelled = cancelled.clone();
+        thread::Builder::new()
+            .name("explorerkit-site-data".into())
+            .spawn(move || {
+                let read = || {
+                    if worker_cancelled.load(Ordering::Relaxed) {
+                        return Err(());
+                    }
+                    let Some(storage) = store.open()? else {
+                        return Ok(None);
+                    };
+                    origins
+                        .into_iter()
+                        .map(|origin| {
+                            if worker_cancelled.load(Ordering::Relaxed) {
+                                return Err(());
+                            }
+                            storage.capture(origin)
+                        })
+                        .collect::<Result<_, _>>()
+                        .map(Some)
+                };
+                let result = read();
+                if !worker_cancelled.load(Ordering::Relaxed) && sender.send(result).is_ok() {
+                    wake();
+                }
+            })
+            .map_err(|_| ())?;
+        Ok(Self { result, cancelled })
     }
-    return JSON.stringify([location.origin, entries]);
-})()"#;
-
-enum Reply {
-    Cookies(Vec<SiteDataCookie>),
-    Loaded,
-    Storage(String),
-    Failed,
 }
 
-#[derive(Clone)]
-struct ReplySink {
-    inbox: Weak<RefCell<Option<Reply>>>,
-    wake: SurfaceEventLoopWaker,
-}
-
-impl ReplySink {
-    fn send(&self, reply: Reply) {
-        if let Some(inbox) = self.inbox.upgrade() {
-            *inbox.borrow_mut() = Some(reply);
-            (self.wake)();
-        }
-    }
-}
-
-define_class!(
-    #[unsafe(super(NSObject))]
-    #[thread_kind = MainThreadOnly]
-    #[ivars = ReplySink]
-    struct CaptureNavigation;
-
-    unsafe impl NSObjectProtocol for CaptureNavigation {}
-    unsafe impl WKNavigationDelegate for CaptureNavigation {
-        #[unsafe(method(webView:didFinishNavigation:))]
-        fn finished(&self, _: &WKWebView, _: Option<&WKNavigation>) {
-            self.ivars().send(Reply::Loaded);
-        }
-
-        #[unsafe(method(webView:didFailProvisionalNavigation:withError:))]
-        fn failed_provisional(&self, _: &WKWebView, _: Option<&WKNavigation>, _: &NSError) {
-            self.ivars().send(Reply::Failed);
-        }
-
-        #[unsafe(method(webView:didFailNavigation:withError:))]
-        fn failed(&self, _: &WKWebView, _: Option<&WKNavigation>, _: &NSError) {
-            self.ivars().send(Reply::Failed);
-        }
-
-        #[unsafe(method(webViewWebContentProcessDidTerminate:))]
-        fn terminated(&self, _: &WKWebView) {
-            self.ivars().send(Reply::Failed);
-        }
-    }
-);
-
-struct Helper {
-    view: Retained<WKWebView>,
-    _navigation: Retained<CaptureNavigation>,
-    origin: SiteDataOrigin,
-}
-
-impl Drop for Helper {
+impl Drop for StorageRead {
     fn drop(&mut self) {
-        // SAFETY: The helper is private and is released on AppKit's thread.
-        unsafe {
-            self.view.setNavigationDelegate(None);
-            self.view.stopLoading();
-        }
+        self.cancelled.store(true, Ordering::Relaxed);
     }
+}
+
+type Inbox<T> = Rc<RefCell<Option<T>>>;
+
+fn reply<T>(sink: &Weak<RefCell<Option<T>>>, wake: &SurfaceEventLoopWaker, value: T) {
+    if let Some(inbox) = sink.upgrade() {
+        *inbox.borrow_mut() = Some(value);
+        wake();
+    }
+}
+
+enum Pending {
+    Cookies(Inbox<Vec<SiteDataCookie>>),
+    VerifyStore(Inbox<bool>),
+    MaterializeStore(Inbox<()>),
+    Read(StorageRead),
 }
 
 pub(super) struct Capture {
     store: Retained<WKWebsiteDataStore>,
     completion: Option<SiteDataCompletion<SiteDataSnapshot>>,
     snapshot: SiteDataSnapshot,
-    origins: VecDeque<SiteDataOrigin>,
-    inbox: Rc<RefCell<Option<Reply>>>,
+    origins: Vec<SiteDataOrigin>,
+    pending: Option<Pending>,
+    materialized: bool,
     wake: SurfaceEventLoopWaker,
-    helper: Option<Helper>,
-    stage: SiteDataStage,
 }
 
 impl Capture {
@@ -131,83 +116,105 @@ impl Capture {
             store,
             completion: Some(completion),
             snapshot: SiteDataSnapshot::default(),
-            origins: selection.local_storage_origins.into(),
-            inbox: Rc::default(),
+            origins: selection.local_storage_origins,
+            pending: None,
+            materialized: false,
             wake,
-            helper: None,
-            stage: SiteDataStage::CaptureLocalStorage,
         };
         if selection.include_cookies {
-            capture.stage = SiteDataStage::CaptureCookies;
             capture.snapshot.limitations = vec![
                 SiteDataLimitation::SameSiteUnspecifiedOrNone,
                 SiteDataLimitation::PartitionMetadataUnavailable,
             ];
-            let sink = capture.sink();
+            let inbox: Inbox<Vec<SiteDataCookie>> = Rc::default();
+            let sink = Rc::downgrade(&inbox);
+            let wake = capture.wake.clone();
             let callback = RcBlock::new(move |array: NonNull<NSArray<NSHTTPCookie>>| {
-                // SAFETY: WebKit supplies this array for the duration of its main-thread callback.
-                if sink.inbox.strong_count() != 0 {
+                if sink.strong_count() != 0 {
+                    // SAFETY: WebKit supplies this array on AppKit's thread.
                     let cookies = unsafe { array.as_ref() }
                         .iter()
                         .map(|cookie| read_cookie(&cookie))
                         .collect();
-                    sink.send(Reply::Cookies(cookies));
+                    reply(&sink, &wake, cookies);
                 }
             });
-            // SAFETY: The selected store and callback belong to AppKit's thread.
+            capture.pending = Some(Pending::Cookies(inbox));
+            // SAFETY: The store and callback belong to AppKit's thread.
             unsafe { capture.store.httpCookieStore().getAllCookies(&callback) };
         } else {
-            capture.next_origin();
+            capture.verify_store();
         }
         let pending = capture.completion.is_some().then_some(capture);
         (operation, pending)
     }
 
-    fn sink(&self) -> ReplySink {
-        ReplySink {
-            inbox: Rc::downgrade(&self.inbox),
-            wake: self.wake.clone(),
+    fn verify_store(&mut self) {
+        if self.origins.is_empty() {
+            self.succeed(Vec::new());
+            return;
         }
+        // SAFETY: Admission retained and verified this named store on AppKit's thread.
+        let Some(identifier) = (unsafe { self.store.identifier() }) else {
+            self.fail(SiteDataErrorKind::NativeRead);
+            return;
+        };
+        let expected = identifier.as_bytes();
+        let inbox = Rc::default();
+        let sink = Rc::downgrade(&inbox);
+        let wake = self.wake.clone();
+        let callback = RcBlock::new(move |array: NonNull<NSArray<NSUUID>>| {
+            if sink.strong_count() != 0 {
+                // SAFETY: WebKit supplies the UUIDs on AppKit's thread.
+                let found = unsafe { array.as_ref() }
+                    .iter()
+                    .any(|id| id.as_bytes() == expected);
+                reply(&sink, &wake, found);
+            }
+        });
+        self.pending = Some(Pending::VerifyStore(inbox));
+        // WebKit lists the UUIDs in its active app/container namespace. A
+        // matching name in an inactive namespace is not evidence of a store.
+        // SAFETY: This macOS 14 API is used only for a verified named store.
+        unsafe { WKWebsiteDataStore::fetchAllDataStoreIdentifiers(&callback, self.store.mtm()) };
     }
 
-    fn next_origin(&mut self) {
-        self.stage = SiteDataStage::CaptureLocalStorage;
-        self.inbox = Rc::default();
-        self.helper.take();
-        let Some(origin) = self.origins.pop_front() else {
-            let snapshot = std::mem::take(&mut self.snapshot);
-            self.finish(Ok(snapshot));
-            return;
-        };
-        let Some(url) = NSURL::URLWithString(&NSString::from_str(&origin.serialize())) else {
+    fn materialize_store(&mut self) {
+        if self.materialized {
             self.fail(SiteDataErrorKind::NativeRead);
             return;
-        };
-        let mtm = self.store.mtm();
-        // SAFETY: All objects are created and used on AppKit's thread.
-        let (view, navigation) = unsafe {
-            let configuration = WKWebViewConfiguration::new(mtm);
-            configuration.setWebsiteDataStore(&self.store);
-            let view = WKWebView::initWithFrame_configuration(
-                WKWebView::alloc(mtm),
-                NSRect::default(),
-                &configuration,
-            );
-            let navigation = CaptureNavigation::alloc(mtm).set_ivars(self.sink());
-            let navigation: Retained<CaptureNavigation> = msg_send![super(navigation), init];
-            view.setNavigationDelegate(Some(ProtocolObject::from_ref(&*navigation)));
-            (view, navigation)
-        };
-        let submitted =
-            unsafe { view.loadHTMLString_baseURL(&NSString::from_str(BLANK), Some(&url)) }
-                .is_some();
-        self.helper = Some(Helper {
-            view,
-            _navigation: navigation,
-            origin,
+        }
+        self.materialized = true;
+        let inbox = Rc::default();
+        let sink = Rc::downgrade(&inbox);
+        let wake = self.wake.clone();
+        let callback = RcBlock::new(move |_: NonNull<NSArray<WKWebsiteDataRecord>>| {
+            reply(&sink, &wake, ());
         });
-        if !submitted {
+        self.pending = Some(Pending::MaterializeStore(inbox));
+        // A fresh named store can exist before the network process has
+        // created its storage layout. Fetch metadata to start that process.
+        // The returned records supply neither values nor evidence of emptiness.
+        // SAFETY: The store and callback belong to AppKit's thread.
+        unsafe {
+            self.store.fetchDataRecordsOfTypes_completionHandler(
+                &NSSet::from_slice(&[WKWebsiteDataTypeLocalStorage]),
+                &callback,
+            )
+        };
+    }
+
+    fn begin_storage(&mut self) {
+        // SAFETY: Admission retained and verified this named store on AppKit's thread.
+        let Some(identifier) = (unsafe { self.store.identifier() }) else {
             self.fail(SiteDataErrorKind::NativeRead);
+            return;
+        };
+        match committed_storage::NamedStore::new(&identifier)
+            .and_then(|store| StorageRead::start(store, self.origins.clone(), self.wake.clone()))
+        {
+            Ok(storage) => self.pending = Some(Pending::Read(storage)),
+            Err(()) => self.fail(SiteDataErrorKind::NativeRead),
         }
     }
 
@@ -219,64 +226,63 @@ impl Capture {
             self.fail(SiteDataErrorKind::Cancelled);
             return true;
         }
-        let reply = self.inbox.borrow_mut().take();
-        match reply {
-            None => {}
-            Some(Reply::Cookies(cookies)) => {
-                self.snapshot.cookies = cookies;
-                self.next_origin();
-            }
-            Some(Reply::Loaded) => {
-                let helper = self.helper.as_ref().expect("load belongs to active helper");
-                let sink = self.sink();
-                let callback = RcBlock::new(move |value: *mut AnyObject, error: *mut NSError| {
-                    // SAFETY: WebKit owns these callback arguments on AppKit's thread.
-                    let value = unsafe { value.as_ref() }
-                        .and_then(|value| value.downcast_ref::<NSString>());
-                    sink.send(match value {
-                        Some(value) if error.is_null() => Reply::Storage(value.to_string()),
-                        _ => Reply::Failed,
-                    });
-                });
-                // SAFETY: A fixed script reads the private helper's own origin on AppKit's thread.
-                unsafe {
-                    helper.view.evaluateJavaScript_completionHandler(
-                        &NSString::from_str(READ_STORAGE),
-                        Some(&callback),
-                    )
-                };
-            }
-            Some(Reply::Storage(data)) => {
-                let helper = self.helper.as_ref().expect("read belongs to active helper");
-                let decoded = serde_json::from_str::<(String, Vec<(String, String)>)>(&data);
-                match decoded {
-                    Ok((origin, entries)) if origin == helper.origin.serialize() => {
-                        self.snapshot.local_storage.push(SiteDataLocalStorage {
-                            origin: helper.origin.clone(),
-                            entries,
-                        });
-                        self.next_origin();
-                    }
-                    _ => self.fail(SiteDataErrorKind::NativeRead),
+        match self.pending.as_ref() {
+            Some(Pending::Cookies(inbox)) => {
+                let cookies = inbox.borrow_mut().take();
+                if let Some(cookies) = cookies {
+                    self.pending = None;
+                    self.snapshot.cookies = cookies;
+                    self.verify_store();
                 }
             }
-            Some(Reply::Failed) => self.fail(SiteDataErrorKind::NativeRead),
+            Some(Pending::VerifyStore(inbox)) => {
+                let found = inbox.borrow_mut().take();
+                match found {
+                    Some(true) => self.begin_storage(),
+                    Some(false) => self.materialize_store(),
+                    None => {}
+                }
+            }
+            Some(Pending::MaterializeStore(inbox)) => {
+                let ready = inbox.borrow_mut().take().is_some();
+                if ready {
+                    self.verify_store();
+                }
+            }
+            Some(Pending::Read(storage)) => match storage.result.try_recv() {
+                Ok(Ok(Some(records))) => self.succeed(records),
+                Ok(Ok(None)) => self.materialize_store(),
+                Ok(Err(())) | Err(mpsc::TryRecvError::Disconnected) => {
+                    self.fail(SiteDataErrorKind::NativeRead);
+                }
+                Err(mpsc::TryRecvError::Empty) => {}
+            },
+            None => {}
         }
         self.completion.is_none()
     }
 
+    fn succeed(&mut self, records: Vec<SiteDataLocalStorage>) {
+        let mut snapshot = std::mem::take(&mut self.snapshot);
+        snapshot.local_storage = records;
+        self.finish(Ok(snapshot));
+    }
+
     fn fail(&mut self, kind: SiteDataErrorKind) {
+        let stage = if matches!(self.pending, Some(Pending::Cookies(_))) {
+            SiteDataStage::CaptureCookies
+        } else {
+            SiteDataStage::CaptureLocalStorage
+        };
         self.finish(Err(SiteDataError {
             kind,
-            stage: self.stage,
+            stage,
             mutation: SiteDataMutation::Unchanged,
         }));
     }
 
     fn finish(&mut self, result: Result<SiteDataSnapshot, SiteDataError>) {
-        // Retire the callback address before making the result observable.
-        self.inbox = Rc::default();
-        self.helper.take();
+        self.pending.take();
         self.snapshot = SiteDataSnapshot::default();
         if let Some(completion) = self.completion.take() {
             completion.complete(result);
