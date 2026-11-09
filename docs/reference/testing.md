@@ -173,6 +173,35 @@ events.
 
 ### macOS
 
+#### Explicit site-data transfer
+
+Rerun these checks when the portable operation lifecycle, WebKit store or
+helper, Servo cookie or storage API, or destination navigation gate changes.
+The native tests use an interactive AppKit session, loopback servers, and
+fresh synthetic stores.
+
+```sh
+cargo test --manifest-path crates/Cargo.toml --locked -p explorerkit-embedder
+cargo check --manifest-path crates/Cargo.toml --locked -p explorerkit --features servo
+cargo test --manifest-path crates/Cargo.toml --locked -p explorerkit \
+  --features macos-webkit --test macos-site-data
+cargo test --manifest-path crates/Cargo.toml --locked -p explorerkit \
+  --features macos-system-webview --test macos-site-data
+cargo test --manifest-path crates/Cargo.toml --locked -p explorerkit \
+  --features macos-webkit-automation --test macos-site-data
+```
+
+The WebKit-only fixture checks store and origin isolation, cookie opt-in,
+read-only capture, cancellation, and teardown. The mixed fixture exercises
+the first Servo request and script, shared-store merge, HTTP cookie scope,
+preflight, and the terminal destination gate. The network fixture uses HTTP.
+Servo's native HTTPS cookie getter verifies the transferred Secure metadata.
+The automation-enabled run checks the selected store for the first
+automation-enabled view using the same fixture. It requires no WebDriver
+helper.
+
+#### Engine configurations
+
 For changes to macOS engine feature flags, host ownership or shared frame
 types, check each [build configuration](macos-system-webview.md#set-up)
 separately. An all-features run cannot prove either single-engine build:

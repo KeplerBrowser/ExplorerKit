@@ -62,6 +62,9 @@ Set it before Servo first starts. ExplorerKit passes it straight to Servo's
 process-wide. Once the engine is running, it only accepts the same directory.
 To switch profiles, start a new process.
 
+[Explicit site-data initialization](../reference/site-data.md) writes into
+that same process-wide Servo store. Existing views can observe those writes.
+
 ## Threads
 
 Call ExplorerKit from the thread that owns the engine, usually your UI thread.
@@ -166,8 +169,8 @@ On macOS, a native Rust host can use `MacOsViewHost` and pick an engine for
 each view when it creates it: `Servo`, or `SystemWebView` (a `WKWebView` owned
 by [WRY](https://github.com/tauri-apps/wry)). The runtime still owns every
 view's lifetime, and your app still owns the window, layout, and selection.
-Servo and WebKit do not share cookies, storage, or credentials. Details:
-[macOS system web view](../reference/macos-system-webview.md).
+The two engines use separate stores. See the
+[macOS system web view guide](../reference/macos-system-webview.md).
 
 ## Failure and recovery
 

@@ -714,3 +714,6 @@ mod tests {
         assert!(NavigationRequest::new("   ").is_err());
     }
 }
+
+/// Explicit owned site-data transfer contracts and backend completion support.
+pub mod site_data;

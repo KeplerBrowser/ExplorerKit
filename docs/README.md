@@ -37,6 +37,7 @@ New here? Read [Get started](getting-started.md), then
 | [What works where](reference/capabilities.md) | Every capability on every platform |
 | [Crates and packages](reference/crates.md) | What each crate does and what may depend on what |
 | [macOS system web view](reference/macos-system-webview.md) | System WebKit views and their JavaScript evaluation rules |
+| [Explicit site-data transfer](reference/site-data.md) | Capture selected WebKit data and initialize a Servo destination |
 | [macOS WebKit automation](reference/macos-webkit-automation.md) | Opt-in native WebDriver connection, view selection, creation and dialogs |
 | [Testing and validation](reference/testing.md) | The checks for each area, from quick to manual |
 | [Dependencies and the Servo version](reference/dependencies.md) | The Servo pin, lockfiles, patches, and updates |

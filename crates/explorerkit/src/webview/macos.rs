@@ -15,6 +15,10 @@ use std::rc::Weak;
 
 #[cfg(feature = "macos-webkit")]
 use dpi::{PhysicalPosition, PhysicalSize};
+use explorerkit_embedder::site_data::{
+    SiteDataError, SiteDataErrorKind, SiteDataOperation, SiteDataScope, SiteDataSelection,
+    SiteDataSnapshot, SiteDataWriteSummary,
+};
 use explorerkit_embedder::{
     ConfigurableHost, ContextMenuAction, Host, HostError, HostEvent, HostInputEvent,
     NewWebViewDecision, NewWebViewRequest, PopupRequestPolicy, SessionHandle, WebViewCommand,
@@ -56,6 +60,8 @@ mod javascript;
 mod native_callbacks;
 #[cfg(feature = "macos-webkit")]
 mod observation;
+#[cfg(feature = "macos-webkit")]
+mod site_data;
 
 #[cfg(feature = "macos-webkit-automation")]
 pub mod automation;
@@ -624,6 +630,7 @@ struct SystemWebViewState {
     viewport: Option<SurfaceViewport>,
     last_url: Option<String>,
     last_navigation_state: Option<(bool, bool)>,
+    capture: Option<site_data::Capture>,
 }
 
 #[cfg(feature = "macos-webkit")]
@@ -654,6 +661,7 @@ impl SystemWebViewState {
             viewport: None,
             last_url: None,
             last_navigation_state: None,
+            capture: None,
         }
     }
 }
@@ -1243,6 +1251,90 @@ impl<S> Host for MacOsViewHost<S>
 where
     S: AppKitViewDelegate + for<'a> SurfaceDelegate<Frame<'a> = SurfaceFrame<'a>>,
 {
+    fn site_data_scope(&mut self, view: WebViewHandle) -> Result<SiteDataScope, SiteDataError> {
+        self.sync_views();
+        match self.views.get(&view) {
+            #[cfg(feature = "servo")]
+            Some(MacOsView::Servo) => self.servo.site_data_scope(view),
+            #[cfg(feature = "macos-webkit")]
+            Some(MacOsView::System(_)) if configuration::named_stores_available() => {
+                Ok(SiteDataScope::HostStore)
+            }
+            #[cfg(feature = "macos-webkit")]
+            Some(MacOsView::System(_)) => {
+                Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+            }
+            None => Err(SiteDataError::admission(SiteDataErrorKind::UnknownView)),
+        }
+    }
+
+    fn capture_site_data(
+        &mut self,
+        source: WebViewHandle,
+        selection: SiteDataSelection,
+    ) -> Result<SiteDataOperation<SiteDataSnapshot>, SiteDataError> {
+        #[cfg(feature = "macos-webkit")]
+        {
+            self.sync_views();
+            if !configuration::named_stores_available() {
+                return Err(SiteDataError::admission(SiteDataErrorKind::Unavailable));
+            }
+            let state = match self.views.get_mut(&source) {
+                Some(MacOsView::System(state)) => state,
+                #[cfg(feature = "servo")]
+                Some(MacOsView::Servo) => {
+                    return Err(SiteDataError::admission(SiteDataErrorKind::WrongEngine))
+                }
+                None => return Err(SiteDataError::admission(SiteDataErrorKind::UnknownView)),
+            };
+            if state.capture.is_some() {
+                return Err(SiteDataError::admission(SiteDataErrorKind::Busy));
+            }
+            let native = state
+                .webview
+                .as_ref()
+                .ok_or_else(|| SiteDataError::admission(SiteDataErrorKind::NotReady))?;
+            let store = configuration::selected_store(
+                &native.webview(),
+                self.webkit_data_store_identifier.0,
+            )
+            .ok_or_else(|| SiteDataError::admission(SiteDataErrorKind::Unavailable))?;
+            let wake = self.callbacks.borrow().wake.clone();
+            let (operation, capture) = site_data::Capture::new(store, selection, wake);
+            state.capture = capture;
+            Ok(operation)
+        }
+        #[cfg(not(feature = "macos-webkit"))]
+        {
+            let _ = (source, selection);
+            Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+        }
+    }
+
+    fn initialize_site_data(
+        &mut self,
+        destination: WebViewHandle,
+        snapshot: SiteDataSnapshot,
+    ) -> Result<SiteDataOperation<SiteDataWriteSummary>, SiteDataError> {
+        #[cfg(feature = "servo")]
+        {
+            self.sync_views();
+            match self.views.get(&destination) {
+                Some(MacOsView::Servo) => self.servo.initialize_site_data(destination, snapshot),
+                #[cfg(feature = "macos-webkit")]
+                Some(MacOsView::System(_)) => {
+                    Err(SiteDataError::admission(SiteDataErrorKind::WrongEngine))
+                }
+                None => Err(SiteDataError::admission(SiteDataErrorKind::UnknownView)),
+            }
+        }
+        #[cfg(not(feature = "servo"))]
+        {
+            let _ = (destination, snapshot);
+            Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+        }
+    }
+
     fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
         #[cfg(feature = "macos-webkit")]
         {
@@ -2309,8 +2401,7 @@ fn build_system_webview(
         // Preserve Wry's selected named data-store behavior when supplying the
         // first configuration ourselves to set eligibility before allocation.
         let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
-        let store_class = objc2::runtime::AnyClass::get(c"WKWebsiteDataStore").unwrap();
-        if store_class.responds_to(sel!(dataStoreForIdentifier:)) {
+        if configuration::named_stores_available() {
             let identifier = objc2_foundation::NSUUID::from_bytes(data_store_identifier.0);
             unsafe {
                 configuration.setWebsiteDataStore(
@@ -2499,6 +2590,9 @@ fn collect_system_updates(
         .map(|state| (state.observed_url.clone(), state.observed_navigation_state))
         .unwrap_or_default();
     let state = system_state_mut(views, webview)?;
+    if state.capture.as_mut().is_some_and(site_data::Capture::pump) {
+        state.capture.take();
+    }
     // Diff the latest native observation at drain time, preserving burst coalescing
     // and queued-result order without state or history reads from WebKit.
     if let Some(url) = url {

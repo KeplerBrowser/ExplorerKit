@@ -11,6 +11,9 @@ use servo::{
 };
 use url::Url;
 
+#[cfg(target_os = "macos")]
+mod site_data;
+
 use crate::{
     ContextMenuAction, HostEvent, HostInputEvent, HostSurface, ImeCompositionState,
     KeyboardInputEvent, KeyboardInputKey, KeyboardInputState, KeyboardKey, KeyboardNamedKey,
@@ -32,6 +35,8 @@ pub struct ServoWebViewInit {
 
 pub struct ServoWebView {
     adapter: ServoWebViewAdapter,
+    #[cfg(target_os = "macos")]
+    site_data_gate: site_data::NavigationGate,
 }
 
 impl ServoWebView {
@@ -80,6 +85,8 @@ impl ServoWebView {
             .clipboard_delegate(clipboard_delegate)
             .delegate(delegate)
             .hidpi_scale_factor(hidpi_scale_factor(density));
+        #[cfg(target_os = "macos")]
+        let site_data_gate = site_data::NavigationGate::new(initial_url.is_some());
         let builder = if let Some(initial_url) = initial_url {
             builder.url(initial_url)
         } else {
@@ -89,7 +96,11 @@ impl ServoWebView {
         let webview = builder.build();
         adapter.register_root_webview(&webview);
 
-        Ok(Self { adapter })
+        Ok(Self {
+            adapter,
+            #[cfg(target_os = "macos")]
+            site_data_gate,
+        })
     }
 
     pub fn set_hidpi_scale_factor(&mut self, density: f32) {
@@ -124,7 +135,11 @@ impl ServoWebView {
     }
 
     pub(crate) fn from_adapter(adapter: ServoWebViewAdapter) -> Self {
-        Self { adapter }
+        Self {
+            adapter,
+            #[cfg(target_os = "macos")]
+            site_data_gate: site_data::NavigationGate::new(true),
+        }
     }
 
     /// Installs prepared native child creation before this view's first native activity.
@@ -300,22 +315,34 @@ impl ServoWebView {
 
     pub fn load_url_request(&mut self, request: NavigationRequest) -> Result<(), String> {
         let parsed_url = Url::parse(&request.url).map_err(|error| error.to_string())?;
-        self.adapter.native_webview()?.load(parsed_url);
+        let webview = self.adapter.native_webview()?;
+        #[cfg(target_os = "macos")]
+        self.site_data_gate.accept_navigation()?;
+        webview.load(parsed_url);
         Ok(())
     }
 
     pub fn reload(&mut self) -> Result<(), String> {
-        self.adapter.native_webview()?.reload();
+        let webview = self.adapter.native_webview()?;
+        #[cfg(target_os = "macos")]
+        self.site_data_gate.accept_navigation()?;
+        webview.reload();
         Ok(())
     }
 
     pub fn go_back(&mut self) -> Result<(), String> {
-        self.adapter.native_webview()?.go_back(1);
+        let webview = self.adapter.native_webview()?;
+        #[cfg(target_os = "macos")]
+        self.site_data_gate.accept_navigation()?;
+        webview.go_back(1);
         Ok(())
     }
 
     pub fn go_forward(&mut self) -> Result<(), String> {
-        self.adapter.native_webview()?.go_forward(1);
+        let webview = self.adapter.native_webview()?;
+        #[cfg(target_os = "macos")]
+        self.site_data_gate.accept_navigation()?;
+        webview.go_forward(1);
         Ok(())
     }
 
@@ -330,7 +357,12 @@ impl ServoWebView {
     }
 
     pub fn evaluate_javascript(&mut self, evaluation_id: &str, script: &str) -> Result<(), String> {
-        self.adapter.evaluate_javascript(evaluation_id, script)
+        #[cfg(target_os = "macos")]
+        self.site_data_gate.check_navigation()?;
+        self.adapter.evaluate_javascript(evaluation_id, script)?;
+        #[cfg(target_os = "macos")]
+        self.site_data_gate.accept_navigation()?;
+        Ok(())
     }
 
     pub fn dispatch_touch_event(
@@ -667,6 +699,13 @@ impl ServoWebView {
 
 impl Drop for ServoWebView {
     fn drop(&mut self) {
+        #[cfg(target_os = "macos")]
+        if self.site_data_gate.is_initializing() {
+            self.adapter
+                .runtime()
+                .lease
+                .close_site_data(&self.site_data_gate);
+        }
         self.adapter.close();
     }
 }
@@ -764,6 +803,8 @@ impl ServoRuntime {
     /// Spins the shared engine; callbacks may target any of its views.
     pub fn perform_updates(&self) -> Result<(), String> {
         self.lease.servo().spin_event_loop();
+        #[cfg(target_os = "macos")]
+        self.lease.pump_site_data();
         let errors = self.lease.errors.borrow_mut().drain(..).collect::<Vec<_>>();
         if errors.is_empty() {
             Ok(())
@@ -879,6 +920,8 @@ impl ProcessServoRuntime {
             servo: servo.clone(),
             waker: waker.clone(),
             errors: errors.clone(),
+            #[cfg(target_os = "macos")]
+            site_data: RefCell::default(),
         };
         Ok((
             Self {
@@ -911,6 +954,8 @@ impl ProcessServoRuntime {
             servo: self.servo.clone(),
             waker: self.waker.clone(),
             errors: self.errors.clone(),
+            #[cfg(target_os = "macos")]
+            site_data: RefCell::default(),
         })
     }
 }
@@ -919,6 +964,8 @@ struct ProcessServoRuntimeLease {
     servo: Servo,
     waker: RoutedEventLoopWaker,
     errors: Rc<RefCell<Vec<String>>>,
+    #[cfg(target_os = "macos")]
+    site_data: RefCell<Option<site_data::Initialization>>,
 }
 
 impl ProcessServoRuntimeLease {

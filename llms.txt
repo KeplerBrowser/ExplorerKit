@@ -28,6 +28,7 @@ Paths are relative to the repository root. Agents working in this repository mus
 - [What works where](docs/reference/capabilities.md): Single source of truth for capability support on Android, iOS, and native Rust
 - [Crates and packages](docs/reference/crates.md): Each crate's purpose, forbidden contents, and dependency rules
 - [macOS system web view](docs/reference/macos-system-webview.md): MacOsViewHost and the system JavaScript evaluation contract
+- [Explicit site-data transfer](docs/reference/site-data.md): Capture selected WebKit cookies and localStorage and initialize a Servo destination
 - [macOS WebKit automation](docs/reference/macos-webkit-automation.md): Opt-in native WebDriver transport, view selection, creation ownership, dialogs and teardown
 - [Testing and validation](docs/reference/testing.md): Quick checks, Servo-backed checks, and manual checks per platform
 - [Dependencies and the Servo version](docs/reference/dependencies.md): Servo 0.6.0 pin, Cargo roots, patches, update steps, upstream submodule

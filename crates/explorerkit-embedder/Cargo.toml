@@ -7,6 +7,7 @@ publish = false
 [features]
 default = []
 servo = [
+    "dep:cookie",
     "dep:dpi",
     "dep:euclid",
     "dep:rustls",
@@ -31,6 +32,9 @@ rustls = { workspace = true, optional = true, features = ["ring"] }
 servo = { workspace = true, optional = true }
 servo-allocator = { workspace = true, optional = true }
 servo-default-resources = { workspace = true, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+cookie = { version = "=0.18.1", optional = true }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 dpi = { workspace = true, optional = true }
