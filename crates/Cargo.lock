@@ -1922,6 +1922,7 @@ dependencies = [
 name = "explorerkit-embedder"
 version = "0.1.0"
 dependencies = [
+ "cookie 0.18.1",
  "dpi",
  "euclid",
  "explorerkit-host",

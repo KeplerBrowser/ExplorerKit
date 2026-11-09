@@ -109,8 +109,9 @@ Servo-only; these choices apply to the native Rust facade.
 - **Storage.** System views use a WebKit data store named by your
   `WebKitDataStoreIdentifier`. Use the same identifier to keep cookies, local
   storage, and IndexedDB across launches; use a different one to isolate
-  them. Servo and WebKit never share storage, logins, autofill, passkeys, or
-  credentials.
+  them. Servo and WebKit use separate stores. Apps can use
+  [explicit site-data transfer](site-data.md) for selected cookies and
+  localStorage.
 - **Detach and reattach.** WRY is parented to an ExplorerKit-owned container
   view. Detaching removes the container from your view but keeps the browser
   alive. Reattaching can move the same container under a different live

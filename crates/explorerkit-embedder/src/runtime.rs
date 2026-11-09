@@ -8,7 +8,13 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::error::Error;
 use std::fmt;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+
+use crate::site_data::{
+    SiteDataError, SiteDataErrorKind, SiteDataOperation, SiteDataScope, SiteDataSelection,
+    SiteDataSnapshot, SiteDataWriteSummary,
+};
 
 use crate::{
     ContextMenuAction, HostEvent, HostInputEvent, LoadStatusKind, NavigationError,
@@ -26,7 +32,7 @@ impl SessionHandle {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct WebViewHandle(u64);
+pub struct WebViewHandle(u64, u64);
 
 impl WebViewHandle {
     pub fn raw(self) -> u64 {
@@ -266,6 +272,29 @@ impl From<HostError> for RuntimeError {
 }
 
 pub trait Host {
+    /// Reports the native store's sharing scope without creating a store.
+    fn site_data_scope(&mut self, _view: WebViewHandle) -> Result<SiteDataScope, SiteDataError> {
+        Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+    }
+
+    /// Captures explicitly selected native site data. Unsupported hosts reject admission.
+    fn capture_site_data(
+        &mut self,
+        _source: WebViewHandle,
+        _selection: SiteDataSelection,
+    ) -> Result<SiteDataOperation<SiteDataSnapshot>, SiteDataError> {
+        Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+    }
+
+    /// Merges owned records into the destination store before caller navigation.
+    fn initialize_site_data(
+        &mut self,
+        _destination: WebViewHandle,
+        _snapshot: SiteDataSnapshot,
+    ) -> Result<SiteDataOperation<SiteDataWriteSummary>, SiteDataError> {
+        Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+    }
+
     /// Installs the Runtime's weak registrar once, before root creation.
     ///
     /// Ignoring this integration hook does not enable child creation.
@@ -653,6 +682,7 @@ impl WebViewState {
 #[derive(Debug, Default)]
 struct RuntimeRegistry {
     shutting_down: bool,
+    identity: u64,
     next_session_id: u64,
     next_webview_id: u64,
     sessions: HashSet<SessionHandle>,
@@ -701,7 +731,7 @@ impl RuntimeRegistry {
             .next_webview_id
             .checked_add(1)
             .ok_or_else(|| HostError::new("webview handle capacity exhausted"))?;
-        Ok(WebViewHandle(self.next_webview_id))
+        Ok(WebViewHandle(self.next_webview_id, self.identity))
     }
 
     fn live_view(&self, webview: WebViewHandle) -> Option<&RegisteredWebView> {
@@ -966,8 +996,50 @@ pub struct Runtime<H> {
 }
 
 impl<H: Host> Runtime<H> {
+    /// Reports the sharing scope of the store behind this live Runtime-owned view.
+    pub fn site_data_scope(&mut self, view: WebViewHandle) -> Result<SiteDataScope, SiteDataError> {
+        self.webview_state(view, |_| ())
+            .map_err(|_| SiteDataError::admission(SiteDataErrorKind::UnknownView))?;
+        self.host.site_data_scope(view)
+    }
+
+    /// Starts an explicit native source capture. Pump the existing event loop and poll its result.
+    /// Cookie opt-in reads the selected store's entire collection; callers may filter owned records.
+    pub fn capture_site_data(
+        &mut self,
+        source: WebViewHandle,
+        mut selection: SiteDataSelection,
+    ) -> Result<SiteDataOperation<SiteDataSnapshot>, SiteDataError> {
+        self.webview_state(source, |_| ())
+            .map_err(|_| SiteDataError::admission(SiteDataErrorKind::UnknownView))?;
+        let mut seen = HashSet::new();
+        selection
+            .local_storage_origins
+            .retain(|origin| seen.insert(origin.clone()));
+        self.host.capture_site_data(source, selection)
+    }
+
+    /// Starts explicit initialization before target navigation. This merges into the native store;
+    /// it does not make a new view an isolated profile. Wait for success before loading the target.
+    pub fn initialize_site_data(
+        &mut self,
+        destination: WebViewHandle,
+        snapshot: SiteDataSnapshot,
+    ) -> Result<SiteDataOperation<SiteDataWriteSummary>, SiteDataError> {
+        self.webview_state(destination, |_| ())
+            .map_err(|_| SiteDataError::admission(SiteDataErrorKind::UnknownView))?;
+        self.host.initialize_site_data(destination, snapshot)
+    }
+
     pub fn new(mut host: H) -> Self {
-        let registry = Arc::new(Mutex::new(RuntimeRegistry::default()));
+        static NEXT_RUNTIME: AtomicU64 = AtomicU64::new(1);
+        let identity = NEXT_RUNTIME
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("Runtime identity capacity exhausted");
+        let registry = Arc::new(Mutex::new(RuntimeRegistry {
+            identity,
+            ..RuntimeRegistry::default()
+        }));
         host.set_webview_registrar(WebViewRegistrar {
             registry: Arc::downgrade(&registry),
         });
@@ -3397,7 +3469,7 @@ mod tests {
         ));
         assert_eq!(runtime.host().calls().len(), calls_after_create);
 
-        let unknown_webview = WebViewHandle(42);
+        let unknown_webview = WebViewHandle(42, 0);
         assert_eq!(
             runtime.load_url(unknown_webview, "example.com"),
             Err(RuntimeError::UnknownWebView(unknown_webview))
@@ -4018,5 +4090,106 @@ mod tests {
             &runtime.host().calls()[calls_after_first_drain..],
             &[HostCall::PerformUpdates { webview }]
         );
+    }
+}
+
+#[cfg(test)]
+mod site_data_tests {
+    use super::*;
+    use crate::site_data::{SiteDataMutation, SiteDataOrigin, SiteDataStage};
+    use std::cell::Cell;
+
+    #[test]
+    fn a_foreign_view_with_the_same_raw_id_cannot_select_a_local_store() {
+        let mut first = Runtime::new(Probe(Rc::new(Cell::new(0))));
+        let session = first.create_session();
+        let foreign = first.create_webview(session).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let mut second = Runtime::new(Probe(calls.clone()));
+        let session = second.create_session();
+        let local = second.create_webview(session).unwrap();
+        assert_eq!(local.raw(), foreign.raw());
+        assert!(matches!(
+            second.capture_site_data(foreign, SiteDataSelection::default()),
+            Err(SiteDataError {
+                kind: SiteDataErrorKind::UnknownView,
+                ..
+            })
+        ));
+        assert_eq!(calls.get(), 0);
+    }
+
+    struct Probe(Rc<Cell<usize>>);
+    impl Host for Probe {
+        fn create_webview(&mut self, _: SessionHandle, _: WebViewHandle) -> Result<(), HostError> {
+            Ok(())
+        }
+        fn destroy_webview(&mut self, _: WebViewHandle) -> Result<(), HostError> {
+            Ok(())
+        }
+        fn observe_webview_events(
+            &mut self,
+            _: WebViewHandle,
+            _: &[HostEvent],
+        ) -> Result<(), HostError> {
+            Ok(())
+        }
+        fn capture_site_data(
+            &mut self,
+            _: WebViewHandle,
+            selection: SiteDataSelection,
+        ) -> Result<SiteDataOperation<SiteDataSnapshot>, SiteDataError> {
+            self.0.set(selection.local_storage_origins.len());
+            Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+        }
+    }
+    #[test]
+    fn capture_deduplicates_origins_and_closed_handles_never_reach_host() {
+        let calls = Rc::new(Cell::new(0));
+        let mut runtime = Runtime::new(Probe(calls.clone()));
+        let session = runtime.create_session();
+        let view = runtime.create_webview(session).unwrap();
+        let capture = |runtime: &mut Runtime<Probe>| {
+            runtime.capture_site_data(
+                view,
+                SiteDataSelection {
+                    include_cookies: false,
+                    local_storage_origins: vec![
+                        SiteDataOrigin::parse("https://EXAMPLE.com:443/a").unwrap(),
+                        SiteDataOrigin::parse("https://example.com/b").unwrap(),
+                    ],
+                },
+            )
+        };
+        assert!(matches!(
+            capture(&mut runtime),
+            Err(SiteDataError {
+                kind: SiteDataErrorKind::Unavailable,
+                ..
+            })
+        ));
+        assert_eq!(calls.get(), 1);
+        runtime.destroy_webview(view).unwrap();
+        calls.set(0);
+        assert!(matches!(
+            capture(&mut runtime),
+            Err(SiteDataError {
+                kind: SiteDataErrorKind::UnknownView,
+                stage: SiteDataStage::Admission,
+                mutation: SiteDataMutation::Unchanged
+            })
+        ));
+        assert_eq!(calls.get(), 0);
+        assert_eq!(
+            runtime.site_data_scope(view),
+            Err(SiteDataError::admission(SiteDataErrorKind::UnknownView))
+        );
+        assert!(matches!(
+            runtime.initialize_site_data(view, SiteDataSnapshot::default()),
+            Err(SiteDataError {
+                kind: SiteDataErrorKind::UnknownView,
+                ..
+            })
+        ));
     }
 }

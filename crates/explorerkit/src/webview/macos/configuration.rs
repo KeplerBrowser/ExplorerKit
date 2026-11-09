@@ -1,6 +1,32 @@
-use objc2::{rc::Retained, MainThreadOnly};
+use objc2::{rc::Retained, runtime::AnyClass, sel, MainThreadOnly};
 #[allow(deprecated)]
-use objc2_web_kit::{WKProcessPool, WKWebViewConfiguration, WKWebsiteDataStore};
+use objc2_web_kit::{WKProcessPool, WKWebView, WKWebViewConfiguration, WKWebsiteDataStore};
+
+#[allow(
+    dead_code,
+    reason = "The standalone configuration test only uses the context type."
+)]
+pub(super) fn named_stores_available() -> bool {
+    AnyClass::get(c"WKWebsiteDataStore")
+        .is_some_and(|class| class.class_method(sel!(dataStoreForIdentifier:)).is_some())
+}
+
+#[allow(
+    dead_code,
+    reason = "The standalone configuration test only uses the context type."
+)]
+pub(super) fn selected_store(
+    view: &WKWebView,
+    expected: [u8; 16],
+) -> Option<Retained<WKWebsiteDataStore>> {
+    // SAFETY: The live view and its configuration belong to AppKit's thread.
+    // The caller has checked that named stores are available on this system.
+    unsafe {
+        let store = view.configuration().websiteDataStore();
+        let identifier = store.identifier()?;
+        (identifier.as_bytes() == expected).then_some(store)
+    }
+}
 
 // WKProcessPool still owns WebKit's font-map cache on the supported native path.
 #[allow(deprecated)]

@@ -43,12 +43,24 @@ native Rust, but its React Native wiring is incomplete and not supported.
 | Several views under one runtime | ➖ | ➖ | ✅ |
 | Offscreen rendering with GPU frame export | ➖ | ➖ | ✅ macOS |
 | System WebKit per view | ➖ | n/a | ✅ macOS |
+| Explicit site-data transfer | ➖ | ➖ | ✅ [macOS Rust](#site-data-transfer) |
 | Persistent profile directory | ➖ | ➖ | ✅ |
 
 "Events only" means a native Rust app is told about the prompt, but the
 `Runtime` has no method to answer it yet.
 
 ## Details by capability
+
+### Site-data transfer
+
+| Operation | Native macOS Rust host | Cargo features |
+| --- | --- | --- |
+| Capture from a named WebKit store on macOS 14 or later | `MacOsViewHost` with an attached system view | `macos-webkit` or `macos-system-webview` |
+| Initialize the process Servo store | `SurfaceHost` or `MacOsViewHost` with an attached blank Servo view | `servo` or `macos-system-webview` |
+
+The operations cover cookies and selected HTTP(S) localStorage origins. See
+[explicit site-data transfer](site-data.md) for sharing, sequencing, and
+metadata limits.
 
 ### Native automation
 

@@ -21,6 +21,11 @@ use servo::{
 };
 
 #[cfg(target_os = "macos")]
+use crate::site_data::{
+    SiteDataError, SiteDataErrorKind, SiteDataOperation, SiteDataScope, SiteDataSnapshot,
+    SiteDataWriteSummary,
+};
+#[cfg(target_os = "macos")]
 use crate::surface::macos::ExportableRenderingContext;
 
 #[derive(Debug, Clone, Copy)]
@@ -177,6 +182,19 @@ trait ServoWebViewFactory {
 }
 
 trait ServoWebViewDriver {
+    #[cfg(target_os = "macos")]
+    fn initialize_site_data(
+        &self,
+        _snapshot: SiteDataSnapshot,
+    ) -> Result<SiteDataOperation<SiteDataWriteSummary>, SiteDataError> {
+        Err(SiteDataError::admission(SiteDataErrorKind::Unavailable))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_site_data_navigation(&self) -> Result<(), HostError> {
+        Ok(())
+    }
+
     fn bind_runtime(
         &mut self,
         _binding: SurfaceRuntimeBinding,
@@ -705,6 +723,33 @@ impl<S: SurfaceHostServices> SurfaceHost<S> {
 }
 
 impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
+    #[cfg(target_os = "macos")]
+    fn site_data_scope(&mut self, view: WebViewHandle) -> Result<SiteDataScope, SiteDataError> {
+        self.sync_native_views();
+        if !self.created_webviews.contains_key(&view) {
+            return Err(SiteDataError::admission(SiteDataErrorKind::UnknownView));
+        }
+        Ok(SiteDataScope::ProcessStore)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn initialize_site_data(
+        &mut self,
+        destination: WebViewHandle,
+        snapshot: SiteDataSnapshot,
+    ) -> Result<SiteDataOperation<SiteDataWriteSummary>, SiteDataError> {
+        self.site_data_scope(destination)?;
+        if !self.attached_surfaces.contains_key(&destination)
+            || self.poisoned_webviews.contains(&destination)
+        {
+            return Err(SiteDataError::admission(SiteDataErrorKind::NotReady));
+        }
+        self.surface_webviews
+            .get(&destination)
+            .ok_or_else(|| SiteDataError::admission(SiteDataErrorKind::NotReady))?
+            .initialize_site_data(snapshot)
+    }
+
     fn set_webview_registrar(&mut self, registrar: WebViewRegistrar) {
         self.registrar = Some(registrar);
     }
@@ -1129,6 +1174,18 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
                 .get(&webview)
                 .is_some_and(|view| view.can_dispatch_unattached())
         {
+            #[cfg(target_os = "macos")]
+            if matches!(
+                command,
+                WebViewCommand::LoadUrl(_)
+                    | WebViewCommand::Reload
+                    | WebViewCommand::GoBack
+                    | WebViewCommand::GoForward
+            ) {
+                if let Some(view) = self.surface_webviews.get(&webview) {
+                    view.check_site_data_navigation()?;
+                }
+            }
             self.pending_commands
                 .entry(webview)
                 .or_default()
@@ -1206,6 +1263,10 @@ impl<S: SurfaceHostServices> Host for SurfaceHost<S> {
         script: &str,
     ) -> Result<Vec<HostEvent>, HostError> {
         self.ensure_created_webview(webview)?;
+        #[cfg(target_os = "macos")]
+        if let Some(view) = self.surface_webviews.get(&webview) {
+            view.check_site_data_navigation()?;
+        }
         if !self.attached_surfaces.contains_key(&webview)
             && !self
                 .surface_webviews
@@ -1634,6 +1695,21 @@ impl SurfaceWebView {
 }
 
 impl ServoWebViewDriver for SurfaceWebView {
+    #[cfg(target_os = "macos")]
+    fn initialize_site_data(
+        &self,
+        snapshot: SiteDataSnapshot,
+    ) -> Result<SiteDataOperation<SiteDataWriteSummary>, SiteDataError> {
+        self.webview.initialize_site_data(snapshot)
+    }
+
+    #[cfg(target_os = "macos")]
+    fn check_site_data_navigation(&self) -> Result<(), HostError> {
+        self.webview
+            .check_site_data_navigation()
+            .map_err(HostError::new)
+    }
+
     fn bind_runtime(
         &mut self,
         binding: SurfaceRuntimeBinding,

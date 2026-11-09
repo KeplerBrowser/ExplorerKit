@@ -23,6 +23,7 @@ pub mod events;
 pub mod host;
 pub mod input;
 pub mod runtime;
+pub mod site_data;
 pub mod surface;
 pub mod webview;
 

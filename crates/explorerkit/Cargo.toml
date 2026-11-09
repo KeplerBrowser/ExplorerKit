@@ -16,6 +16,12 @@ path = "tests/macos_webkit_automation.rs"
 required-features = ["macos-webkit-automation"]
 harness = false
 
+[[test]]
+name = "macos-site-data"
+path = "tests/macos_site_data.rs"
+required-features = ["macos-webkit"]
+harness = false
+
 [[example]]
 name = "multiple-native-views"
 path = "examples/multiple-native-views/main.rs"
@@ -96,8 +102,8 @@ mime = { version = "0.3.17", optional = true }
 objc2-core-foundation = { workspace = true, optional = true }
 objc2-app-kit = { workspace = true, features = ["NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSGraphics", "NSColor"], optional = true }
 objc2 = { workspace = true, optional = true }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDictionary", "NSError", "NSJSONSerialization", "NSNull", "NSData", "NSString", "NSValue", "NSURL", "NSURLRequest"], optional = true }
-objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKContentWorld", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKUIDelegate", "WKNavigationAction", "WKWindowFeatures", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDate", "NSDictionary", "NSError", "NSHTTPCookie", "NSJSONSerialization", "NSNull", "NSData", "NSString", "NSValue", "NSURL", "NSURLRequest"], optional = true }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKContentWorld", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKHTTPCookieStore", "WKUIDelegate", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKWindowFeatures", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
 serde_json = { version = "1", optional = true }
 surfman = { workspace = true, optional = true }
 wry = { workspace = true, optional = true }
