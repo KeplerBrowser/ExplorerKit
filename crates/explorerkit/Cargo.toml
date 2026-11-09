@@ -52,12 +52,16 @@ macos-webkit = [
     "dep:dpi",
     "dep:raw-window-handle",
     "dep:block2",
+    "dep:base64",
     "dep:mime",
     "dep:objc2",
     "dep:objc2-app-kit",
     "dep:objc2-foundation",
     "dep:objc2-web-kit",
+    "dep:rusqlite",
     "dep:serde_json",
+    "dep:sha2",
+    "dep:url",
     "dep:wry",
 ]
 servo = [
@@ -89,6 +93,7 @@ servo = { workspace = true, optional = true }
 webrender_api = { workspace = true, optional = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+base64 = { version = "=0.22.1", optional = true }
 block2 = { version = "0.6.2", optional = true }
 cocoa = { workspace = true, optional = true }
 core-foundation = { workspace = true, optional = true }
@@ -102,8 +107,11 @@ mime = { version = "0.3.17", optional = true }
 objc2-core-foundation = { workspace = true, optional = true }
 objc2-app-kit = { workspace = true, features = ["NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSGraphics", "NSColor"], optional = true }
 objc2 = { workspace = true, optional = true }
-objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSDate", "NSDictionary", "NSError", "NSHTTPCookie", "NSJSONSerialization", "NSNull", "NSData", "NSString", "NSValue", "NSURL", "NSURLRequest"], optional = true }
-objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKContentWorld", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKHTTPCookieStore", "WKUIDelegate", "WKNavigation", "WKNavigationDelegate", "WKNavigationAction", "WKWindowFeatures", "WKWebViewConfiguration", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDate", "NSDictionary", "NSError", "NSFileManager", "NSHTTPCookie", "NSJSONSerialization", "NSNull", "NSData", "NSPathUtilities", "NSProcessInfo", "NSSet", "NSString", "NSUserDefaults", "NSValue", "NSURL", "NSURLRequest"], optional = true }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKContentWorld", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKHTTPCookieStore", "WKUIDelegate", "WKNavigationAction", "WKWindowFeatures", "WKWebViewConfiguration", "WKWebsiteDataRecord", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
+rusqlite = { version = "=0.38.0", optional = true }
 serde_json = { version = "1", optional = true }
+sha2 = { version = "=0.10.9", optional = true }
 surfman = { workspace = true, optional = true }
+url = { version = "2.5", optional = true }
 wry = { workspace = true, optional = true }

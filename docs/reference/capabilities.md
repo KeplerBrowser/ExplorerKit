@@ -58,7 +58,8 @@ native Rust, but its React Native wiring is incomplete and not supported.
 | Capture from a named WebKit store on macOS 14 or later | `MacOsViewHost` with an attached system view | `macos-webkit` or `macos-system-webview` |
 | Initialize the process Servo store | `SurfaceHost` or `MacOsViewHost` with an attached blank Servo view | `servo` or `macos-system-webview` |
 
-The operations cover cookies and selected HTTP(S) localStorage origins. See
+WebKit capture covers native cookies and committed persistent localStorage
+for selected HTTP(S) first-party origins in recognized named stores. See
 [explicit site-data transfer](site-data.md) for sharing, sequencing, and
 metadata limits.
 

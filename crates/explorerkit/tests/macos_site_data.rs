@@ -189,6 +189,31 @@ mod native {
             let operation = self.runtime.capture_site_data(view, selection).unwrap();
             self.complete(operation).unwrap()
         }
+
+        fn committed(
+            &mut self,
+            view: WebViewHandle,
+            origin: &SiteDataOrigin,
+            expected: &[(&str, &str)],
+        ) {
+            wait("committed WebKit rows", || {
+                let snapshot = self.capture(view, storage_selection(origin.clone()));
+                let mut rows = snapshot.local_storage[0]
+                    .entries
+                    .iter()
+                    .map(|(key, value)| (key.as_str(), value.as_str()))
+                    .collect::<Vec<_>>();
+                rows.sort_unstable();
+                (rows == expected).then_some(())
+            });
+        }
+    }
+
+    fn storage_selection(origin: SiteDataOrigin) -> SiteDataSelection {
+        SiteDataSelection {
+            include_cookies: false,
+            local_storage_origins: vec![origin],
+        }
     }
 
     fn wait<T>(label: &str, mut poll: impl FnMut() -> Option<T>) -> T {
@@ -223,8 +248,8 @@ mod native {
         });
     }
 
-    fn fixture_server() -> u16 {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    fn fixture_server(port: u16) -> u16 {
+        let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
         let port = listener.local_addr().unwrap().port();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
@@ -251,13 +276,14 @@ mod native {
                     "/account/source" => ("localStorage.setItem('token','source'); localStorage.setItem('getItem','shadow');",
                         "Set-Cookie: auth=source; Path=/account; HttpOnly; Max-Age=3600; SameSite=Lax\r\n"),
                     "/second-source" => ("localStorage.setItem('token','second');", ""),
+                    "/replace-source" => (r#"localStorage.setItem('token','雪🧪\u0000'); localStorage.setItem('',''); localStorage.removeItem('getItem');"#, ""),
                     "/retain" => ("localStorage.setItem('retain','destination');", ""),
                     "/change" => ("localStorage.setItem('token','changed');", ""),
                     _ => ("", ""),
                 };
                 let cookie = serde_json::to_string(&cookie).unwrap();
                 let body = format!(
-                    "<!doctype html><script>{seed}document.title = 'observed:' + JSON.stringify([{cookie}, document.cookie, localStorage.getItem('token') ?? '', localStorage.getItem('retain') ?? '', localStorage.getItem('getItem') ?? '']);</script>"
+                    "<!doctype html><meta charset=utf-8><script>{seed}document.title = 'observed:' + JSON.stringify([{cookie}, document.cookie, localStorage.getItem('token') ?? '', localStorage.getItem('retain') ?? '', localStorage.getItem('getItem') ?? '']);</script>"
                 );
                 let _ = write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nConnection: close\r\n{headers}Content-Length: {}\r\n\r\n{body}", body.len());
             }
@@ -270,8 +296,8 @@ mod native {
     }
 
     fn exercise(first: &NSUUID, other: &NSUUID, profile: &Path) {
-        let first_port = fixture_server();
-        let second_port = fixture_server();
+        let first_port = fixture_server(0);
+        let second_port = fixture_server(0);
         let main = format!("http://127.0.0.1:{first_port}");
         let second = format!("http://127.0.0.1:{second_port}");
         let missing = format!("http://localhost:{second_port}");
@@ -320,11 +346,22 @@ mod native {
                 app.navigate(source, &format!("{second}/second-source"))[2],
                 "second"
             );
+            app.committed(
+                source,
+                &origin(&main),
+                &[("getItem", "shadow"), ("token", "source")],
+            );
+            app.committed(source, &origin(&second), &[("token", "second")]);
             let untouched = app.urls[&source].clone();
 
             let mut isolated = App::new(window, other, profile);
             let empty = isolated.create(MacOsWebViewKind::SystemWebView);
             isolated.attach(empty);
+            assert!(isolated
+                .capture(empty, storage_selection(origin(&main)))
+                .local_storage[0]
+                .entries
+                .is_empty());
             let isolated_snapshot = isolated.capture(empty, selection());
             assert!(isolated_snapshot.cookies.is_empty());
             assert!(isolated_snapshot
@@ -333,7 +370,7 @@ mod native {
                 .all(|entry| entry.entries.is_empty()));
             let operation = isolated
                 .runtime
-                .capture_site_data(empty, selection())
+                .capture_site_data(empty, storage_selection(origin(&main)))
                 .unwrap();
             isolated.runtime.destroy_webview(empty).unwrap();
             assert_eq!(
@@ -370,7 +407,10 @@ mod native {
             assert!(auth.host_only && auth.http_only && auth.expires_unix_seconds.is_some());
             assert_eq!(auth.same_site, Some(SiteDataSameSite::Lax));
 
-            let mut cancelled = app.runtime.capture_site_data(source, selection()).unwrap();
+            let mut cancelled = app
+                .runtime
+                .capture_site_data(source, storage_selection(origin(&main)))
+                .unwrap();
             cancelled.cancel();
             assert_eq!(
                 error_kind(app.complete(cancelled)),
@@ -399,6 +439,73 @@ mod native {
             );
             assert_eq!(retained.cookies[0].value, "source");
             assert_eq!(app.urls[&source], untouched);
+
+            let page = app.navigate(source, &format!("{main}/replace-source"));
+            assert_eq!(page[2], "雪🧪\0");
+            assert_eq!(page[4], "");
+            // WebKit controls the commit. A capture may see either commit at
+            // this boundary, but the final saved state must reflect the delete.
+            let mut rows = app
+                .capture(source, storage_selection(origin(&main)))
+                .local_storage
+                .remove(0)
+                .entries;
+            rows.sort();
+            assert!(
+                rows == [
+                    ("getItem".into(), "shadow".into()),
+                    ("token".into(), "source".into())
+                ] || rows == [("".into(), "".into()), ("token".into(), "雪🧪\0".into())]
+            );
+            app.committed(source, &origin(&main), &[("", ""), ("token", "雪🧪\0")]);
+            std::fs::write(profile.join("source-port"), first_port.to_string()).unwrap();
+            app.runtime.shutdown().unwrap();
+            window.close();
+            pool.drain();
+        }
+    }
+
+    fn reopen_saved(first: &NSUUID, profile: &Path) {
+        let port: u16 = std::fs::read_to_string(profile.join("source-port"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        let origin = format!("http://127.0.0.1:{port}");
+        let cold_servo = profile.join("cold-servo");
+        std::fs::create_dir(&cold_servo).unwrap();
+        unsafe {
+            let pool = NSAutoreleasePool::new(nil);
+            let window = NSWindow::alloc(nil).initWithContentRect_styleMask_backing_defer_(
+                NSRect::new(NSPoint::new(100., 100.), NSSize::new(320., 240.)),
+                NSWindowStyleMask::NSTitledWindowMask,
+                NSBackingStoreBuffered,
+                NO,
+            );
+            window.orderFront_(nil);
+            let mut app = App::new(window, first, &cold_servo);
+            let source = app.create_source();
+            app.attach(source);
+            let mut snapshot = app.capture(
+                source,
+                storage_selection(SiteDataOrigin::parse(&origin).unwrap()),
+            );
+            snapshot.local_storage[0].entries.sort();
+            assert_eq!(
+                snapshot.local_storage[0].entries,
+                [("".into(), "".into()), ("token".into(), "雪🧪\0".into())]
+            );
+            #[cfg(feature = "servo")]
+            {
+                let target = app.create(MacOsWebViewKind::Servo);
+                app.attach(target);
+                let operation = app.runtime.initialize_site_data(target, snapshot).unwrap();
+                assert_eq!(app.complete(operation).unwrap().local_storage_entries, 2);
+                assert_eq!(fixture_server(port), port);
+                assert_eq!(
+                    app.navigate(target, &format!("{origin}/account/observe")),
+                    ["", "", "雪🧪\0", "", ""]
+                );
+            }
             app.runtime.shutdown().unwrap();
             window.close();
             pool.drain();
@@ -628,6 +735,8 @@ mod native {
             let other = uuid(other);
             if mode == "--child" {
                 exercise(&first, &other, Path::new(profile));
+            } else if mode == "--saved" {
+                reopen_saved(&first, Path::new(profile));
             } else {
                 assert_eq!(mode, "--cleanup");
                 for uuid in [&first, &other] {
@@ -673,9 +782,14 @@ mod native {
                 .unwrap()
         };
         let exercise = run("--child");
+        let saved = exercise.success().then(|| run("--saved"));
         let cleanup = run("--cleanup");
         std::fs::remove_dir_all(profile).unwrap();
         assert!(exercise.success(), "native site-data acceptance failed");
+        assert!(
+            saved.is_some_and(|status| status.success()),
+            "cold saved-data acceptance failed"
+        );
         assert!(cleanup.success(), "native site-data fixture cleanup failed");
         println!(
             "AppKit site-data acceptance passed (Servo compiled: {})",

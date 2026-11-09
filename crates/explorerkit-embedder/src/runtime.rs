@@ -1005,6 +1005,7 @@ impl<H: Host> Runtime<H> {
 
     /// Starts an explicit native source capture. Pump the existing event loop and poll its result.
     /// Cookie opt-in reads the selected store's entire collection; callers may filter owned records.
+    /// On macOS WebKit, localStorage capture reads the last committed persistent values.
     pub fn capture_site_data(
         &mut self,
         source: WebViewHandle,
