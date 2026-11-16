@@ -34,7 +34,7 @@ use objc2::{msg_send, rc::Retained, sel, MainThreadMarker, MainThreadOnly, Messa
 #[cfg(feature = "macos-webkit")]
 use objc2_app_kit::{NSAutoresizingMaskOptions, NSView};
 #[cfg(feature = "macos-webkit")]
-use objc2_foundation::{NSObject, NSObjectProtocol};
+use objc2_foundation::{NSObject, NSObjectProtocol, NSProcessInfo};
 use raw_window_handle::HasWindowHandle;
 #[cfg(feature = "macos-webkit")]
 use raw_window_handle::{AppKitWindowHandle, HandleError, RawWindowHandle, WindowHandle};
@@ -71,7 +71,10 @@ use configuration::SystemWebViewContext;
 #[cfg(feature = "macos-webkit")]
 use native_callbacks::SystemUiDelegateRegistration;
 #[cfg(feature = "macos-webkit")]
-use objc2_web_kit::{WKNavigationAction, WKWebView, WKWebViewConfiguration, WKWindowFeatures};
+use objc2_web_kit::{
+    WKInactiveSchedulingPolicy, WKNavigationAction, WKWebView, WKWebViewConfiguration,
+    WKWindowFeatures,
+};
 
 #[cfg(feature = "macos-webkit")]
 use javascript::{evaluation_event, NativeEvaluationError};
@@ -110,6 +113,20 @@ pub fn compiled_engines() -> &'static [MacOsWebViewKind] {
     ]
 }
 
+/// How WebKit schedules tasks for an inactive system view on macOS 14 or later.
+///
+/// WebKit applies the policy when it considers the view inactive and outside
+/// a window. Loading, media playback, and capture can keep the view active.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WebKitInactiveSchedulingPolicy {
+    /// Selects WebKit's native `None` policy.
+    None,
+    /// Asks WebKit to throttle tasks while the view is inactive.
+    Throttle,
+    /// Asks WebKit to suspend tasks when the inactive view becomes eligible.
+    Suspend,
+}
+
 /// Create-time options for [`MacOsViewHost`].
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct MacOsWebViewOptions {
@@ -118,6 +135,8 @@ pub struct MacOsWebViewOptions {
     /// Opts this system view into the macOS native automation and prompt paths.
     /// Requires `macos-webkit-automation`; unsupported for Servo views.
     pub webkit_automation: bool,
+    /// Selects the native inactive policy. An unset option uses WebKit's default.
+    pub webkit_inactive_scheduling_policy: Option<WebKitInactiveSchedulingPolicy>,
 }
 
 impl MacOsWebViewOptions {
@@ -125,13 +144,24 @@ impl MacOsWebViewOptions {
     pub fn new(kind: MacOsWebViewKind) -> Self {
         Self {
             kind,
-            webkit_automation: false,
+            ..Self::default()
         }
     }
 
     /// Chooses native WebKit automation eligibility before native allocation.
     pub fn with_webkit_automation(mut self, enabled: bool) -> Self {
         self.webkit_automation = enabled;
+        self
+    }
+
+    /// Sets the policy before native allocation for a macOS 14+ system view.
+    ///
+    /// Native popups inherit the policy through WebKit's configuration.
+    pub fn with_webkit_inactive_scheduling_policy(
+        mut self,
+        policy: WebKitInactiveSchedulingPolicy,
+    ) -> Self {
+        self.webkit_inactive_scheduling_policy = Some(policy);
         self
     }
 }
@@ -617,6 +647,7 @@ enum MacOsView {
 #[cfg(feature = "macos-webkit")]
 struct SystemWebViewState {
     generation: u64,
+    inactive_scheduling_policy: Option<WebKitInactiveSchedulingPolicy>,
     ui_registration: Option<SystemUiDelegateRegistration>,
     #[cfg(test)]
     test_callback_depth: Cell<usize>,
@@ -648,6 +679,7 @@ impl SystemWebViewState {
     fn new(generation: u64) -> Self {
         Self {
             generation,
+            inactive_scheduling_policy: None,
             ui_registration: None,
             #[cfg(test)]
             test_callback_depth: Cell::new(0),
@@ -1201,6 +1233,13 @@ where
         webview: WebViewHandle,
         options: Self::WebViewOptions,
     ) -> Result<(), HostError> {
+        if options.webkit_inactive_scheduling_policy.is_some()
+            && options.kind == MacOsWebViewKind::Servo
+        {
+            return Err(HostError::new(
+                "WebKit inactive scheduling policy is unavailable for Servo views",
+            ));
+        }
         if options.webkit_automation {
             if options.kind != MacOsWebViewKind::SystemWebView {
                 return Err(HostError::new(
@@ -1221,6 +1260,16 @@ where
                 }
                 #[cfg(feature = "macos-webkit")]
                 {
+                    if options.webkit_inactive_scheduling_policy.is_some()
+                        && NSProcessInfo::processInfo()
+                            .operatingSystemVersion()
+                            .majorVersion
+                            < 14
+                    {
+                        return Err(HostError::new(
+                            "WebKit inactive scheduling policy requires macOS 14 or later",
+                        ));
+                    }
                     if self.views.contains_key(&webview) {
                         return Err(duplicate_webview(webview));
                     }
@@ -1232,10 +1281,10 @@ where
                         .initialize_view(&sink, options.webkit_automation);
                     #[cfg(not(feature = "macos-webkit-automation"))]
                     let _ = sink;
-                    self.views.insert(
-                        webview,
-                        MacOsView::System(Box::new(SystemWebViewState::new(generation))),
-                    );
+                    let mut state = SystemWebViewState::new(generation);
+                    state.inactive_scheduling_policy = options.webkit_inactive_scheduling_policy;
+                    self.views
+                        .insert(webview, MacOsView::System(Box::new(state)));
                     Ok(())
                 }
             }
@@ -2212,7 +2261,7 @@ fn attach_system_view<S>(
 where
     S: AppKitViewDelegate + for<'a> SurfaceDelegate<Frame<'a> = SurfaceFrame<'a>>,
 {
-    let (generation, pending_commands, has_native_view) = {
+    let (generation, pending_commands, has_native_view, inactive_scheduling_policy) = {
         let state = system_state_mut(&mut host.views, webview)?;
         if state.viewport.is_some() {
             return Err(HostError::new(format!(
@@ -2224,6 +2273,7 @@ where
             state.generation,
             state.pending_commands.iter().cloned().collect::<Vec<_>>(),
             state.webview.is_some(),
+            state.inactive_scheduling_policy,
         )
     };
     let sink = host.system_sink(webview, generation);
@@ -2313,6 +2363,7 @@ where
         data_store_identifier,
         sink.clone(),
         &mut host.system_context,
+        inactive_scheduling_policy,
     );
 
     let native = match built {
@@ -2380,26 +2431,22 @@ fn build_system_webview(
     data_store_identifier: WebKitDataStoreIdentifier,
     sink: SystemCallbackSink,
     context: &mut Option<SystemWebViewContext>,
+    inactive_scheduling_policy: Option<WebKitInactiveSchedulingPolicy>,
 ) -> Result<WebView, HostError> {
     #[cfg(feature = "macos-webkit-automation")]
     let eligible = automation::dialogs::enabled(&sink);
     let mut builder = system_webview_builder(sink)
         .with_bounds(wry_rect(viewport))
         .with_data_store_identifier(data_store_identifier.0);
-    if let Some(context) = context {
-        let configuration = context.configuration();
-        #[cfg(feature = "macos-webkit-automation")]
-        if eligible {
-            automation::native::configure(&configuration, true);
-        }
-        builder = builder.with_webview_configuration(configuration);
-    }
+    let needs_configuration = inactive_scheduling_policy.is_some();
     #[cfg(feature = "macos-webkit-automation")]
-    if context.is_none() && eligible {
+    let needs_configuration = needs_configuration || eligible;
+    let configuration = if let Some(context) = context {
+        Some(context.configuration())
+    } else if needs_configuration {
         let mtm =
             MainThreadMarker::new().ok_or_else(|| HostError::new("AppKit main thread required"))?;
-        // Preserve Wry's selected named data-store behavior when supplying the
-        // first configuration ourselves to set eligibility before allocation.
+        // WRY skips named-store selection when it receives an explicit configuration.
         let configuration = unsafe { WKWebViewConfiguration::new(mtm) };
         if configuration::named_stores_available() {
             let identifier = objc2_foundation::NSUUID::from_bytes(data_store_identifier.0);
@@ -2409,7 +2456,28 @@ fn build_system_webview(
                 );
             }
         }
-        automation::native::configure(&configuration, true);
+        Some(configuration)
+    } else {
+        None
+    };
+    if let Some(configuration) = configuration {
+        if let Some(policy) = inactive_scheduling_policy {
+            let policy = match policy {
+                WebKitInactiveSchedulingPolicy::None => WKInactiveSchedulingPolicy::None,
+                WebKitInactiveSchedulingPolicy::Throttle => WKInactiveSchedulingPolicy::Throttle,
+                WebKitInactiveSchedulingPolicy::Suspend => WKInactiveSchedulingPolicy::Suspend,
+            };
+            // SAFETY: Creation checks macOS availability. The configuration belongs to AppKit.
+            unsafe {
+                configuration
+                    .preferences()
+                    .setInactiveSchedulingPolicy(policy)
+            };
+        }
+        #[cfg(feature = "macos-webkit-automation")]
+        if eligible {
+            automation::native::configure(&configuration, true);
+        }
         builder = builder.with_webview_configuration(configuration);
     }
     let native = builder.build_as_child(parent).map_err(wry_error)?;
@@ -4754,6 +4822,24 @@ mod build_selection_tests {
             runtime.destroy_webview(view).unwrap();
             assert!(runtime.load_url(view, "https://example.invalid/").is_err());
         }
+    }
+
+    #[test]
+    fn inactive_policy_rejects_servo_before_registration() {
+        let mut runtime = Runtime::new(host());
+        let session = runtime.create_session();
+        let sibling = runtime
+            .create_webview_with_options(session, MacOsWebViewOptions::new(compiled_engines()[0]))
+            .unwrap();
+        let options = MacOsWebViewOptions::new(MacOsWebViewKind::Servo)
+            .with_webkit_inactive_scheduling_policy(WebKitInactiveSchedulingPolicy::None);
+        let error = runtime
+            .create_webview_with_options(session, options)
+            .unwrap_err();
+        assert!(error.to_string().contains("unavailable for Servo views"));
+        runtime.destroy_webview(sibling).unwrap();
+        runtime.perform_all_updates().unwrap();
+        assert!(runtime.drain_events().is_empty());
     }
 
     #[cfg(not(all(feature = "servo", feature = "macos-webkit")))]

@@ -118,6 +118,47 @@ Servo-only; these choices apply to the native Rust facade.
   parent. Destroying a view, or dropping the host normally, removes system
   views before your parent view's services are released.
 
+## Control inactive scheduling
+
+A native Rust host can select the public WebKit inactive scheduling policy
+when creating a system view on macOS 14 or later.
+
+```rust
+use explorerkit::webview::macos::{
+    MacOsWebViewKind, MacOsWebViewOptions, WebKitInactiveSchedulingPolicy,
+};
+
+let view = runtime.create_webview_with_options(
+    session,
+    MacOsWebViewOptions::new(MacOsWebViewKind::SystemWebView)
+        .with_webkit_inactive_scheduling_policy(WebKitInactiveSchedulingPolicy::Suspend),
+)?;
+```
+
+ExplorerKit sets
+[WebKit's `WKPreferences.inactiveSchedulingPolicy`](https://developer.apple.com/documentation/webkit/wkpreferences/inactiveschedulingpolicy-swift.property)
+on the root configuration before the native view is created. WebKit gives its
+native popups the originating view's configuration. The modes `None`,
+`Throttle`, and `Suspend` map to WebKit's public values. Omitting the builder
+uses WebKit's default, which Apple documents as Suspend. Explicit `None`
+selects WebKit's None mode and leaves other WebKit timer rules in effect.
+Explicit options return a host error at creation for Servo or on macOS versions
+earlier than 14. The option belongs to the macOS WebKit adapter.
+
+Your app chooses which views to present and retain. Call
+`Runtime::detach_surface` to remove presentation and keep the live view, then
+`Runtime::attach_surface_with_viewport` with the same handle to present it
+again. Call `Runtime::destroy_webview` to close the view and release its
+document. WebKit applies the policy when it considers the view inactive and
+outside a window. Page loads, media playback, capture, and other interactive
+activity can keep a view active. WebKit chooses when eligible work slows or
+stops. The policy gives the host no acknowledgement of a stopped page or process. Surface events report attachment, and an engine crash
+can invalidate the retained document.
+
+If you construct `MacOsWebViewOptions` with a Rust struct literal, provide
+`webkit_inactive_scheduling_policy: None` to retain the native default or use
+`MacOsWebViewOptions::new(kind)` with the builders you need.
+
 ## Stop loading
 
 `Runtime::stop_loading(view)` calls `WKWebView.stopLoading` through Wry's

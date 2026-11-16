@@ -329,9 +329,15 @@ cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-sys
 cargo test --manifest-path crates/Cargo.toml -p explorerkit --features macos-system-webview --test macos-system-configuration --locked
 ```
 
-The configuration regression runs on the process main thread with an ephemeral
-store. It checks that configurations share only their native pool and store,
-while configurations, preferences and content controllers stay independent.
+The configuration regression runs on the process main thread. It checks that
+configurations share the native pool and store while preferences and content
+controllers stay independent. On macOS 14 and later, its AppKit fixture also
+checks the [inactive scheduling policy](macos-system-webview.md#control-inactive-scheduling)
+through the Rust runtime. It uses a temporary named store and verifies native
+policy readback, popup inheritance, retry, and same-document reattachment.
+Rerun it when root or popup construction, WebKit preferences, attachment, or
+the WRY or WebKit runtime changes. The fixture needs an interactive macOS
+desktop.
 
 These cover callback and runtime queue ordering, retiring pending requests on a
 same-URL commit, evaluation ID reuse, closing and replacing sibling views, and

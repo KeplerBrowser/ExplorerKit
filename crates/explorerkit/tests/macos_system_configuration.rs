@@ -3,6 +3,10 @@
 mod configuration;
 
 #[cfg(target_os = "macos")]
+#[path = "macos_system_configuration/scheduling.rs"]
+mod scheduling;
+
+#[cfg(target_os = "macos")]
 #[allow(deprecated)]
 fn main() {
     use objc2::{rc::autoreleasepool, MainThreadMarker};
@@ -11,6 +15,11 @@ fn main() {
     let main_thread =
         MainThreadMarker::new().expect("native configuration test runs on main thread");
     autoreleasepool(|_| {
+        let mut args = std::env::args().skip(1);
+        if args.next().as_deref() == Some("--inactive-scheduling-child") {
+            scheduling::run_child(main_thread, &args.next().expect("fixture store identifier"));
+            return;
+        }
         // SAFETY: The test is on the process main thread.
         let first = unsafe { WKWebViewConfiguration::new(main_thread) };
         // SAFETY: Only an ephemeral store is used, on the process main thread.
@@ -41,6 +50,7 @@ fn main() {
                 &*third.userContentController()
             ));
         }
+        scheduling::run(main_thread);
     });
 }
 
