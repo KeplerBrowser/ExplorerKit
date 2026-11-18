@@ -195,6 +195,20 @@ JavaScript evaluations. Actual commit, close and process-termination callbacks
 retain their existing behavior. Ordinary load failure can also make loading
 false; this is not an attributed cancellation-complete notification.
 
+## Page snapshots
+
+Call `runtime.snapshot_system_webview(view, 960)` on the AppKit main thread
+with a live WebKit view attached to a window. The returned request resolves to
+owned, top-down, straight sRGB RGBA8 pixels. The width is in physical pixels
+and the height follows the viewport aspect ratio. Await the request or call
+`try_recv` while the app continues running its event loop.
+
+ExplorerKit uses WebKit's public `WKWebView.takeSnapshot` API to snapshot the
+page viewport without the app's overlays. WebKit may omit some accelerated
+content. A busy or hung WebContent process can delay completion. Dropping
+the request discards any result. The app owns capture timing, caching, image
+age, and storage. A result can arrive after the view navigates or detaches.
+
 ## Popups and new windows
 
 Install a destination provider on `MacOsViewHostOptions` with

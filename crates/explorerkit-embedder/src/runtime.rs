@@ -995,6 +995,34 @@ pub struct Runtime<H> {
     registry: Arc<Mutex<RuntimeRegistry>>,
 }
 
+#[cfg(target_os = "macos")]
+impl<H: crate::webkit_snapshot::WebKitSnapshotHost> Runtime<H> {
+    /// Starts an asynchronous page snapshot on the AppKit main thread.
+    ///
+    /// The live WebKit view must have an attached surface in an AppKit window.
+    /// `width` is the requested physical pixel width. The output height preserves
+    /// the viewport aspect ratio to the nearest pixel, with a minimum of one.
+    ///
+    /// Keep AppKit's event loop running while awaiting the result. A busy page
+    /// can delay it indefinitely. The request yields a snapshot or a native
+    /// error. It is canceled if WebKit releases its completion without a
+    /// result. Dropping the receiver discards the result.
+    /// An admitted request can complete after navigation or detachment. The
+    /// caller decides whether the result is still useful.
+    pub fn snapshot_system_webview(
+        &mut self,
+        webview: WebViewHandle,
+        width: u32,
+    ) -> Result<crate::webkit_snapshot::WebKitSnapshotRequest, RuntimeError> {
+        if !self.webview_state(webview, |state| state.surface.is_some())? {
+            return Err(RuntimeError::SurfaceNotAttached(webview));
+        }
+        let (reply, request) = futures_channel::oneshot::channel();
+        self.call_host(|host| host.start_webkit_snapshot(webview, width, reply))?;
+        Ok(request)
+    }
+}
+
 impl<H: Host> Runtime<H> {
     /// Reports the sharing scope of the store behind this live Runtime-owned view.
     pub fn site_data_scope(&mut self, view: WebViewHandle) -> Result<SiteDataScope, SiteDataError> {

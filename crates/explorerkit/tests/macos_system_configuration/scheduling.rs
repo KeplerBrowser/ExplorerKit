@@ -170,6 +170,118 @@ fn evaluate(
     })
 }
 
+fn exercise_snapshot(
+    runtime: &mut Runtime<MacOsViewHost<Parent>>,
+    session: explorerkit::SessionHandle,
+    viewport: SurfaceViewport,
+) {
+    use base64::Engine;
+    use explorerkit::{runtime::RuntimeError, webview::macos::WebKitSnapshot};
+
+    fn verify(snapshot: WebKitSnapshot, width: u32) {
+        let height = (width as f64 * 0.75).round() as u32;
+        assert_eq!((snapshot.width, snapshot.height), (width, height));
+        assert_eq!(snapshot.rgba.len(), (width * height * 4) as usize);
+        for (x, y, expected) in [
+            (width / 4, height / 4, [255, 0, 0, 255]),
+            (3 * width / 4, height / 4, [0, 255, 0, 255]),
+            (width / 4, 3 * height / 4, [0, 0, 255, 255]),
+            (3 * width / 4, 3 * height / 4, [255, 255, 0, 255]),
+        ] {
+            let index = ((y * width + x) * 4) as usize;
+            let pixel = &snapshot.rgba[index..index + 4];
+            assert!(
+                pixel.iter().zip(expected).all(|(a, b)| a.abs_diff(b) <= 3),
+                "unexpected snapshot pixel at {x},{y}: {pixel:?}"
+            );
+        }
+    }
+
+    let view = runtime
+        .create_webview_with_options(
+            session,
+            MacOsWebViewOptions::new(MacOsWebViewKind::SystemWebView),
+        )
+        .unwrap();
+    assert_eq!(
+        runtime.snapshot_system_webview(view, 960).unwrap_err(),
+        RuntimeError::SurfaceNotAttached(view)
+    );
+    runtime
+        .attach_surface_with_viewport(view, HostSurface::new("snapshot"), viewport)
+        .unwrap();
+    assert!(runtime.snapshot_system_webview(view, 0).is_err());
+    let html = r#"<!doctype html><title>ExplorerKit snapshot fixture</title><style>
+        html,body{width:100%;height:100%;margin:0}
+        body{display:grid;grid-template:1fr 1fr/1fr 1fr}
+        i:nth-child(1){background:red} i:nth-child(2){background:lime}
+        i:nth-child(3){background:blue} i:nth-child(4){background:yellow}
+        </style><i></i><i></i><i></i><i></i>"#;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(html);
+    runtime
+        .load_url(view, format!("data:text/html;base64,{encoded}"))
+        .unwrap();
+    assert!(runtime.snapshot_system_webview(view, u32::MAX).is_err());
+    await_event(runtime, "snapshot fixture document", |event| {
+        (event.webview == view
+            && matches!(event.event, HostEvent::PageTitleChanged { title: Some(title) }
+                if title == "ExplorerKit snapshot fixture"))
+        .then_some(())
+    });
+    let ready = evaluate(runtime, view, "document.querySelectorAll('i').length");
+    assert_eq!(ready.as_f64(), Some(4.0));
+    for width in [960, 959] {
+        let mut request = runtime.snapshot_system_webview(view, width).unwrap();
+        verify(
+            wait("responsive WebKit snapshot", || request.try_recv().unwrap()).unwrap(),
+            width,
+        );
+    }
+    let mut tiny = runtime.snapshot_system_webview(view, 1).unwrap();
+    let tiny = wait("one-pixel WebKit snapshot", || tiny.try_recv().unwrap()).unwrap();
+    assert_eq!((tiny.width, tiny.height, tiny.rgba.len()), (1, 1, 4));
+
+    runtime
+        .evaluate_javascript(
+            view,
+            "snapshot-stall",
+            "const end = performance.now() + 1100; while (performance.now() < end) {}",
+        )
+        .unwrap();
+    let start = Instant::now();
+    let mut request = runtime.snapshot_system_webview(view, 960).unwrap();
+    while start.elapsed() < Duration::from_millis(250) {
+        appkit_turn();
+        assert!(
+            request.try_recv().unwrap().is_none(),
+            "snapshot completed during the WebContent stall"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    verify(
+        wait("WebKit snapshot after WebContent recovers", || {
+            request.try_recv().unwrap()
+        })
+        .unwrap(),
+        960,
+    );
+    println!(
+        "WebKit snapshot pixels and recovery passed (stall completion after {:?})",
+        start.elapsed()
+    );
+
+    runtime.detach_surface(view).unwrap();
+    assert_eq!(
+        runtime.snapshot_system_webview(view, 960).unwrap_err(),
+        RuntimeError::SurfaceNotAttached(view)
+    );
+    runtime.destroy_webview(view).unwrap();
+    assert_eq!(
+        runtime.snapshot_system_webview(view, 960).unwrap_err(),
+        RuntimeError::UnknownWebView(view)
+    );
+}
+
 fn assert_configuration(view: &WKWebView, store: &NSUUID, expected: WKInactiveSchedulingPolicy) {
     // SAFETY: These objects belong to the process main thread, on macOS 14 or later.
     unsafe {
@@ -218,6 +330,8 @@ fn exercise(store: &NSUUID, mtm: MainThreadMarker) {
     let session = runtime.create_session();
     let root_options = || MacOsWebViewOptions::new(MacOsWebViewKind::SystemWebView);
     use WebKitInactiveSchedulingPolicy::{Suspend, Throttle};
+
+    exercise_snapshot(&mut runtime, session, viewport);
 
     if NSProcessInfo::processInfo()
         .operatingSystemVersion()

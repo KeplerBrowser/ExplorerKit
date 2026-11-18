@@ -43,6 +43,8 @@ mod servo_webview;
     )
 ))]
 mod servo_webview_adapter;
+#[cfg(target_os = "macos")]
+pub mod webkit_snapshot;
 
 use thiserror::Error;
 use url::{ParseError, Url};

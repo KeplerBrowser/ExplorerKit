@@ -62,6 +62,11 @@ mod native_callbacks;
 mod observation;
 #[cfg(feature = "macos-webkit")]
 mod site_data;
+#[cfg(feature = "macos-webkit")]
+mod snapshot;
+
+#[cfg(feature = "macos-webkit")]
+pub use explorerkit_embedder::webkit_snapshot::{WebKitSnapshot, WebKitSnapshotRequest};
 
 #[cfg(feature = "macos-webkit-automation")]
 pub mod automation;

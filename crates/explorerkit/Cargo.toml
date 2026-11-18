@@ -38,6 +38,7 @@ macos-webkit-automation = ["macos-webkit"]
 macos-system-webview = ["servo", "macos-webkit"]
 macos-webkit = [
     "dep:objc2-core-foundation",
+    "dep:objc2-core-graphics",
     "dep:image",
     "image/bmp",
     "image/gif",
@@ -105,10 +106,11 @@ image = { workspace = true, optional = true }
 io-surface = { workspace = true, optional = true }
 mime = { version = "0.3.17", optional = true }
 objc2-core-foundation = { workspace = true, optional = true }
-objc2-app-kit = { workspace = true, features = ["NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSGraphics", "NSColor"], optional = true }
+objc2-app-kit = { workspace = true, features = ["NSImage", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "NSGraphics", "NSColor", "objc2-core-graphics"], optional = true }
+objc2-core-graphics = { version = "0.3.2", default-features = false, features = ["CGBitmapContext", "CGColorSpace", "CGContext", "CGImage"], optional = true }
 objc2 = { workspace = true, optional = true }
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSArray", "NSBundle", "NSDate", "NSDictionary", "NSError", "NSFileManager", "NSHTTPCookie", "NSJSONSerialization", "NSNull", "NSData", "NSPathUtilities", "NSProcessInfo", "NSSet", "NSString", "NSUserDefaults", "NSValue", "NSURL", "NSURLRequest"], optional = true }
-objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKContentWorld", "WKWebView", "WKBackForwardList", "WKBackForwardListItem", "WKHTTPCookieStore", "WKUIDelegate", "WKNavigationAction", "WKWindowFeatures", "WKPreferences", "WKWebViewConfiguration", "WKWebsiteDataRecord", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
+objc2-web-kit = { version = "0.3.2", default-features = false, features = ["std", "block2", "WKError", "WKContentWorld", "WKWebView", "WKSnapshotConfiguration", "WKBackForwardList", "WKBackForwardListItem", "WKHTTPCookieStore", "WKUIDelegate", "WKNavigationAction", "WKWindowFeatures", "WKPreferences", "WKWebViewConfiguration", "WKWebsiteDataRecord", "WKWebsiteDataStore", "WKProcessPool", "WKFrameInfo", "WKOpenPanelParameters", "WKSecurityOrigin"], optional = true }
 rusqlite = { version = "=0.38.0", optional = true }
 serde_json = { version = "1", optional = true }
 sha2 = { version = "=0.10.9", optional = true }

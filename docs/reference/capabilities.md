@@ -43,6 +43,7 @@ native Rust, but its React Native wiring is incomplete and not supported.
 | Several views under one runtime | ➖ | ➖ | ✅ |
 | Offscreen rendering with GPU frame export | ➖ | ➖ | ✅ macOS |
 | System WebKit per view | ➖ | n/a | ✅ macOS |
+| Asynchronous page snapshot | ➖ | ➖ | ✅ [macOS system WebKit](macos-system-webview.md#page-snapshots) |
 | Explicit site-data transfer | ➖ | ➖ | ✅ [macOS Rust](#site-data-transfer) |
 | Persistent profile directory | ➖ | ➖ | ✅ |
 

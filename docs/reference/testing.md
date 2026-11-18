@@ -335,9 +335,11 @@ controllers stay independent. On macOS 14 and later, its AppKit fixture also
 checks the [inactive scheduling policy](macos-system-webview.md#control-inactive-scheduling)
 through the Rust runtime. It uses a temporary named store and verifies native
 policy readback, popup inheritance, retry, and same-document reattachment.
-Rerun it when root or popup construction, WebKit preferences, attachment, or
-the WRY or WebKit runtime changes. The fixture needs an interactive macOS
-desktop.
+The same fixture exercises [page snapshots](macos-system-webview.md#page-snapshots)
+through the public runtime, including physical dimensions, pixel orientation,
+and a stalled page. Rerun it after changing snapshot admission, WebKit
+configuration, pixel conversion, native view ownership, or the WRY or WebKit
+runtime. The fixture needs an interactive macOS desktop.
 
 These cover callback and runtime queue ordering, retiring pending requests on a
 same-URL commit, evaluation ID reuse, closing and replacing sibling views, and
